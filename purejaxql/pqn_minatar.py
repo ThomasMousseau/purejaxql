@@ -14,6 +14,7 @@ import chex
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
+from flax.traverse_util import flatten_dict
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import hydra
 from omegaconf import OmegaConf
@@ -126,6 +127,18 @@ def make_train(config):
             greedy_actions,
         )
         return chosed_actions
+
+    def get_layer_grad_norms(grads):
+        flat_grads = flatten_dict(grads)
+        layer_sq_norms = {}
+        for key, value in flat_grads.items():
+            layer_key = "/".join(key[:-1]) if len(key) > 1 else key[0]
+            sq_norm = jnp.sum(jnp.square(value))
+            if layer_key in layer_sq_norms:
+                layer_sq_norms[layer_key] = layer_sq_norms[layer_key] + sq_norm
+            else:
+                layer_sq_norms[layer_key] = sq_norm
+        return {k: jnp.sqrt(v) for k, v in layer_sq_norms.items()}
 
     def train(rng):
 
@@ -290,12 +303,24 @@ def make_train(config):
                         _loss_fn, has_aux=True
                     )(train_state.params)
                     grad_norm = optax.global_norm(grads)
+                    if config.get("LOG_LAYER_GRAD_NORMS", False):
+                        layer_grad_norms = get_layer_grad_norms(grads)
+                    else:
+                        layer_grad_norms = {}
                     train_state = train_state.apply_gradients(grads=grads)
                     train_state = train_state.replace(
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    return (train_state, rng), (loss, qvals, grad_norm)
+                    return (
+                        train_state,
+                        rng,
+                    ), (
+                        loss,
+                        qvals,
+                        grad_norm,
+                        layer_grad_norms,
+                    )
 
                 def preprocess_transition(x, rng):
                     x = x.reshape(
@@ -316,14 +341,14 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals, grad_norm) = jax.lax.scan(
+                (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
                     _learn_phase, (train_state, rng), (minibatches, targets)
                 )
 
-                return (train_state, rng), (loss, qvals, grad_norm)
+                return (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms)
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals, grad_norm) = jax.lax.scan(
+            (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
                 _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
             )
 
@@ -337,6 +362,13 @@ def make_train(config):
                 "qvals": qvals.mean(),
                 "grad_norm": grad_norm.mean(),
             }
+            if config.get("LOG_LAYER_GRAD_NORMS", False):
+                layer_grad_norms = jax.tree_util.tree_map(
+                    lambda x: x.mean(), layer_grad_norms
+                )
+                metrics.update(
+                    {f"grad_norm/{k}": v for k, v in layer_grad_norms.items()}
+                )
             metrics.update({k: v.mean() for k, v in infos.items()})
 
             if config.get("TEST_DURING_TRAINING", False):
