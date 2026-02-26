@@ -399,12 +399,13 @@ def make_train(config):
                     (loss, (updates, qvals)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
                     )(train_state.params)
+                    grad_norm = optax.global_norm(grads)
                     train_state = train_state.apply_gradients(grads=grads)
                     train_state = train_state.replace(
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    return (train_state, rng), (loss, qvals)
+                    return (train_state, rng), (loss, qvals, grad_norm)
 
                 def preprocess_transition(x, rng):
                     # x: (num_steps, num_envs, ...)
@@ -426,14 +427,14 @@ def make_train(config):
                 )  # num_minibatches, num_steps+memory_window, batch_size/num_minbatches, ...
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals) = jax.lax.scan(
+                (train_state, rng), (loss, qvals, grad_norm) = jax.lax.scan(
                     _learn_phase, (train_state, rng), minibatches
                 )
 
-                return (train_state, rng), (loss, qvals)
+                return (train_state, rng), (loss, qvals, grad_norm)
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals) = jax.lax.scan(
+            (train_state, rng), (loss, qvals, grad_norm) = jax.lax.scan(
                 _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
             )
 
@@ -444,6 +445,7 @@ def make_train(config):
                 "grad_steps": train_state.grad_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
+                "grad_norm": grad_norm.mean(),
             }
             done_infos = jax.tree_util.tree_map(
                 lambda x: (x * infos["returned_episode"]).sum()

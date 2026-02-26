@@ -620,6 +620,8 @@ def make_train(config):
                 "loss": total_loss.mean(),
                 "value_loss": value_loss.mean(),
                 "loss_actor": loss_actor.mean(),
+                "critic_grad_norm": opt_infos["critic_norm"].mean(),
+                "actor_grad_norm": opt_infos["actor_norm"].mean(),
                 "lr": lr_scheduler(train_state["actor"].n_updates),
             }
             metrics.update({k: v.mean() for k, v in traj_batch.info.items()})
