@@ -449,7 +449,6 @@ def maybe_print_network_summary(config):
         jax.random.PRNGKey(config["SEED"]),
         init_x,
         train=False,
-        mutable=["batch_stats"],
     )
     print(summary)
 
