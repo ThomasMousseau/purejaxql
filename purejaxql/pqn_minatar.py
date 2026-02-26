@@ -228,9 +228,6 @@ def make_train(config):
 
             # SAMPLE PHASE
             def _step_env(carry, _):
-
-                jax.debug.breakpoint()
-
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
                 q_vals = network.apply(
@@ -275,6 +272,8 @@ def make_train(config):
                 timesteps=train_state.timesteps
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
             )  # update timesteps count
+
+            jax.debug.breakpoint()
 
             last_q = network.apply(
                 {
