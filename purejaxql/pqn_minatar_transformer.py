@@ -200,7 +200,7 @@ class QNetwork(nn.Module):
         for i in range(self.mlp_num_layers):
             resid = x
             x = nn.Dense(
-                4*self.mlp_hidden_dim,
+                2*self.mlp_hidden_dim,
                 kernel_init=nn.initializers.he_normal(),
                 use_bias=False,
                 name=f"mlp_up_{i}",
