@@ -12,6 +12,7 @@ NUM_EPOCHS: 2 # minibatches per epoch
 NORM_TYPE: "layer_norm" # layer_norm or batch_norm
 LR: 0.0005
 MAX_GRAD_NORM: 10
+PER_LAYER_GRADIENT_CLIPPING: False
 LR_LINEAR_DECAY: True
 GAMMA: 0.99
 LAMBDA: 0.65

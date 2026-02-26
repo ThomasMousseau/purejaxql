@@ -13,8 +13,9 @@ from typing import Any
 import chex
 import optax
 import flax.linen as nn
+from flax.core import FrozenDict, freeze
 from flax.training.train_state import TrainState
-from flax.traverse_util import flatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import hydra
 from omegaconf import OmegaConf
@@ -96,6 +97,8 @@ def make_train(config):
     config["NUM_UPDATES_DECAY"] = (
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
+    max_grad_norm = config["MAX_GRAD_NORM"]
+    per_layer_gradient_clipping = config.get("PER_LAYER_GRADIENT_CLIPPING", False)
 
     assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
         "NUM_MINIBATCHES"
@@ -140,6 +143,34 @@ def make_train(config):
                 layer_sq_norms[layer_key] = sq_norm
         return {k: jnp.sqrt(v) for k, v in layer_sq_norms.items()}
 
+    def clip_grads_per_layer(grads):
+        flat_grads = flatten_dict(grads)
+        layer_sq_norms = {}
+        for key, value in flat_grads.items():
+            layer_key = key[:-1] if len(key) > 1 else key
+            sq_norm = jnp.sum(jnp.square(value))
+            if layer_key in layer_sq_norms:
+                layer_sq_norms[layer_key] = layer_sq_norms[layer_key] + sq_norm
+            else:
+                layer_sq_norms[layer_key] = sq_norm
+
+        max_norm = jnp.asarray(max_grad_norm, dtype=jnp.float32)
+        eps = 1e-6
+        layer_scales = {
+            layer_key: jnp.minimum(1.0, max_norm / (jnp.sqrt(sq_norm) + eps))
+            for layer_key, sq_norm in layer_sq_norms.items()
+        }
+
+        clipped_flat_grads = {}
+        for key, value in flat_grads.items():
+            layer_key = key[:-1] if len(key) > 1 else key
+            clipped_flat_grads[key] = value * layer_scales[layer_key]
+
+        clipped_grads = unflatten_dict(clipped_flat_grads)
+        if isinstance(grads, FrozenDict):
+            return freeze(clipped_grads)
+        return clipped_grads
+
     def train(rng):
 
         original_rng = rng[0]
@@ -169,8 +200,13 @@ def make_train(config):
         def create_agent(rng):
             init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
             network_variables = network.init(rng, init_x, train=False)
+            clip_transform = (
+                optax.identity()
+                if per_layer_gradient_clipping
+                else optax.clip_by_global_norm(max_grad_norm)
+            )
             tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                clip_transform,
                 optax.radam(learning_rate=lr),
             )
 
@@ -192,6 +228,9 @@ def make_train(config):
 
             # SAMPLE PHASE
             def _step_env(carry, _):
+
+                jax.debug.breakpoint()
+
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
                 q_vals = network.apply(
@@ -307,6 +346,8 @@ def make_train(config):
                         layer_grad_norms = get_layer_grad_norms(grads)
                     else:
                         layer_grad_norms = {}
+                    if per_layer_gradient_clipping:
+                        grads = clip_grads_per_layer(grads)
                     train_state = train_state.apply_gradients(grads=grads)
                     train_state = train_state.replace(
                         grad_steps=train_state.grad_steps + 1,
