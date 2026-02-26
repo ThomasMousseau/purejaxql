@@ -36,26 +36,25 @@ def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
     return x
 
 
-def add_sinusoidal_positional_encoding(x: jnp.ndarray) -> jnp.ndarray:
-    """Adds deterministic position encodings for sequence-aware attention."""
-    seq_len = x.shape[1]
-    hidden_dim = x.shape[-1]
-    half_dim = hidden_dim // 2
-    if half_dim == 0:
-        return x
+class LearnedPositionalEmbedding(nn.Module):
+    max_sequence_length: int
+    hidden_dim: int
+    init_std: float = 0.02
 
-    position = jnp.arange(seq_len, dtype=x.dtype)[:, None]
-    freq_scale = jnp.maximum(half_dim - 1, 1)
-    div_term = jnp.exp(
-        -jnp.log(jnp.array(10000.0, dtype=x.dtype))
-        * jnp.arange(half_dim, dtype=x.dtype)
-        / freq_scale
-    )
-    angles = position * div_term[None, :]
-    pos_emb = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
-    if hidden_dim % 2 != 0:
-        pos_emb = jnp.pad(pos_emb, ((0, 0), (0, 1)))
-    return x + pos_emb[None, :, :]
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        seq_len = x.shape[1]
+        if seq_len > self.max_sequence_length:
+            raise ValueError(
+                "Sequence length exceeds learned positional embedding capacity. "
+                f"Got {seq_len}, max is {self.max_sequence_length}."
+            )
+        pos_embedding = self.param(
+            "embedding",
+            nn.initializers.normal(stddev=self.init_std),
+            (self.max_sequence_length, self.hidden_dim),
+        )
+        return x + pos_embedding[None, :seq_len, :]
 
 
 class CNN(nn.Module):
@@ -146,6 +145,7 @@ class QNetwork(nn.Module):
     norm_input: bool = False
     mlp_num_layers: int = 1
     mlp_hidden_dim: int = 128
+    max_sequence_length: int = 32
     num_attention_heads: int = 4
     attention_dropout: float = 0.0
     causal_attention: bool = True
@@ -186,8 +186,7 @@ class QNetwork(nn.Module):
         elif not is_sequence_input:
             attention_padding = attention_padding[:, None]
 
-        if x.shape[1] > 1:
-            x = add_sinusoidal_positional_encoding(x)
+        jax.debug.breakpoint()
 
         # Project to hidden_dim
         x = nn.Dense(
@@ -196,6 +195,11 @@ class QNetwork(nn.Module):
             name=f"mlp_proj",
         )(x)
         x = apply_norm(x, self.norm_type, train)
+        x = LearnedPositionalEmbedding(
+            max_sequence_length=self.max_sequence_length,
+            hidden_dim=self.mlp_hidden_dim,
+            name="position_embedding",
+        )(x)
 
         for i in range(self.mlp_num_layers):
             resid = x
@@ -459,6 +463,7 @@ def make_train(config):
             norm_input=config.get("NORM_INPUT", False),
             mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
             mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
+            max_sequence_length=max(sequence_length, action_history_length),
             num_attention_heads=config.get("NUM_ATTENTION_HEADS", 4),
             attention_dropout=config.get("ATTENTION_DROPOUT", 0.0),
             causal_attention=config.get("CAUSAL_ATTENTION", True),
@@ -851,12 +856,17 @@ def maybe_print_network_summary(config):
 
     env, env_params = gymnax.make(config["ENV_NAME"])
     env = LogWrapper(env)
+    summary_sequence_length = int(config.get("SEQUENCE_LENGTH", 1))
+    summary_action_history_length = int(
+        config.get("ACTION_HISTORY_LENGTH", summary_sequence_length)
+    )
     network = QNetwork(
         action_dim=env.action_space(env_params).n,
         norm_type=config["NORM_TYPE"],
         norm_input=config.get("NORM_INPUT", False),
         mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
         mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
+        max_sequence_length=max(summary_sequence_length, summary_action_history_length),
         num_attention_heads=config.get("NUM_ATTENTION_HEADS", 4),
         attention_dropout=config.get("ATTENTION_DROPOUT", 0.0),
         causal_attention=config.get("CAUSAL_ATTENTION", True),
