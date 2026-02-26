@@ -430,12 +430,38 @@ def make_train(config):
     return train
 
 
+def maybe_print_network_summary(config):
+    if not config.get("PRINT_NETWORK_SUMMARY", False):
+        return
+
+    env, env_params = gymnax.make(config["ENV_NAME"])
+    env = FlattenObservationWrapper(env)
+
+    network = QNetwork(
+        action_dim=env.action_space(env_params).n,
+        hidden_size=config.get("HIDDEN_SIZE", 128),
+        num_layers=config.get("NUM_LAYERS", 2),
+        norm_type=config["NORM_TYPE"],
+        norm_input=config.get("NORM_INPUT", False),
+    )
+    init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+    summary = network.tabulate(
+        jax.random.PRNGKey(config["SEED"]),
+        init_x,
+        train=False,
+        mutable=["batch_stats"],
+    )
+    print(summary)
+
+
 def single_run(config):
 
     config = {**config, **config["alg"]}
 
     alg_name = config.get("ALG_NAME", "pqn")
     env_name = config["ENV_NAME"]
+
+    maybe_print_network_summary(config)
 
     wandb.init(
         entity=config["ENTITY"],
@@ -492,6 +518,8 @@ def tune(default_config):
         config = copy.deepcopy(default_config)
         for k, v in dict(wandb.config).items():
             config[k] = v
+
+        maybe_print_network_summary(config)
 
         print("running experiment with params:", config)
         rng = jax.random.PRNGKey(config["SEED"])

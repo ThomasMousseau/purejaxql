@@ -16,6 +16,8 @@ LR_LINEAR_DECAY: True
 GAMMA: 0.99
 LAMBDA: 0.65
 
+PRINT_NETWORK_SUMMARY: True
+
 # env specific
 ENV_NAME: "Asterix-MinAtar"
 ENV_KWARGS: {}
