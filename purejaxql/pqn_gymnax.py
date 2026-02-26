@@ -49,9 +49,13 @@ class QNetwork(nn.Module):
             normalize = lambda x: x
 
         for l in range(self.num_layers):
+            residual = x
             x = nn.Dense(self.hidden_size)(x)
             x = normalize(x)
             x = nn.relu(x)
+            if residual.shape[-1] != self.hidden_size:
+                residual = nn.Dense(self.hidden_size, use_bias=False)(residual)
+            x = nn.relu(x + residual)
 
         x = nn.Dense(self.action_dim)(x)
 
