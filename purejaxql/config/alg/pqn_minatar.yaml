@@ -17,6 +17,7 @@ GAMMA: 0.99
 LAMBDA: 0.65
 
 PRINT_NETWORK_SUMMARY: True
+LOG_LAYER_GRAD_NORMS: True
 
 # env specific
 ENV_NAME: "Asterix-MinAtar"
