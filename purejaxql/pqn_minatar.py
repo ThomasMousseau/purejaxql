@@ -36,16 +36,21 @@ def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
 
 
 class CNN(nn.Module):
+    norm_type: str = "batch_norm"
+
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-        x = nn.Conv(
-            16,
-            kernel_size=(3, 3),
-            strides=1,
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = nn.relu(x)
+        for i, channels in enumerate((32, 64)):
+            x = nn.Conv(
+                channels,
+                kernel_size=(3, 3),
+                strides=1,
+                padding="SAME",
+                kernel_init=nn.initializers.he_normal(),
+                name=f"conv_{i}",
+            )(x)
+            x = apply_norm(x, self.norm_type, train)
+            x = nn.relu(x)
         x = jnp.mean(x, axis=(1, 2))
         return x
 
@@ -65,7 +70,7 @@ class QNetwork(nn.Module):
             # dummy normalize input for global compatibility
             _ = nn.BatchNorm(use_running_average=not train, name="input_norm_dummy")(x)
             # x = x / 255.0
-        x = CNN()(x, train)
+        x = CNN(norm_type=self.norm_type)(x, train)
 
         # Project to hidden_dim
         x = nn.Dense(
