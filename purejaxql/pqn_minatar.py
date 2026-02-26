@@ -36,7 +36,7 @@ def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
 
 
 class CNN(nn.Module):
-    norm_type: str = "batch_norm"
+    norm_type: str = "layer_norm"
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
