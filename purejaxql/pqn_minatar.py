@@ -127,7 +127,9 @@ def make_train(config):
         )
         return chosed_actions
 
-    def train(rng, seed_idx):
+    def train(rng):
+
+        original_rng = rng[0]
 
         eps_scheduler = optax.linear_schedule(
             config["EPS_START"],
@@ -350,17 +352,17 @@ def make_train(config):
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
-                def callback(metrics, seed_idx):
+                def callback(metrics, original_rng):
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         metrics.update(
                             {
-                                f"seed_{int(seed_idx)}/{k}": v
+                                f"rng{int(original_rng)}/{k}": v
                                 for k, v in metrics.items()
                             }
                         )
                     wandb.log(metrics, step=metrics["update_steps"])
 
-                jax.debug.callback(callback, metrics, seed_idx)
+                jax.debug.callback(callback, metrics, original_rng)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, rng)
 
@@ -455,9 +457,8 @@ def single_run(config):
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    seed_idxs = jnp.arange(config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config), in_axes=(0, 0)))
-    outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
+    train_vjit = jax.jit(jax.vmap(make_train(config)))
+    outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time()-t0} seconds to complete.")
 
     if config.get("SAVE_PATH", None) is not None:
@@ -501,9 +502,8 @@ def tune(default_config):
 
         rng = jax.random.PRNGKey(config["SEED"])
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
-        seed_idxs = jnp.arange(config["NUM_SEEDS"])
-        train_vjit = jax.jit(jax.vmap(make_train(config), in_axes=(0, 0)))
-        outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
+        train_vjit = jax.jit(jax.vmap(make_train(config)))
+        outs = jax.block_until_ready(train_vjit(rngs))
 
     sweep_config = {
         "name": f"{alg_name}_{env_name}",
@@ -543,3 +543,4 @@ def main(config):
 
 if __name__ == "__main__":
     main()
+

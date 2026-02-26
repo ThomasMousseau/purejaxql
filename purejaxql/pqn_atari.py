@@ -161,7 +161,9 @@ def make_train(config):
     # here reset must be out of vmap and jit
     init_obs, env_state = env.reset()
 
-    def train(rng, seed_idx):
+    def train(rng):
+
+        original_seed = rng[0]
 
         eps_scheduler = optax.linear_schedule(
             config["EPS_START"],
@@ -396,17 +398,17 @@ def make_train(config):
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
-                def callback(metrics, seed_idx):
+                def callback(metrics, original_seed):
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         metrics.update(
                             {
-                                f"seed_{int(seed_idx)}/{k}": v
+                                f"rng{int(original_seed)}/{k}": v
                                 for k, v in metrics.items()
                             }
                         )
                     wandb.log(metrics, step=metrics["update_steps"])
 
-                jax.debug.callback(callback, metrics, seed_idx)
+                jax.debug.callback(callback, metrics, original_seed)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, rng)
 
@@ -455,7 +457,7 @@ def single_run(config):
     if config["NUM_SEEDS"] > 1:
         raise NotImplementedError("Vmapped seeds not supported yet.")
     else:
-        outs = jax.jit(make_train(config))(rng, jnp.asarray(0, dtype=jnp.int32))
+        outs = jax.jit(make_train(config))(rng)
     print(f"Took {time.time()-t0} seconds to complete.")
 
     # save params
@@ -505,7 +507,7 @@ def tune(default_config):
         if config["NUM_SEEDS"] > 1:
             raise NotImplementedError("Vmapped seeds not supported yet.")
         else:
-            outs = jax.jit(make_train(config))(rng, jnp.asarray(0, dtype=jnp.int32))
+            outs = jax.jit(make_train(config))(rng)
 
     sweep_config = {
         "name": f"pqn_atari_{default_config['ENV_NAME']}",
