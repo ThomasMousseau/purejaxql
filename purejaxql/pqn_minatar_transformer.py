@@ -63,7 +63,7 @@ class CNN(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-        for i, channels in enumerate((32, 64, 128)):
+        for i, channels in enumerate((32, 64)):
             x = nn.Conv(
                 channels,
                 kernel_size=(3, 3),
