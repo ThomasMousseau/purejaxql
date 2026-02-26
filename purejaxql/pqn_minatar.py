@@ -99,7 +99,7 @@ class QNetwork(nn.Module):
             x = apply_norm(x, self.norm_type, train)
 
             x = x + resid
-        x = nn.Dense(self.action_dim)(x)
+        x = nn.Dense(self.action_dim, kernel_init=nn.zeros)(x)
         return x
 
 
