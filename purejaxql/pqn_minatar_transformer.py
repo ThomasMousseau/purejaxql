@@ -78,6 +78,68 @@ class CNN(nn.Module):
         return x
 
 
+class ManualCausalSelfAttention(nn.Module):
+    hidden_dim: int
+    num_heads: int
+    dropout_rate: float = 0.0
+    causal: bool = True
+
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        attention_padding: jnp.ndarray,
+        train: bool,
+    ) -> jnp.ndarray:
+        batch_size, seq_len, _ = x.shape
+        head_dim = self.hidden_dim // self.num_heads
+
+        qkv = nn.Dense(
+            3 * self.hidden_dim,
+            kernel_init=nn.initializers.he_normal(),
+            name="c_attn",
+        )(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        def split_heads(t: jnp.ndarray) -> jnp.ndarray:
+            return t.reshape(batch_size, seq_len, self.num_heads, head_dim).transpose(
+                0, 2, 1, 3
+            )
+
+        q = split_heads(q)  # (B, H, T, D)
+        k = split_heads(k)  # (B, H, T, D)
+        v = split_heads(v)  # (B, H, T, D)
+
+        scale = jnp.asarray(head_dim, dtype=x.dtype) ** -0.5
+        attn_logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale  # (B, H, T, T)
+
+        mask = attention_padding[:, None, None, :]  # key padding mask
+        if self.causal:
+            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+            mask = mask & causal_mask[None, None, :, :]
+
+        neg_large = jnp.asarray(-1e9, dtype=attn_logits.dtype)
+        attn_logits = jnp.where(mask, attn_logits, neg_large)
+
+        attn = nn.softmax(attn_logits, axis=-1)
+        attn = nn.Dropout(rate=self.dropout_rate, name="attn_dropout")(
+            attn, deterministic=not train
+        )
+        y = jnp.einsum("bhqk,bhkd->bhqd", attn, v)  # (B, H, T, D)
+        y = y.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.hidden_dim)
+
+        y = nn.Dense(
+            self.hidden_dim,
+            kernel_init=nn.initializers.he_normal(),
+            name="c_proj",
+        )(y)
+        y = nn.Dropout(rate=self.dropout_rate, name="resid_dropout")(
+            y, deterministic=not train
+        )
+        y = y * attention_padding[:, :, None].astype(y.dtype)
+        return y
+
+
 class QNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
@@ -156,24 +218,13 @@ class QNetwork(nn.Module):
             x = x + resid
 
             attn_resid = x
-            attention_mask = nn.make_attention_mask(
-                attention_padding,
-                attention_padding,
-                dtype=jnp.bool_,
-            )
-            if self.causal_attention:
-                causal_mask = nn.make_causal_mask(
-                    jnp.ones(x.shape[:2], dtype=jnp.bool_)
-                )
-                attention_mask = nn.combine_masks(attention_mask, causal_mask)
-            x = nn.SelfAttention(
+            x = ManualCausalSelfAttention(
+                hidden_dim=self.mlp_hidden_dim,
                 num_heads=self.num_attention_heads,
-                qkv_features=self.mlp_hidden_dim,
-                out_features=self.mlp_hidden_dim,
                 dropout_rate=self.attention_dropout,
-                deterministic=not train,
+                causal=self.causal_attention,
                 name=f"self_attention_{i}",
-            )(x, mask=attention_mask)
+            )(x, attention_padding=attention_padding, train=train)
             x = apply_norm(x, self.norm_type, train)
             x = x + attn_resid
 
@@ -206,15 +257,21 @@ def make_train(config):
     assert 1 <= sequence_length <= config["NUM_STEPS"], (
         "SEQUENCE_LENGTH must be in [1, NUM_STEPS]"
     )
-    assert config["NUM_STEPS"] % sequence_length == 0, (
-        "NUM_STEPS must be divisible by SEQUENCE_LENGTH"
-    )
     action_history_length = int(
         config.get("ACTION_HISTORY_LENGTH", sequence_length)
     )
     assert 1 <= action_history_length <= config["NUM_STEPS"], (
         "ACTION_HISTORY_LENGTH must be in [1, NUM_STEPS]"
     )
+    num_sequence_chunks = (
+        config["NUM_STEPS"] + sequence_length - 1
+    ) // sequence_length
+    time_padding = num_sequence_chunks * sequence_length - config["NUM_STEPS"]
+    total_sequences = config["NUM_ENVS"] * num_sequence_chunks
+    sequence_batch_padding = (
+        config["NUM_MINIBATCHES"] - (total_sequences % config["NUM_MINIBATCHES"])
+    ) % config["NUM_MINIBATCHES"]
+    total_sequences_padded = total_sequences + sequence_batch_padding
 
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -226,14 +283,7 @@ def make_train(config):
     max_grad_norm = config["MAX_GRAD_NORM"]
     per_layer_gradient_clipping = config.get("PER_LAYER_GRADIENT_CLIPPING", False)
 
-    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
-        "NUM_MINIBATCHES"
-    ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
-    assert (
-        config["NUM_ENVS"] * (config["NUM_STEPS"] // sequence_length)
-    ) % config["NUM_MINIBATCHES"] == 0, (
-        "NUM_MINIBATCHES must divide NUM_ENVS*(NUM_STEPS/SEQUENCE_LENGTH)"
-    )
+    assert config["NUM_MINIBATCHES"] > 0, "NUM_MINIBATCHES must be positive"
 
     def update_obs_history(
         history_obs: jnp.ndarray,
@@ -262,6 +312,61 @@ def make_train(config):
         updated_obs = jnp.where(obs_mask, reset_obs, shifted_obs)
         updated_valid = jnp.where(reset_mask[:, None], reset_valid, shifted_valid)
         return updated_obs, updated_valid
+
+    def preprocess_transition(x, rng, pad_value=0):
+        # x: (num_steps, num_envs, ...)
+        x = jnp.swapaxes(x, 0, 1)  # (num_envs, num_steps, ...)
+        if time_padding > 0:
+            x = jnp.pad(
+                x,
+                ((0, 0), (0, time_padding)) + ((0, 0),) * (x.ndim - 2),
+                constant_values=pad_value,
+            )
+        x = x.reshape(
+            config["NUM_ENVS"],
+            num_sequence_chunks,
+            sequence_length,
+            *x.shape[2:],
+        )  # (num_envs, num_chunks, T, ...)
+        x = x.reshape(-1, sequence_length, *x.shape[3:])  # (batch, T, ...)
+        if sequence_batch_padding > 0:
+            x = jnp.pad(
+                x,
+                ((0, sequence_batch_padding), (0, 0)) + ((0, 0),) * (x.ndim - 2),
+                constant_values=pad_value,
+            )
+        x = jax.random.permutation(rng, x, axis=0)  # shuffle full sequences
+        x = x.reshape(
+            config["NUM_MINIBATCHES"],
+            total_sequences_padded // config["NUM_MINIBATCHES"],
+            sequence_length,
+            *x.shape[2:],
+        )  # (num_minibatches, batch_per_minibatch, T, ...)
+        return x
+
+    def preprocess_valid_mask(rng):
+        valid = jnp.ones((config["NUM_ENVS"], config["NUM_STEPS"]), dtype=jnp.bool_)
+        if time_padding > 0:
+            valid = jnp.pad(
+                valid,
+                ((0, 0), (0, time_padding)),
+                constant_values=False,
+            )
+        valid = valid.reshape(config["NUM_ENVS"], num_sequence_chunks, sequence_length)
+        valid = valid.reshape(-1, sequence_length)
+        if sequence_batch_padding > 0:
+            valid = jnp.pad(
+                valid,
+                ((0, sequence_batch_padding), (0, 0)),
+                constant_values=False,
+            )
+        valid = jax.random.permutation(rng, valid, axis=0)
+        valid = valid.reshape(
+            config["NUM_MINIBATCHES"],
+            total_sequences_padded // config["NUM_MINIBATCHES"],
+            sequence_length,
+        )
+        return valid
 
     env, env_params = gymnax.make(config["ENV_NAME"])
     env = LogWrapper(env)
@@ -501,13 +606,20 @@ def make_train(config):
                 def _learn_phase(carry, minibatch_and_target):
 
                     train_state, rng = carry
-                    minibatch, target = minibatch_and_target
+                    minibatch, target, valid_mask = minibatch_and_target
 
                     def _loss_fn(params):
+                        safe_attention_padding = valid_mask.at[:, -1].set(True)
+                        safe_attention_padding = jnp.where(
+                            jnp.any(valid_mask, axis=-1, keepdims=True),
+                            valid_mask,
+                            safe_attention_padding,
+                        )
                         q_vals, updates = network.apply(
                             {"params": params, "batch_stats": train_state.batch_stats},
                             minibatch.obs,
                             train=True,
+                            attention_padding=safe_attention_padding,
                             mutable=["batch_stats"],
                         )  # (batch_size, sequence_length, num_actions)
 
@@ -517,7 +629,11 @@ def make_train(config):
                             axis=-1,
                         ).squeeze(axis=-1)
 
-                        loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
+                        td_loss = 0.5 * jnp.square(chosen_action_qvals - target)
+                        valid = valid_mask.astype(td_loss.dtype)
+                        loss = jnp.sum(td_loss * valid) / jnp.maximum(
+                            jnp.sum(valid), 1.0
+                        )
 
                         return loss, (updates, chosen_action_qvals)
 
@@ -546,33 +662,16 @@ def make_train(config):
                         layer_grad_norms,
                     )
 
-                def preprocess_transition(x, rng):
-                    # x: (num_steps, num_envs, ...)
-                    x = jnp.swapaxes(x, 0, 1)  # (num_envs, num_steps, ...)
-                    x = x.reshape(
-                        x.shape[0],
-                        x.shape[1] // sequence_length,
-                        sequence_length,
-                        *x.shape[2:],
-                    )  # (num_envs, num_chunks, T, ...)
-                    x = x.reshape(-1, sequence_length, *x.shape[3:])  # (batch, T, ...)
-                    x = jax.random.permutation(rng, x, axis=0)  # shuffle full sequences
-                    x = x.reshape(
-                        config["NUM_MINIBATCHES"], -1, sequence_length, *x.shape[2:]
-                    )  # (num_minibatches, batch_per_minibatch, T, ...)
-                    return x
-
                 rng, _rng = jax.random.split(rng)
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, _rng), transitions
                 )  # num_actors*num_envs (batch_size), ...
-                targets = jax.tree_util.tree_map(
-                    lambda x: preprocess_transition(x, _rng), lambda_targets
-                )
+                targets = preprocess_transition(lambda_targets, _rng)
+                valid_masks = preprocess_valid_mask(_rng)
 
                 rng, _rng = jax.random.split(rng)
                 (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
-                    _learn_phase, (train_state, rng), (minibatches, targets)
+                    _learn_phase, (train_state, rng), (minibatches, targets, valid_masks)
                 )
 
                 return (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms)
