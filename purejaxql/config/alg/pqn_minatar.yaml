@@ -9,7 +9,9 @@ EPS_FINISH: 0.05
 EPS_DECAY: 0.1 # ratio of total updates
 NUM_MINIBATCHES: 32 # minibatches per epoch
 NUM_EPOCHS: 2 # minibatches per epoch
-NORM_TYPE: "layer_norm" # layer_norm or batch_norm
+NORM_TYPE: "justnorm" # layer_norm, batch_norm, or justnorm
+MLP_NUM_LAYERS: 1
+MLP_HIDDEN_DIM: 128
 LR: 0.0005
 MAX_GRAD_NORM: 10
 PER_LAYER_GRADIENT_CLIPPING: False

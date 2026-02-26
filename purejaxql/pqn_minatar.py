@@ -23,20 +23,21 @@ import gymnax
 import wandb
 
 
+def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
+    if norm_type == "layer_norm":
+        return nn.LayerNorm()(x)
+    if norm_type == "batch_norm":
+        return nn.BatchNorm(use_running_average=not train)(x)
+    if norm_type == "justnorm":
+        eps = jnp.finfo(x.dtype).eps
+        rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+        return x / rms
+    return x
+
+
 class CNN(nn.Module):
-
-    norm_type: str = "layer_norm"
-
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-
-        if self.norm_type == "layer_norm":
-            normalize = lambda x: nn.LayerNorm()(x)
-        elif self.norm_type == "batch_norm":
-            normalize = lambda x: nn.BatchNorm(use_running_average=not train)(x)
-        else:
-            normalize = lambda x: x
-
         x = nn.Conv(
             16,
             kernel_size=(3, 3),
@@ -44,12 +45,8 @@ class CNN(nn.Module):
             padding="VALID",
             kernel_init=nn.initializers.he_normal(),
         )(x)
-        x = normalize(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(128, kernel_init=nn.initializers.he_normal())(x)
-        x = normalize(x)
-        x = nn.relu(x)
         return x
 
 
@@ -57,16 +54,28 @@ class QNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
     norm_input: bool = False
+    mlp_num_layers: int = 1
+    mlp_hidden_dim: int = 128
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
         if self.norm_input:
-            x = nn.BatchNorm(use_running_average=not train)(x)
+            x = nn.BatchNorm(use_running_average=not train, name="input_norm")(x)
         else:
             # dummy normalize input for global compatibility
-            x_dummy = nn.BatchNorm(use_running_average=not train)(x)
+            _ = nn.BatchNorm(use_running_average=not train, name="input_norm_dummy")(x)
             # x = x / 255.0
         x = CNN(norm_type=self.norm_type)(x, train)
+        x = apply_norm(x, self.norm_type, train)
+
+        for i in range(self.mlp_num_layers):
+            x = nn.Dense(
+                self.mlp_hidden_dim,
+                kernel_init=nn.initializers.he_normal(),
+                name=f"mlp_dense_{i}",
+            )(x)
+            x = apply_norm(x, self.norm_type, train)
+            x = nn.relu(x)
         x = nn.Dense(self.action_dim)(x)
         return x
 
@@ -195,6 +204,8 @@ def make_train(config):
             action_dim=env.action_space(env_params).n,
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
+            mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
+            mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
         )
 
         def create_agent(rng):
@@ -516,6 +527,8 @@ def maybe_print_network_summary(config):
         action_dim=env.action_space(env_params).n,
         norm_type=config["NORM_TYPE"],
         norm_input=config.get("NORM_INPUT", False),
+        mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
+        mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
     )
     init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
     summary = network.tabulate(
