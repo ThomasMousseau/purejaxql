@@ -173,9 +173,7 @@ def make_train(config, env):
     def unbatchify(x: jnp.ndarray):
         return {agent: x[i] for i, agent in enumerate(env.agents)}
 
-    def train(rng):
-
-        original_seed = rng[0]
+    def train(rng, seed_idx):
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -492,17 +490,17 @@ def make_train(config, env):
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
-                def callback(metrics, original_seed):
+                def callback(metrics, seed_idx):
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         metrics.update(
                             {
-                                f"rng{int(original_seed)}/{k}": v
+                                f"seed_{int(seed_idx) + 1}/{k}": v
                                 for k, v in metrics.items()
                             }
                         )
                     wandb.log(metrics, step=metrics["update_steps"])
 
-                jax.debug.callback(callback, metrics, original_seed)
+                jax.debug.callback(callback, metrics, seed_idx)
 
             runner_state = (
                 train_state,
@@ -706,8 +704,9 @@ def single_run(config):
     rng = jax.random.PRNGKey(config["SEED"])
 
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
+    seed_idxs = jnp.arange(config["NUM_SEEDS"], dtype=jnp.int32)
     train_vjit = jax.jit(jax.vmap(make_train(config, env)))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
 
     # save params
     if config.get("SAVE_PATH", None) is not None:
@@ -754,8 +753,9 @@ def tune(default_config):
 
         rng = jax.random.PRNGKey(config["SEED"])
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
+        seed_idxs = jnp.arange(config["NUM_SEEDS"], dtype=jnp.int32)
         train_vjit = jax.jit(jax.vmap(make_train(config, env)))
-        outs = jax.block_until_ready(train_vjit(rngs))
+        outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
 
     sweep_config = {
         "name": f"{alg_name}_{env_name}",
