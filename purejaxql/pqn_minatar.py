@@ -91,7 +91,7 @@ class QNetwork(nn.Module):
             x = nn.relu(x)
             x = nn.Dense(
                 self.mlp_hidden_dim,
-                kernel_init=nn.initializers.he_normal(),
+                kernel_init=nn.zeros,
                 use_bias=False,
                 name=f"mlp_down_{i}",
             )(x)
