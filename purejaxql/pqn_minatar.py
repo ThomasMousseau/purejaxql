@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from functools import partial
 from typing import Any
+import random
 
 import chex
 import optax
@@ -585,7 +586,8 @@ def single_run(config):
         mode=config["WANDB_MODE"],
     )
 
-    rng = jax.random.PRNGKey(config["SEED"])
+    seed = random.randint(0, 100_000)
+    rng = jax.random.PRNGKey()
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
