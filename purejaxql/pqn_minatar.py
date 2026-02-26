@@ -66,6 +66,13 @@ class QNetwork(nn.Module):
             _ = nn.BatchNorm(use_running_average=not train, name="input_norm_dummy")(x)
             # x = x / 255.0
         x = CNN()(x, train)
+
+        # Project to hidden_dim
+        x = nn.Dense(
+            self.mlp_hidden_dim,
+            kernel_init=nn.initializers.he_normal(),
+            name=f"mlp_proj",
+        )(x)
         x = apply_norm(x, self.norm_type, train)
 
         for i in range(self.mlp_num_layers):
