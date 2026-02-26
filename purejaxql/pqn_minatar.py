@@ -353,6 +353,9 @@ def make_train(config):
                     minibatch, target = minibatch_and_target
 
                     def _loss_fn(params):
+
+                        jax.debug.breakpoint()
+
                         q_vals, updates = network.apply(
                             {"params": params, "batch_stats": train_state.batch_stats},
                             minibatch.obs,
