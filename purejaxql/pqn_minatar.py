@@ -69,6 +69,7 @@ class QNetwork(nn.Module):
         x = apply_norm(x, self.norm_type, train)
 
         for i in range(self.mlp_num_layers):
+            resid = x
             x = nn.Dense(
                 self.mlp_hidden_dim,
                 kernel_init=nn.initializers.he_normal(),
@@ -76,6 +77,8 @@ class QNetwork(nn.Module):
             )(x)
             x = apply_norm(x, self.norm_type, train)
             x = nn.relu(x)
+
+            x = x + resid
         x = nn.Dense(self.action_dim)(x)
         return x
 
