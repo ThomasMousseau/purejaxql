@@ -65,7 +65,7 @@ class QNetwork(nn.Module):
         else:
             # dummy normalize input for global compatibility
             x_dummy = nn.BatchNorm(use_running_average=not train)(x)
-            x = x / 255.0
+            # x = x / 255.0
         x = CNN(norm_type=self.norm_type)(x, train)
         x = nn.Dense(self.action_dim)(x)
         return x
@@ -273,7 +273,7 @@ def make_train(config):
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
             )  # update timesteps count
 
-            jax.debug.breakpoint()
+            # jax.debug.breakpoint()
 
             last_q = network.apply(
                 {
