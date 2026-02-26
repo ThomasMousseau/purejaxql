@@ -587,7 +587,7 @@ def single_run(config):
     )
 
     seed = random.randint(0, 100_000)
-    rng = jax.random.PRNGKey()
+    rng = jax.random.PRNGKey(seed)
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
