@@ -186,7 +186,7 @@ class QNetwork(nn.Module):
         elif not is_sequence_input:
             attention_padding = attention_padding[:, None]
 
-        jax.debug.breakpoint()
+        # jax.debug.breakpoint()
 
         # Project to hidden_dim
         x = nn.Dense(
@@ -202,6 +202,17 @@ class QNetwork(nn.Module):
         )(x)
 
         for i in range(self.mlp_num_layers):
+            attn_resid = x
+            x = ManualCausalSelfAttention(
+                hidden_dim=self.mlp_hidden_dim,
+                num_heads=self.num_attention_heads,
+                dropout_rate=self.attention_dropout,
+                causal=self.causal_attention,
+                name=f"self_attention_{i}",
+            )(x, attention_padding=attention_padding, train=train)
+            x = apply_norm(x, self.norm_type, train)
+            x = x + attn_resid
+
             resid = x
             x = nn.Dense(
                 2*self.mlp_hidden_dim,
@@ -216,22 +227,8 @@ class QNetwork(nn.Module):
                 use_bias=False,
                 name=f"mlp_down_{i}",
             )(x)
-
             x = apply_norm(x, self.norm_type, train)
-
             x = x + resid
-
-            attn_resid = x
-            x = ManualCausalSelfAttention(
-                hidden_dim=self.mlp_hidden_dim,
-                num_heads=self.num_attention_heads,
-                dropout_rate=self.attention_dropout,
-                causal=self.causal_attention,
-                name=f"self_attention_{i}",
-            )(x, attention_padding=attention_padding, train=train)
-            x = apply_norm(x, self.norm_type, train)
-            x = x + attn_resid
-
         x = nn.Dense(self.action_dim, kernel_init=nn.zeros)(x)
         if not is_sequence_input:
             x = x.squeeze(axis=1)
