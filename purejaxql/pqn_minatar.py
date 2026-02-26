@@ -46,7 +46,7 @@ class CNN(nn.Module):
             kernel_init=nn.initializers.he_normal(),
         )(x)
         x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
+        x = jnp.mean(x, axis=(1, 2))
         return x
 
 
