@@ -342,116 +342,70 @@ def make_train(config):
                 method=CharacteristicQNetwork.q_values,
             )
 
-        def compute_lambda_targets(train_state, transitions, base_omegas):
-            num_steps, num_envs, num_omegas = base_omegas.shape
+        def zero_frequency_outputs(params, batch_stats, obs):
+            outputs = network.apply(
+                {
+                    "params": params,
+                    "batch_stats": batch_stats,
+                },
+                obs,
+                jnp.zeros((obs.shape[0], 1), dtype=obs.dtype),
+                train=False,
+            )
+            return outputs["mean"][:, 0, :], outputs["scale"][:, 0, :]
+
+        def compute_one_step_targets(train_state, transitions, omegas):
+            num_steps, num_envs, num_omegas = omegas.shape
             obs_shape = transitions.next_obs.shape[2:]
-            gamma = jnp.asarray(config["GAMMA"], dtype=base_omegas.dtype)
-            lambda_coeff = jnp.asarray(config["LAMBDA"], dtype=base_omegas.dtype)
-            start_indices = jnp.arange(num_steps, dtype=jnp.int32)[:, None, None]
+            reward_dtype = transitions.reward.dtype
+            gamma = jnp.asarray(config["GAMMA"], dtype=reward_dtype)
 
             flat_next_obs = transitions.next_obs.reshape(num_steps * num_envs, *obs_shape)
-            next_q_vals = q_values_from_state(train_state, flat_next_obs, train=False)
-            next_q_vals = next_q_vals.reshape(num_steps, num_envs, -1)
-            next_actions = jnp.argmax(next_q_vals, axis=-1)
-
-            def get_bootstrap_cf(step_idx, current_omegas):
-                repeated_next_obs = jnp.broadcast_to(
-                    transitions.next_obs[step_idx][None, ...],
-                    (num_steps, num_envs, *obs_shape),
-                ).reshape(num_steps * num_envs, *obs_shape)
-                repeated_actions = jnp.broadcast_to(
-                    next_actions[step_idx][None, :],
-                    (num_steps, num_envs),
-                )
-                outputs = network.apply(
-                    {
-                        "params": train_state.params,
-                        "batch_stats": train_state.batch_stats,
-                    },
-                    repeated_next_obs,
-                    (gamma * current_omegas).reshape(num_steps * num_envs, num_omegas),
-                    train=False,
-                )
-                cf = outputs["cf"].reshape(num_steps, num_envs, num_omegas, -1)
-                return select_action_values(cf, repeated_actions)
-
-            time_to_end = (num_steps - 1) - jnp.arange(num_steps, dtype=base_omegas.dtype)
-            current_omegas = base_omegas * jnp.power(gamma, time_to_end)[:, None, None]
-
-            last_idx = num_steps - 1
-            last_bootstrap_cf = get_bootstrap_cf(last_idx, current_omegas)
-            last_reward_phase = jnp.exp(
-                1j * current_omegas * transitions.reward[last_idx][None, :, None]
+            next_mean_values, next_var_values = zero_frequency_outputs(
+                train_state.params,
+                train_state.batch_stats,
+                flat_next_obs,
             )
-            last_done = transitions.done[last_idx][None, :, None]
-            current_targets = last_reward_phase * (
-                (1.0 - last_done) * last_bootstrap_cf + last_done
+            next_mean_values = next_mean_values.reshape(num_steps, num_envs, -1)
+            next_var_values = next_var_values.reshape(num_steps, num_envs, -1)
+            next_actions = jnp.argmax(next_mean_values, axis=-1)
+            next_mean_bootstrap = select_action_values(next_mean_values, next_actions)
+            next_var_bootstrap = select_action_values(next_var_values, next_actions)
+            next_second_bootstrap = next_var_bootstrap + jnp.square(next_mean_bootstrap)
+            done = transitions.done.astype(reward_dtype)
+
+            next_cf_outputs = network.apply(
+                {
+                    "params": train_state.params,
+                    "batch_stats": train_state.batch_stats,
+                },
+                flat_next_obs,
+                (gamma * omegas).reshape(num_steps * num_envs, num_omegas),
+                train=False,
+            )
+            next_cf = next_cf_outputs["cf"].reshape(num_steps, num_envs, num_omegas, -1)
+            next_cf = select_action_values(next_cf, next_actions)
+
+            reward_phase = jnp.exp(1j * omegas * transitions.reward[..., None])
+            cf_targets = reward_phase * (
+                (1.0 - done[..., None]) * next_cf + done[..., None]
             )
 
-            def _scan_target(carry, step_idx):
-                current_targets, current_omegas = carry
-                bootstrap_cf = get_bootstrap_cf(step_idx, current_omegas)
-                reward_phase = jnp.exp(
-                    1j * current_omegas * transitions.reward[step_idx][None, :, None]
-                )
-                done = transitions.done[step_idx][None, :, None]
-                updated_targets = reward_phase * (
-                    done
-                    + (1.0 - done)
-                    * (
-                        (1.0 - lambda_coeff) * bootstrap_cf
-                        + lambda_coeff * current_targets
-                    )
-                )
-                active_mask = start_indices <= step_idx
-                current_targets = jnp.where(
-                    active_mask,
-                    updated_targets,
-                    current_targets,
-                )
-                current_omegas = jnp.where(
-                    start_indices < step_idx,
-                    current_omegas / gamma,
-                    current_omegas,
-                )
-                return (current_targets, current_omegas), None
-
-            scan_indices = jnp.arange(num_steps - 1, dtype=jnp.int32)[::-1]
-            (lambda_targets, _), _ = jax.lax.scan(
-                _scan_target,
-                (current_targets, current_omegas),
-                scan_indices,
+            mean_targets = transitions.reward + gamma * (1.0 - done) * next_mean_bootstrap
+            second_targets = (
+                jnp.square(transitions.reward)
+                + 2.0 * gamma * (1.0 - done) * transitions.reward * next_mean_bootstrap
+                + jnp.square(gamma) * (1.0 - done) * next_second_bootstrap
             )
-            return lambda_targets
-
-        def compute_mean_lambda_targets(train_state, transitions):
-            last_q = q_values_from_state(train_state, transitions.next_obs[-1], train=False)
-            last_q = jnp.max(last_q, axis=-1)
-
-            def _get_target(lambda_returns_and_next_q, transition):
-                lambda_returns, next_q = lambda_returns_and_next_q
-                target_bootstrap = (
-                    transition.reward + config["GAMMA"] * (1 - transition.done) * next_q
-                )
-                delta = lambda_returns - next_q
-                lambda_returns = (
-                    target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
-                )
-                lambda_returns = (
-                    1 - transition.done
-                ) * lambda_returns + transition.done * transition.reward
-                next_q = jnp.max(transition.q_val, axis=-1)
-                return (lambda_returns, next_q), lambda_returns
-
-            last_q = last_q * (1 - transitions.done[-1])
-            lambda_returns = transitions.reward[-1] + config["GAMMA"] * last_q
-            _, targets = jax.lax.scan(
-                _get_target,
-                (lambda_returns, last_q),
-                jax.tree_util.tree_map(lambda x: x[:-1], transitions),
-                reverse=True,
+            variance_targets = jnp.maximum(
+                second_targets - jnp.square(mean_targets),
+                0.0,
             )
-            return jnp.concatenate((targets, lambda_returns[jnp.newaxis]))
+
+            return jax.tree_util.tree_map(
+                jax.lax.stop_gradient,
+                (cf_targets, mean_targets, variance_targets),
+            )
 
         def _update_step(runner_state, unused):
             train_state, expl_state, test_metrics, rng = runner_state
@@ -499,15 +453,18 @@ def make_train(config):
                 config["NUM_STEPS"] * config["NUM_ENVS"],
                 config,
             ).reshape(config["NUM_STEPS"], config["NUM_ENVS"], config["NUM_OMEGAS"])
-            lambda_targets = compute_lambda_targets(train_state, transitions, omegas)
-            mean_lambda_targets = compute_mean_lambda_targets(train_state, transitions)
+            cf_targets, mean_targets, variance_targets = compute_one_step_targets(
+                train_state, transitions, omegas
+            )
 
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
                 def _learn_phase(carry, minibatch_and_target):
                     train_state, rng = carry
-                    minibatch, target_cf, omega, target_mean = minibatch_and_target
+                    minibatch, target_cf, omega, target_mean, target_var = (
+                        minibatch_and_target
+                    )
                     q_vals = q_values_from_state(train_state, minibatch.obs, train=False)
                     chosen_action_qvals = select_action_values(q_vals, minibatch.action)
 
@@ -526,30 +483,45 @@ def make_train(config):
                         pred_scale = select_action_values(
                             outputs["scale"], minibatch.action
                         )
-                        pred_mean = network.apply(
-                            {
-                                "params": params,
-                                "batch_stats": train_state.batch_stats,
-                            },
+                        zero_mean_values, zero_var_values = zero_frequency_outputs(
+                            params,
+                            train_state.batch_stats,
                             minibatch.obs,
-                            train=False,
-                            method=CharacteristicQNetwork.q_values,
                         )
-                        pred_mean = select_action_values(pred_mean, minibatch.action)
+                        pred_mean = select_action_values(zero_mean_values, minibatch.action)
+                        pred_var = select_action_values(zero_var_values, minibatch.action)
                         diff = pred_cf - target_cf
                         cf_loss = 0.5 * (
                             jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
                         ).mean()
                         mean_loss = 0.5 * jnp.square(pred_mean - target_mean).mean()
+                        var_loss = 0.5 * jnp.square(pred_var - target_var).mean()
                         loss = (
                             cf_loss
                             + config.get("AUX_MEAN_LOSS_WEIGHT", 0.1) * mean_loss
+                            + config.get("AUX_VAR_LOSS_WEIGHT", 0.1) * var_loss
                         )
-                        return loss, (updates, pred_cf, pred_scale, cf_loss, mean_loss)
+                        return loss, (
+                            updates,
+                            pred_cf,
+                            pred_scale,
+                            pred_var,
+                            cf_loss,
+                            mean_loss,
+                            var_loss,
+                        )
 
                     (
                         loss,
-                        (updates, pred_cf, pred_scale, cf_loss, mean_loss),
+                        (
+                            updates,
+                            pred_cf,
+                            pred_scale,
+                            pred_var,
+                            cf_loss,
+                            mean_loss,
+                            var_loss,
+                        ),
                     ), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
                         train_state.params
                     )
@@ -572,9 +544,11 @@ def make_train(config):
                         loss,
                         cf_loss,
                         mean_loss,
+                        var_loss,
                         chosen_action_qvals.mean(),
                         jnp.abs(pred_cf).mean(),
                         pred_scale.mean(),
+                        pred_var.mean(),
                         grad_norm,
                         layer_grad_norms,
                     )
@@ -592,9 +566,10 @@ def make_train(config):
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, permutation), transitions
                 )
-                target_minibatches = preprocess_transition(lambda_targets, permutation)
-                mean_target_minibatches = preprocess_transition(
-                    mean_lambda_targets, permutation
+                cf_target_minibatches = preprocess_transition(cf_targets, permutation)
+                mean_target_minibatches = preprocess_transition(mean_targets, permutation)
+                variance_target_minibatches = preprocess_transition(
+                    variance_targets, permutation
                 )
                 omega_minibatches = preprocess_transition(omegas, permutation)
 
@@ -602,9 +577,11 @@ def make_train(config):
                     loss,
                     cf_loss,
                     mean_loss,
+                    var_loss,
                     qvals,
                     cf_magnitude,
                     scale_mean,
+                    variance_mean,
                     grad_norm,
                     layer_grad_norms,
                 ) = jax.lax.scan(
@@ -612,9 +589,10 @@ def make_train(config):
                     (train_state, rng),
                     (
                         minibatches,
-                        target_minibatches,
+                        cf_target_minibatches,
                         omega_minibatches,
                         mean_target_minibatches,
+                        variance_target_minibatches,
                     ),
                 )
 
@@ -622,9 +600,11 @@ def make_train(config):
                     loss,
                     cf_loss,
                     mean_loss,
+                    var_loss,
                     qvals,
                     cf_magnitude,
                     scale_mean,
+                    variance_mean,
                     grad_norm,
                     layer_grad_norms,
                 )
@@ -634,9 +614,11 @@ def make_train(config):
                 loss,
                 cf_loss,
                 mean_loss,
+                var_loss,
                 qvals,
                 cf_magnitude,
                 scale_mean,
+                variance_mean,
                 grad_norm,
                 layer_grad_norms,
             ) = jax.lax.scan(_learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"])
@@ -651,9 +633,11 @@ def make_train(config):
                 "loss": loss.mean(),
                 "cf_loss": cf_loss.mean(),
                 "aux_mean_loss": mean_loss.mean(),
+                "aux_var_loss": var_loss.mean(),
                 "qvals": qvals.mean(),
                 "cf_magnitude": cf_magnitude.mean(),
                 "scale_mean": scale_mean.mean(),
+                "variance_mean": variance_mean.mean(),
                 "grad_norm": grad_norm.mean(),
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):
