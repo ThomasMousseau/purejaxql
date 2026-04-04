@@ -12,6 +12,8 @@ NUM_EPOCHS: 2 # minibatches per epoch
 NORM_TYPE: "justnorm" # layer_norm, batch_norm, or justnorm
 MLP_NUM_LAYERS: 1
 MLP_HIDDEN_DIM: 128
+USE_ROPE: False
+ROPE_THETA: 10000.0
 LR: 0.0005
 MAX_GRAD_NORM: 10
 PER_LAYER_GRADIENT_CLIPPING: False

@@ -1,27 +1,26 @@
 """
-This script is like pqn_gymnax but the network uses a CNN.
+This script is like pqn_minatar but uses a characteristic-function network
+based on the architecture described in cqn.pdf.
 """
+import copy
 import os
-import copy 
-import time
-import jax
-import jax.numpy as jnp
-import numpy as np
-from functools import partial
-from typing import Any
 import random
+import time
+from typing import Any
 
 import chex
-import optax
 import flax.linen as nn
+import gymnax
+import hydra
+import jax
+import jax.numpy as jnp
+import optax
+import wandb
 from flax.core import FrozenDict, freeze
 from flax.training.train_state import TrainState
 from flax.traverse_util import flatten_dict, unflatten_dict
-from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
-import hydra
+from gymnax.wrappers.purerl import LogWrapper
 from omegaconf import OmegaConf
-import gymnax
-import wandb
 
 
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
@@ -56,35 +55,68 @@ class CNN(nn.Module):
         return x
 
 
-class QNetwork(nn.Module):
+class FrequencyEmbedding(nn.Module):
+    hidden_dim: int
+
+    @nn.compact
+    def __call__(self, omega: jnp.ndarray) -> jnp.ndarray:
+        omega = jnp.asarray(omega, dtype=jnp.float32)
+        basis = jnp.arange(1, self.hidden_dim + 1, dtype=omega.dtype)
+        return jnp.cos(jnp.pi * omega[..., None] * basis)
+
+
+class CharacteristicQNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
     norm_input: bool = False
     mlp_num_layers: int = 1
     mlp_hidden_dim: int = 128
+    sigma_min: float = 1e-6
 
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
+    def _prepare_omegas(
+        self, omega: jnp.ndarray | float, batch_size: int, dtype: jnp.dtype
+    ) -> jnp.ndarray:
+        omega = jnp.asarray(omega, dtype=dtype)
+        if omega.ndim == 0:
+            omega = jnp.broadcast_to(omega[None, None], (batch_size, 1))
+        elif omega.ndim == 1:
+            omega = jnp.broadcast_to(omega[None, :], (batch_size, omega.shape[0]))
+        elif omega.ndim == 2:
+            if omega.shape[0] == 1 and batch_size != 1:
+                omega = jnp.broadcast_to(omega, (batch_size, omega.shape[1]))
+            elif omega.shape[0] != batch_size:
+                raise ValueError(
+                    "Frequency batch dimension must match observation batch "
+                    f"dimension. Got omega batch {omega.shape[0]} and "
+                    f"observation batch {batch_size}."
+                )
+        else:
+            raise ValueError(
+                "Frequencies must be scalar, rank-1, or rank-2. "
+                f"Got shape {omega.shape}."
+            )
+        return omega
+
+    def _encode_state(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train, name="input_norm")(x)
         else:
-            # dummy normalize input for global compatibility
             _ = nn.BatchNorm(use_running_average=not train, name="input_norm_dummy")(x)
-            # x = x / 255.0
         x = CNN(norm_type=self.norm_type)(x, train)
-
-        # Project to hidden_dim
         x = nn.Dense(
             self.mlp_hidden_dim,
             kernel_init=nn.initializers.he_normal(),
-            name=f"mlp_proj",
+            name="state_proj",
         )(x)
         x = apply_norm(x, self.norm_type, train)
+        return x
 
+    def _shared_trunk(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
+        x = x.reshape(-1, x.shape[-1])
         for i in range(self.mlp_num_layers):
             resid = x
             x = nn.Dense(
-                4*self.mlp_hidden_dim,
+                4 * self.mlp_hidden_dim,
                 kernel_init=nn.initializers.he_normal(),
                 use_bias=False,
                 name=f"mlp_up_{i}",
@@ -92,16 +124,67 @@ class QNetwork(nn.Module):
             x = nn.relu(x)
             x = nn.Dense(
                 self.mlp_hidden_dim,
-                kernel_init=nn.zeros,
+                kernel_init=nn.initializers.zeros,
                 use_bias=False,
                 name=f"mlp_down_{i}",
             )(x)
-
             x = apply_norm(x, self.norm_type, train)
-
             x = x + resid
-        x = nn.Dense(self.action_dim, kernel_init=nn.zeros)(x)
         return x
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, omega: jnp.ndarray | float, train: bool):
+        state_latent = self._encode_state(x, train)
+        omega = self._prepare_omegas(omega, state_latent.shape[0], state_latent.dtype)
+        freq_latent = FrequencyEmbedding(hidden_dim=self.mlp_hidden_dim)(omega)
+        joint_latent = state_latent[:, None, :] * freq_latent
+
+        hidden = self._shared_trunk(joint_latent, train)
+        hidden = hidden.reshape(state_latent.shape[0], omega.shape[1], -1)
+
+        mean = nn.Dense(
+            self.action_dim,
+            kernel_init=nn.initializers.zeros,
+            name="mean_head",
+        )(hidden)
+        scale = nn.Dense(
+            self.action_dim,
+            kernel_init=nn.initializers.zeros,
+            name="scale_head",
+        )(hidden)
+        scale = nn.softplus(scale) + self.sigma_min
+
+        kappa = jnp.square(omega) / (1.0 + jnp.square(omega))
+        log_magnitude = -0.5 * kappa[..., None] * scale
+        phase = omega[..., None] * mean
+        cf = jnp.exp(log_magnitude + 1j * phase)
+
+        return {"mean": mean, "scale": scale, "cf": cf}
+
+    def q_values(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
+        outputs = self(x, jnp.zeros((x.shape[0], 1), dtype=x.dtype), train)
+        return outputs["mean"][:, 0, :]
+
+
+def sample_omegas(rng, batch_size: int, config) -> jnp.ndarray:
+    omegas = jax.random.normal(rng, (batch_size, config["NUM_OMEGAS"]))
+    omegas = omegas * config.get("OMEGA_SCALE", 1.0)
+    omega_clip = config.get("OMEGA_CLIP", None)
+    if omega_clip is not None:
+        omegas = jnp.clip(omegas, -omega_clip, omega_clip)
+    return omegas
+
+
+def select_action_values(values: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+    if values.ndim == 2:
+        return jnp.take_along_axis(values, actions[:, None], axis=-1).squeeze(axis=-1)
+    if values.ndim == 3:
+        action_idx = jnp.broadcast_to(
+            actions[:, None, None],
+            (values.shape[0], values.shape[1], 1),
+        )
+        return jnp.take_along_axis(values, action_idx, axis=-1).squeeze(axis=-1)
+    raise ValueError(f"Unsupported tensor rank for action selection: {values.ndim}")
 
 
 @chex.dataclass(frozen=True)
@@ -122,12 +205,10 @@ class CustomTrainState(TrainState):
 
 
 def make_train(config):
-
-    config["NUM_UPDATES"] = (
+    config["NUM_UPDATES"] = int(
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-
-    config["NUM_UPDATES_DECAY"] = (
+    config["NUM_UPDATES_DECAY"] = int(
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     max_grad_norm = config["MAX_GRAD_NORM"]
@@ -148,21 +229,17 @@ def make_train(config):
         env.step, in_axes=(0, 0, 0, None)
     )(jax.random.split(rng, n_envs), env_state, action, env_params)
 
-    # epsilon-greedy exploration
     def eps_greedy_exploration(rng, q_vals, eps):
-        rng_a, rng_e = jax.random.split(
-            rng
-        )  # a key for sampling random actions and one for picking
+        rng_a, rng_e = jax.random.split(rng)
         greedy_actions = jnp.argmax(q_vals, axis=-1)
-        chosed_actions = jnp.where(
-            jax.random.uniform(rng_e, greedy_actions.shape)
-            < eps,  # pick the actions that should be random
+        chosen_actions = jnp.where(
+            jax.random.uniform(rng_e, greedy_actions.shape) < eps,
             jax.random.randint(
                 rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
-            ),  # sample random actions,
+            ),
             greedy_actions,
         )
-        return chosed_actions
+        return chosen_actions
 
     def get_layer_grad_norms(grads):
         flat_grads = flatten_dict(grads)
@@ -205,34 +282,34 @@ def make_train(config):
         return clipped_grads
 
     def train(rng, seed_idx):
-
         eps_scheduler = optax.linear_schedule(
             config["EPS_START"],
             config["EPS_FINISH"],
-            (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY"],
+            config["EPS_DECAY"] * config["NUM_UPDATES_DECAY"],
         )
 
         lr_scheduler = optax.linear_schedule(
             init_value=config["LR"],
             end_value=1e-20,
-            transition_steps=(config["NUM_UPDATES_DECAY"])
+            transition_steps=config["NUM_UPDATES_DECAY"]
             * config["NUM_MINIBATCHES"]
             * config["NUM_EPOCHS"],
         )
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
-        # INIT NETWORK AND OPTIMIZER
-        network = QNetwork(
+        network = CharacteristicQNetwork(
             action_dim=env.action_space(env_params).n,
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
             mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
             mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
+            sigma_min=config.get("SIGMA_MIN", 1e-6),
         )
 
         def create_agent(rng):
             init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
-            network_variables = network.init(rng, init_x, train=False)
+            init_omega = jnp.zeros((1, config["NUM_OMEGAS"]))
+            network_variables = network.init(rng, init_x, init_omega, train=False)
             clip_transform = (
                 optax.identity()
                 if per_layer_gradient_clipping
@@ -251,28 +328,27 @@ def make_train(config):
             )
             return train_state
 
-        rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
 
-        # TRAINING LOOP
-        def _update_step(runner_state, unused):
+        def q_values_from_state(train_state, obs, train: bool):
+            return network.apply(
+                {
+                    "params": train_state.params,
+                    "batch_stats": train_state.batch_stats,
+                },
+                obs,
+                train=train,
+                method=CharacteristicQNetwork.q_values,
+            )
 
+        def _update_step(runner_state, unused):
             train_state, expl_state, test_metrics, rng = runner_state
 
-            # SAMPLE PHASE
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
-                q_vals = network.apply(
-                    {
-                        "params": train_state.params,
-                        "batch_stats": train_state.batch_stats,
-                    },
-                    last_obs,
-                    train=False,
-                )
+                q_vals = q_values_from_state(train_state, last_obs, train=False)
 
-                # different eps for each env
                 _rngs = jax.random.split(rng_a, config["NUM_ENVS"])
                 eps = jnp.full(config["NUM_ENVS"], eps_scheduler(train_state.n_updates))
                 new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
@@ -284,14 +360,13 @@ def make_train(config):
                 transition = Transition(
                     obs=last_obs,
                     action=new_action,
-                    reward=config.get("REW_SCALE", 1)*reward,
+                    reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
                     next_obs=new_obs,
                     q_val=q_vals,
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
-            # step the env
             rng, _rng = jax.random.split(rng)
             (*expl_state, rng), (transitions, infos) = jax.lax.scan(
                 _step_env,
@@ -304,73 +379,63 @@ def make_train(config):
             train_state = train_state.replace(
                 timesteps=train_state.timesteps
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
-            )  # update timesteps count
-
-            # jax.debug.breakpoint()
-
-            last_q = network.apply(
-                {
-                    "params": train_state.params,
-                    "batch_stats": train_state.batch_stats,
-                },
-                transitions.next_obs[-1],
-                train=False,
             )
-            last_q = jnp.max(last_q, axis=-1)
 
-            def _get_target(lambda_returns_and_next_q, transition):
-                lambda_returns, next_q = lambda_returns_and_next_q
-                target_bootstrap = (
-                    transition.reward + config["GAMMA"] * (1 - transition.done) * next_q
-                )
-                delta = lambda_returns - next_q
-                lambda_returns = (
-                    target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
-                )
-                lambda_returns = (
-                    1 - transition.done
-                ) * lambda_returns + transition.done * transition.reward
-                next_q = jnp.max(transition.q_val, axis=-1)
-                return (lambda_returns, next_q), lambda_returns
-
-            last_q = last_q * (1 - transitions.done[-1])
-            lambda_returns = transitions.reward[-1] + config["GAMMA"] * last_q
-            _, targets = jax.lax.scan(
-                _get_target,
-                (lambda_returns, last_q),
-                jax.tree_util.tree_map(lambda x: x[:-1], transitions),
-                reverse=True,
-            )
-            lambda_targets = jnp.concatenate((targets, lambda_returns[np.newaxis]))
-
-            # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
-                def _learn_phase(carry, minibatch_and_target):
-
+                def _learn_phase(carry, minibatch):
                     train_state, rng = carry
-                    minibatch, target = minibatch_and_target
+                    rng, rng_omega = jax.random.split(rng)
+                    batch_size = minibatch.action.shape[0]
+                    omegas = sample_omegas(rng_omega, batch_size, config)
+
+                    q_vals = q_values_from_state(train_state, minibatch.obs, train=False)
+                    chosen_action_qvals = select_action_values(q_vals, minibatch.action)
+
+                    next_q_vals = q_values_from_state(
+                        train_state, minibatch.next_obs, train=False
+                    )
+                    next_actions = jnp.argmax(next_q_vals, axis=-1)
+                    next_outputs = network.apply(
+                        {
+                            "params": train_state.params,
+                            "batch_stats": train_state.batch_stats,
+                        },
+                        minibatch.next_obs,
+                        config["GAMMA"] * omegas,
+                        train=False,
+                    )
+                    next_cf = select_action_values(next_outputs["cf"], next_actions)
+                    reward_phase = jnp.exp(1j * omegas * minibatch.reward[:, None])
+                    bootstrap = (
+                        (1.0 - minibatch.done)[:, None] * next_cf
+                        + minibatch.done[:, None]
+                    )
+                    target_cf = jax.lax.stop_gradient(reward_phase * bootstrap)
 
                     def _loss_fn(params):
-                        q_vals, updates = network.apply(
-                            {"params": params, "batch_stats": train_state.batch_stats},
+                        outputs, updates = network.apply(
+                            {
+                                "params": params,
+                                "batch_stats": train_state.batch_stats,
+                            },
                             minibatch.obs,
+                            omegas,
                             train=True,
                             mutable=["batch_stats"],
-                        )  # (batch_size*2, num_actions)
+                        )
+                        pred_cf = select_action_values(outputs["cf"], minibatch.action)
+                        pred_scale = select_action_values(
+                            outputs["scale"], minibatch.action
+                        )
+                        diff = pred_cf - target_cf
+                        loss = 0.5 * (
+                            jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
+                        ).mean()
+                        return loss, (updates, pred_cf, pred_scale)
 
-                        chosen_action_qvals = jnp.take_along_axis(
-                            q_vals,
-                            jnp.expand_dims(minibatch.action, axis=-1),
-                            axis=-1,
-                        ).squeeze(axis=-1)
-
-                        loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
-
-                        return loss, (updates, chosen_action_qvals)
-
-                    (loss, (updates, qvals)), grads = jax.value_and_grad(
+                    (loss, (updates, pred_cf, pred_scale)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
                     )(train_state.params)
                     grad_norm = optax.global_norm(grads)
@@ -390,49 +455,66 @@ def make_train(config):
                         rng,
                     ), (
                         loss,
-                        qvals,
+                        chosen_action_qvals.mean(),
+                        jnp.abs(pred_cf).mean(),
+                        pred_scale.mean(),
                         grad_norm,
                         layer_grad_norms,
                     )
 
-                def preprocess_transition(x, rng):
-                    x = x.reshape(
-                        -1, *x.shape[2:]
-                    )  # num_steps*num_envs (batch_size), ...
-                    x = jax.random.permutation(rng, x)  # shuffle the transitions
-                    x = x.reshape(
-                        config["NUM_MINIBATCHES"], -1, *x.shape[1:]
-                    )  # num_mini_updates, batch_size/num_mini_updates, ...
+                def preprocess_transition(x, permutation):
+                    x = x.reshape(-1, *x.shape[2:])
+                    x = x[permutation]
+                    x = x.reshape(config["NUM_MINIBATCHES"], -1, *x.shape[1:])
                     return x
 
                 rng, _rng = jax.random.split(rng)
+                permutation = jax.random.permutation(
+                    _rng, config["NUM_STEPS"] * config["NUM_ENVS"]
+                )
                 minibatches = jax.tree_util.tree_map(
-                    lambda x: preprocess_transition(x, _rng), transitions
-                )  # num_actors*num_envs (batch_size), ...
-                targets = jax.tree_util.tree_map(
-                    lambda x: preprocess_transition(x, _rng), lambda_targets
+                    lambda x: preprocess_transition(x, permutation), transitions
                 )
 
-                rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
-                    _learn_phase, (train_state, rng), (minibatches, targets)
-                )
+                (train_state, rng), (
+                    loss,
+                    qvals,
+                    cf_magnitude,
+                    scale_mean,
+                    grad_norm,
+                    layer_grad_norms,
+                ) = jax.lax.scan(_learn_phase, (train_state, rng), minibatches)
 
-                return (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms)
+                return (train_state, rng), (
+                    loss,
+                    qvals,
+                    cf_magnitude,
+                    scale_mean,
+                    grad_norm,
+                    layer_grad_norms,
+                )
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
-                _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
-            )
+            (train_state, rng), (
+                loss,
+                qvals,
+                cf_magnitude,
+                scale_mean,
+                grad_norm,
+                layer_grad_norms,
+            ) = jax.lax.scan(_learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"])
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
             metrics = {
                 "env_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
-                "env_frame": train_state.timesteps * env.observation_space(env_params).shape[-1],
+                "env_frame": train_state.timesteps
+                * env.observation_space(env_params).shape[-1],
                 "grad_steps": train_state.grad_steps,
-                "td_loss": loss.mean(),
+                "cf_loss": loss.mean(),
                 "qvals": qvals.mean(),
+                "cf_magnitude": cf_magnitude.mean(),
+                "scale_mean": scale_mean.mean(),
                 "grad_norm": grad_norm.mean(),
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):
@@ -456,7 +538,6 @@ def make_train(config):
                 )
                 metrics.update({f"test/{k}": v for k, v in test_metrics.items()})
 
-            # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
                 def callback(metrics, seed_idx):
@@ -472,25 +553,16 @@ def make_train(config):
                 jax.debug.callback(callback, metrics, seed_idx)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, rng)
-
             return runner_state, metrics
 
         def get_test_metrics(train_state, rng):
-
             if not config.get("TEST_DURING_TRAINING", False):
                 return None
 
             def _env_step(carry, _):
                 env_state, last_obs, rng = carry
                 rng, _rng = jax.random.split(rng)
-                q_vals = network.apply(
-                    {
-                        "params": train_state.params,
-                        "batch_stats": train_state.batch_stats,
-                    },
-                    last_obs,
-                    train=False,
-                )
+                q_vals = q_values_from_state(train_state, last_obs, train=False)
                 eps = jnp.full(config["TEST_NUM_ENVS"], config["EPS_TEST"])
                 action = jax.vmap(eps_greedy_exploration)(
                     jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
@@ -506,7 +578,6 @@ def make_train(config):
             _, infos = jax.lax.scan(
                 _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
             )
-            # return mean of done infos
             done_infos = jax.tree_util.tree_map(
                 lambda x: jnp.nanmean(
                     jnp.where(
@@ -525,10 +596,8 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         expl_state = vmap_reset(config["NUM_ENVS"])(_rng)
 
-        # train
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, expl_state, test_metrics, _rng)
-
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
@@ -538,35 +607,36 @@ def make_train(config):
     return train
 
 
-
 def maybe_print_network_summary(config):
     if not config.get("PRINT_NETWORK_SUMMARY", False):
         return
 
     env, env_params = gymnax.make(config["ENV_NAME"])
     env = LogWrapper(env)
-    network = QNetwork(
+    network = CharacteristicQNetwork(
         action_dim=env.action_space(env_params).n,
         norm_type=config["NORM_TYPE"],
         norm_input=config.get("NORM_INPUT", False),
         mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
         mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
+        sigma_min=config.get("SIGMA_MIN", 1e-6),
     )
     init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+    init_omega = jnp.zeros((1, config["NUM_OMEGAS"]))
     summary = network.tabulate(
         jax.random.PRNGKey(config["SEED"]),
         init_x,
+        init_omega,
         train=False,
     )
     print(summary)
 
 
 def single_run(config):
-
     config = {**config, **config["alg"]}
     print(config)
 
-    alg_name = config.get("ALG_NAME", "pqn")
+    alg_name = config.get("ALG_NAME", "cqn")
     env_name = config["ENV_NAME"]
 
     maybe_print_network_summary(config)
@@ -607,7 +677,7 @@ def single_run(config):
             ),
         )
 
-        for i, rng in enumerate(rngs):
+        for i, _ in enumerate(rngs):
             params = jax.tree_util.tree_map(lambda x: x[i], model_state.params)
             save_path = os.path.join(
                 save_dir,
@@ -621,7 +691,7 @@ def tune(default_config):
 
     default_config = {**default_config, **default_config["alg"]}
     print(default_config)
-    alg_name = default_config.get("ALG_NAME", "pqn")
+    alg_name = default_config.get("ALG_NAME", "cqn")
     env_name = default_config["ENV_NAME"]
 
     def wrapped_make_train():
@@ -639,7 +709,7 @@ def tune(default_config):
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
         seed_idxs = jnp.arange(config["NUM_SEEDS"], dtype=jnp.int32)
         train_vjit = jax.jit(jax.vmap(make_train(config)))
-        outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
+        jax.block_until_ready(train_vjit(rngs, seed_idxs))
 
     sweep_config = {
         "name": f"{alg_name}_{env_name}",
@@ -657,6 +727,7 @@ def tune(default_config):
                     0.00005,
                 ]
             },
+            "OMEGA_SCALE": {"values": [0.5, 1.0, 2.0]},
         },
     }
 

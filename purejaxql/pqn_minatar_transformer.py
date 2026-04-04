@@ -57,6 +57,40 @@ class LearnedPositionalEmbedding(nn.Module):
         return x + pos_embedding[None, :seq_len, :]
 
 
+def _rotate_half(x: jnp.ndarray) -> jnp.ndarray:
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    return jnp.stack((-x_odd, x_even), axis=-1).reshape(x.shape)
+
+
+def apply_rope(
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    theta: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    head_dim = q.shape[-1]
+    if head_dim % 2 != 0:
+        raise ValueError(
+            "RoPE requires an even attention head dimension. "
+            f"Got {head_dim}."
+        )
+
+    positions = jnp.arange(q.shape[-2], dtype=jnp.float32)
+    inv_freq = 1.0 / (
+        jnp.asarray(theta, dtype=jnp.float32)
+        ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim)
+    )
+    angles = positions[:, None] * inv_freq[None, :]
+    sin = jnp.repeat(jnp.sin(angles), repeats=2, axis=-1)[None, None, :, :]
+    cos = jnp.repeat(jnp.cos(angles), repeats=2, axis=-1)[None, None, :, :]
+    sin = sin.astype(q.dtype)
+    cos = cos.astype(q.dtype)
+
+    q = (q * cos) + (_rotate_half(q) * sin)
+    k = (k * cos) + (_rotate_half(k) * sin)
+    return q, k
+
+
 class CNN(nn.Module):
     norm_type: str = "layer_norm"
 
@@ -81,6 +115,8 @@ class ManualCausalSelfAttention(nn.Module):
     hidden_dim: int
     num_heads: int
     causal: bool = True
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
     def __call__(
@@ -107,6 +143,8 @@ class ManualCausalSelfAttention(nn.Module):
         q = split_heads(q)  # (B, H, T, D)
         k = split_heads(k)  # (B, H, T, D)
         v = split_heads(v)  # (B, H, T, D)
+        if self.use_rope:
+            q, k = apply_rope(q, k, self.rope_theta)
 
         scale = jnp.asarray(head_dim, dtype=x.dtype) ** -0.5
         attn_logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale  # (B, H, T, T)
@@ -141,6 +179,8 @@ class QNetwork(nn.Module):
     max_sequence_length: int = 32
     num_attention_heads: int = 4
     causal_attention: bool = True
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
     @nn.compact
     def __call__(
@@ -153,6 +193,12 @@ class QNetwork(nn.Module):
             raise ValueError(
                 "MLP_HIDDEN_DIM must be divisible by NUM_ATTENTION_HEADS. "
                 f"Got {self.mlp_hidden_dim} and {self.num_attention_heads}."
+            )
+        head_dim = self.mlp_hidden_dim // self.num_attention_heads
+        if self.use_rope and head_dim % 2 != 0:
+            raise ValueError(
+                "RoPE requires MLP_HIDDEN_DIM / NUM_ATTENTION_HEADS to be even. "
+                f"Got head_dim={head_dim}."
             )
 
         is_sequence_input = x.ndim == 5  # [batch, T, H, W, C]
@@ -187,11 +233,12 @@ class QNetwork(nn.Module):
             name=f"mlp_proj",
         )(x)
         x = apply_norm(x, self.norm_type, train)
-        x = LearnedPositionalEmbedding(
-            max_sequence_length=self.max_sequence_length,
-            hidden_dim=self.mlp_hidden_dim,
-            name="position_embedding",
-        )(x)
+        if not self.use_rope:
+            x = LearnedPositionalEmbedding(
+                max_sequence_length=self.max_sequence_length,
+                hidden_dim=self.mlp_hidden_dim,
+                name="position_embedding",
+            )(x)
 
         for i in range(self.mlp_num_layers):
             attn_resid = x
@@ -199,6 +246,8 @@ class QNetwork(nn.Module):
                 hidden_dim=self.mlp_hidden_dim,
                 num_heads=self.num_attention_heads,
                 causal=self.causal_attention,
+                use_rope=self.use_rope,
+                rope_theta=self.rope_theta,
                 name=f"self_attention_{i}",
             )(x, attention_padding=attention_padding, train=train)
             x = apply_norm(x, self.norm_type, train)
@@ -432,6 +481,8 @@ def make_train(config):
             max_sequence_length=max(sequence_length, action_history_length),
             num_attention_heads=config.get("NUM_ATTENTION_HEADS", 4),
             causal_attention=config.get("CAUSAL_ATTENTION", True),
+            use_rope=config.get("USE_ROPE", False),
+            rope_theta=config.get("ROPE_THETA", 10000.0),
         )
 
         def create_agent(rng):
@@ -840,6 +891,8 @@ def maybe_print_network_summary(config):
         max_sequence_length=max(summary_sequence_length, summary_action_history_length),
         num_attention_heads=config.get("NUM_ATTENTION_HEADS", 4),
         causal_attention=config.get("CAUSAL_ATTENTION", True),
+        use_rope=config.get("USE_ROPE", False),
+        rope_theta=config.get("ROPE_THETA", 10000.0),
     )
     if summary_action_history_length > 1:
         init_x = jnp.zeros(
