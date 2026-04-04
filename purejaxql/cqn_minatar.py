@@ -133,20 +133,33 @@ class CharacteristicQNetwork(nn.Module):
         return x
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, omega: Union[jnp.ndarray, float], train: bool):
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        omega: Union[jnp.ndarray, float, None],
+        train: bool,
+        compute_cf: bool = True,
+    ):
         state_latent = self._encode_state(x, train)
-        omega = self._prepare_omegas(omega, state_latent.shape[0], state_latent.dtype)
-        freq_latent = FrequencyEmbedding(hidden_dim=self.mlp_hidden_dim)(omega)
-        joint_latent = state_latent[:, None, :] * freq_latent
-
-        hidden = self._shared_trunk(joint_latent, train)
-        hidden = hidden.reshape(state_latent.shape[0], omega.shape[1], -1)
+        if compute_cf:
+            omega = self._prepare_omegas(omega, state_latent.shape[0], state_latent.dtype)
+            freq_latent = FrequencyEmbedding(hidden_dim=self.mlp_hidden_dim)(omega)
+            joint_latent = state_latent[:, None, :] * freq_latent
+            hidden = self._shared_trunk(joint_latent, train)
+            hidden = hidden.reshape(state_latent.shape[0], omega.shape[1], -1)
+        else:
+            hidden = self._shared_trunk(state_latent[:, None, :], train)
+            hidden = hidden.reshape(state_latent.shape[0], 1, -1)
 
         mean = nn.Dense(
             self.action_dim,
             kernel_init=nn.initializers.zeros,
             name="mean_head",
         )(hidden)
+
+        if not compute_cf:
+            return {"mean": mean}
+
         scale = nn.Dense(
             self.action_dim,
             kernel_init=nn.initializers.zeros,
@@ -162,7 +175,7 @@ class CharacteristicQNetwork(nn.Module):
         return {"mean": mean, "scale": scale, "cf": cf}
 
     def q_values(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
-        outputs = self(x, jnp.zeros((x.shape[0], 1), dtype=x.dtype), train)
+        outputs = self(x, None, train, compute_cf=False)
         return outputs["mean"][:, 0, :]
 
 
@@ -342,45 +355,40 @@ def make_train(config):
                 method=CharacteristicQNetwork.q_values,
             )
 
-        def zero_frequency_mean_values(params, batch_stats, obs):
-            outputs = network.apply(
-                {
-                    "params": params,
-                    "batch_stats": batch_stats,
-                },
-                obs,
-                jnp.zeros((obs.shape[0], 1), dtype=obs.dtype),
-                train=False,
-            )
-            return outputs["mean"][:, 0, :]
-
         def compute_one_step_targets(train_state, transitions, omegas):
             num_steps, num_envs, num_omegas = omegas.shape
             obs_shape = transitions.next_obs.shape[2:]
             reward_dtype = transitions.reward.dtype
             gamma = jnp.asarray(config["GAMMA"], dtype=reward_dtype)
+            flat_batch_size = num_steps * num_envs
 
-            flat_next_obs = transitions.next_obs.reshape(num_steps * num_envs, *obs_shape)
-            next_mean_values = zero_frequency_mean_values(
-                train_state.params,
-                train_state.batch_stats,
-                flat_next_obs,
+            flat_next_obs = transitions.next_obs.reshape(flat_batch_size, *obs_shape)
+            bootstrap_omegas = jnp.concatenate(
+                (
+                    jnp.zeros((flat_batch_size, 1), dtype=omegas.dtype),
+                    (gamma * omegas).reshape(flat_batch_size, num_omegas),
+                ),
+                axis=-1,
             )
-            next_mean_values = next_mean_values.reshape(num_steps, num_envs, -1)
-            next_actions = jnp.argmax(next_mean_values, axis=-1)
-            next_mean_bootstrap = select_action_values(next_mean_values, next_actions)
-            done = transitions.done.astype(reward_dtype)
-
-            next_cf_outputs = network.apply(
+            bootstrap_outputs = network.apply(
                 {
                     "params": train_state.params,
                     "batch_stats": train_state.batch_stats,
                 },
                 flat_next_obs,
-                (gamma * omegas).reshape(num_steps * num_envs, num_omegas),
+                bootstrap_omegas,
                 train=False,
             )
-            next_cf = next_cf_outputs["cf"].reshape(num_steps, num_envs, num_omegas, -1)
+            next_mean_values = bootstrap_outputs["mean"][:, 0, :].reshape(
+                num_steps, num_envs, -1
+            )
+            next_actions = jnp.argmax(next_mean_values, axis=-1)
+            next_mean_bootstrap = select_action_values(next_mean_values, next_actions)
+            done = transitions.done.astype(reward_dtype)
+
+            next_cf = bootstrap_outputs["cf"][:, 1:, :].reshape(
+                num_steps, num_envs, num_omegas, -1
+            )
             next_cf = select_action_values(next_cf, next_actions)
 
             reward_phase = jnp.exp(1j * omegas * transitions.reward[..., None])
@@ -449,9 +457,7 @@ def make_train(config):
 
                 def _learn_phase(carry, minibatch_and_target):
                     train_state, rng = carry
-                    minibatch, target_cf, omega, target_mean = minibatch_and_target
-                    q_vals = q_values_from_state(train_state, minibatch.obs, train=False)
-                    chosen_action_qvals = select_action_values(q_vals, minibatch.action)
+                    minibatch, target_cf, omega_input, target_mean = minibatch_and_target
 
                     def _loss_fn(params):
                         outputs, updates = network.apply(
@@ -460,20 +466,21 @@ def make_train(config):
                                 "batch_stats": train_state.batch_stats,
                             },
                             minibatch.obs,
-                            omega,
+                            omega_input,
                             train=True,
                             mutable=["batch_stats"],
                         )
-                        pred_cf = select_action_values(outputs["cf"], minibatch.action)
+                        pred_qvals = outputs["mean"][:, 0, :]
+                        chosen_action_qvals = select_action_values(
+                            pred_qvals, minibatch.action
+                        )
+                        pred_cf = select_action_values(
+                            outputs["cf"][:, 1:, :], minibatch.action
+                        )
                         pred_scale = select_action_values(
-                            outputs["scale"], minibatch.action
+                            outputs["scale"][:, 1:, :], minibatch.action
                         )
-                        zero_mean_values = zero_frequency_mean_values(
-                            params,
-                            train_state.batch_stats,
-                            minibatch.obs,
-                        )
-                        pred_mean = select_action_values(zero_mean_values, minibatch.action)
+                        pred_mean = chosen_action_qvals
                         diff = pred_cf - target_cf
                         cf_loss = 0.5 * (
                             jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
@@ -485,6 +492,7 @@ def make_train(config):
                         )
                         return loss, (
                             updates,
+                            chosen_action_qvals,
                             pred_cf,
                             pred_scale,
                             cf_loss,
@@ -495,6 +503,7 @@ def make_train(config):
                         loss,
                         (
                             updates,
+                            chosen_action_qvals,
                             pred_cf,
                             pred_scale,
                             cf_loss,
@@ -544,7 +553,16 @@ def make_train(config):
                 )
                 cf_target_minibatches = preprocess_transition(cf_targets, permutation)
                 mean_target_minibatches = preprocess_transition(mean_targets, permutation)
-                omega_minibatches = preprocess_transition(omegas, permutation)
+                omega_input_minibatches = preprocess_transition(
+                    jnp.concatenate(
+                        (
+                            jnp.zeros((*omegas.shape[:2], 1), dtype=omegas.dtype),
+                            omegas,
+                        ),
+                        axis=-1,
+                    ),
+                    permutation,
+                )
 
                 (train_state, rng), (
                     loss,
@@ -561,7 +579,7 @@ def make_train(config):
                     (
                         minibatches,
                         cf_target_minibatches,
-                        omega_minibatches,
+                        omega_input_minibatches,
                         mean_target_minibatches,
                     ),
                 )
