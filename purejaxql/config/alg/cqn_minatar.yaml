@@ -23,7 +23,7 @@ LR_LINEAR_DECAY: True
 GAMMA: 0.99
 
 PRINT_NETWORK_SUMMARY: True
-LOG_LAYER_GRAD_NORMS: True
+LOG_LAYER_GRAD_NORMS: False
 
 # env specific
 ENV_NAME: "Asterix-MinAtar"
