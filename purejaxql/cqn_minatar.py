@@ -342,7 +342,7 @@ def make_train(config):
                 method=CharacteristicQNetwork.q_values,
             )
 
-        def zero_frequency_outputs(params, batch_stats, obs):
+        def zero_frequency_mean_values(params, batch_stats, obs):
             outputs = network.apply(
                 {
                     "params": params,
@@ -352,7 +352,7 @@ def make_train(config):
                 jnp.zeros((obs.shape[0], 1), dtype=obs.dtype),
                 train=False,
             )
-            return outputs["mean"][:, 0, :], outputs["scale"][:, 0, :]
+            return outputs["mean"][:, 0, :]
 
         def compute_one_step_targets(train_state, transitions, omegas):
             num_steps, num_envs, num_omegas = omegas.shape
@@ -361,17 +361,14 @@ def make_train(config):
             gamma = jnp.asarray(config["GAMMA"], dtype=reward_dtype)
 
             flat_next_obs = transitions.next_obs.reshape(num_steps * num_envs, *obs_shape)
-            next_mean_values, next_var_values = zero_frequency_outputs(
+            next_mean_values = zero_frequency_mean_values(
                 train_state.params,
                 train_state.batch_stats,
                 flat_next_obs,
             )
             next_mean_values = next_mean_values.reshape(num_steps, num_envs, -1)
-            next_var_values = next_var_values.reshape(num_steps, num_envs, -1)
             next_actions = jnp.argmax(next_mean_values, axis=-1)
             next_mean_bootstrap = select_action_values(next_mean_values, next_actions)
-            next_var_bootstrap = select_action_values(next_var_values, next_actions)
-            next_second_bootstrap = next_var_bootstrap + jnp.square(next_mean_bootstrap)
             done = transitions.done.astype(reward_dtype)
 
             next_cf_outputs = network.apply(
@@ -392,19 +389,9 @@ def make_train(config):
             )
 
             mean_targets = transitions.reward + gamma * (1.0 - done) * next_mean_bootstrap
-            second_targets = (
-                jnp.square(transitions.reward)
-                + 2.0 * gamma * (1.0 - done) * transitions.reward * next_mean_bootstrap
-                + jnp.square(gamma) * (1.0 - done) * next_second_bootstrap
-            )
-            variance_targets = jnp.maximum(
-                second_targets - jnp.square(mean_targets),
-                0.0,
-            )
-
             return jax.tree_util.tree_map(
                 jax.lax.stop_gradient,
-                (cf_targets, mean_targets, variance_targets),
+                (cf_targets, mean_targets),
             )
 
         def _update_step(runner_state, unused):
@@ -453,7 +440,7 @@ def make_train(config):
                 config["NUM_STEPS"] * config["NUM_ENVS"],
                 config,
             ).reshape(config["NUM_STEPS"], config["NUM_ENVS"], config["NUM_OMEGAS"])
-            cf_targets, mean_targets, variance_targets = compute_one_step_targets(
+            cf_targets, mean_targets = compute_one_step_targets(
                 train_state, transitions, omegas
             )
 
@@ -462,9 +449,7 @@ def make_train(config):
 
                 def _learn_phase(carry, minibatch_and_target):
                     train_state, rng = carry
-                    minibatch, target_cf, omega, target_mean, target_var = (
-                        minibatch_and_target
-                    )
+                    minibatch, target_cf, omega, target_mean = minibatch_and_target
                     q_vals = q_values_from_state(train_state, minibatch.obs, train=False)
                     chosen_action_qvals = select_action_values(q_vals, minibatch.action)
 
@@ -483,32 +468,27 @@ def make_train(config):
                         pred_scale = select_action_values(
                             outputs["scale"], minibatch.action
                         )
-                        zero_mean_values, zero_var_values = zero_frequency_outputs(
+                        zero_mean_values = zero_frequency_mean_values(
                             params,
                             train_state.batch_stats,
                             minibatch.obs,
                         )
                         pred_mean = select_action_values(zero_mean_values, minibatch.action)
-                        pred_var = select_action_values(zero_var_values, minibatch.action)
                         diff = pred_cf - target_cf
                         cf_loss = 0.5 * (
                             jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
                         ).mean()
                         mean_loss = 0.5 * jnp.square(pred_mean - target_mean).mean()
-                        var_loss = 0.5 * jnp.square(pred_var - target_var).mean()
                         loss = (
                             cf_loss
                             + config.get("AUX_MEAN_LOSS_WEIGHT", 0.1) * mean_loss
-                            + config.get("AUX_VAR_LOSS_WEIGHT", 0.1) * var_loss
                         )
                         return loss, (
                             updates,
                             pred_cf,
                             pred_scale,
-                            pred_var,
                             cf_loss,
                             mean_loss,
-                            var_loss,
                         )
 
                     (
@@ -517,10 +497,8 @@ def make_train(config):
                             updates,
                             pred_cf,
                             pred_scale,
-                            pred_var,
                             cf_loss,
                             mean_loss,
-                            var_loss,
                         ),
                     ), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
                         train_state.params
@@ -544,11 +522,9 @@ def make_train(config):
                         loss,
                         cf_loss,
                         mean_loss,
-                        var_loss,
                         chosen_action_qvals.mean(),
                         jnp.abs(pred_cf).mean(),
                         pred_scale.mean(),
-                        pred_var.mean(),
                         grad_norm,
                         layer_grad_norms,
                     )
@@ -568,20 +544,15 @@ def make_train(config):
                 )
                 cf_target_minibatches = preprocess_transition(cf_targets, permutation)
                 mean_target_minibatches = preprocess_transition(mean_targets, permutation)
-                variance_target_minibatches = preprocess_transition(
-                    variance_targets, permutation
-                )
                 omega_minibatches = preprocess_transition(omegas, permutation)
 
                 (train_state, rng), (
                     loss,
                     cf_loss,
                     mean_loss,
-                    var_loss,
                     qvals,
                     cf_magnitude,
                     scale_mean,
-                    variance_mean,
                     grad_norm,
                     layer_grad_norms,
                 ) = jax.lax.scan(
@@ -592,7 +563,6 @@ def make_train(config):
                         cf_target_minibatches,
                         omega_minibatches,
                         mean_target_minibatches,
-                        variance_target_minibatches,
                     ),
                 )
 
@@ -600,11 +570,9 @@ def make_train(config):
                     loss,
                     cf_loss,
                     mean_loss,
-                    var_loss,
                     qvals,
                     cf_magnitude,
                     scale_mean,
-                    variance_mean,
                     grad_norm,
                     layer_grad_norms,
                 )
@@ -614,11 +582,9 @@ def make_train(config):
                 loss,
                 cf_loss,
                 mean_loss,
-                var_loss,
                 qvals,
                 cf_magnitude,
                 scale_mean,
-                variance_mean,
                 grad_norm,
                 layer_grad_norms,
             ) = jax.lax.scan(_learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"])
@@ -633,11 +599,9 @@ def make_train(config):
                 "loss": loss.mean(),
                 "cf_loss": cf_loss.mean(),
                 "aux_mean_loss": mean_loss.mean(),
-                "aux_var_loss": var_loss.mean(),
                 "qvals": qvals.mean(),
                 "cf_magnitude": cf_magnitude.mean(),
                 "scale_mean": scale_mean.mean(),
-                "variance_mean": variance_mean.mean(),
                 "grad_norm": grad_norm.mean(),
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):
