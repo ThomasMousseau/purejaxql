@@ -167,12 +167,14 @@ class CharacteristicQNetwork(nn.Module):
 
 
 def sample_omegas(rng, batch_size: int, config) -> jnp.ndarray:
-    omegas = jax.random.normal(rng, (batch_size, config["NUM_OMEGAS"]))
-    omegas = omegas * config.get("OMEGA_SCALE", 1.0)
-    omega_clip = config.get("OMEGA_CLIP", None)
-    if omega_clip is not None:
-        omegas = jnp.clip(omegas, -omega_clip, omega_clip)
-    return omegas
+    num_omegas = config["NUM_OMEGAS"]
+    del config
+    return jax.random.uniform(
+        rng,
+        (batch_size, num_omegas),
+        minval=0.0,
+        maxval=1.0,
+    )
 
 
 def select_action_values(values: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
