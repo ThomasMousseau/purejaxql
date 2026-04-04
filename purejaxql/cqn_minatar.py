@@ -532,7 +532,7 @@ def make_train(config):
                                 "batch_stats": train_state.batch_stats,
                             },
                             minibatch.obs,
-                            train=True,
+                            train=False,
                             method=CharacteristicQNetwork.q_values,
                         )
                         pred_mean = select_action_values(pred_mean, minibatch.action)
