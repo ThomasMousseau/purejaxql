@@ -424,6 +424,35 @@ def make_train(config):
             )
             return lambda_targets
 
+        def compute_mean_lambda_targets(train_state, transitions):
+            last_q = q_values_from_state(train_state, transitions.next_obs[-1], train=False)
+            last_q = jnp.max(last_q, axis=-1)
+
+            def _get_target(lambda_returns_and_next_q, transition):
+                lambda_returns, next_q = lambda_returns_and_next_q
+                target_bootstrap = (
+                    transition.reward + config["GAMMA"] * (1 - transition.done) * next_q
+                )
+                delta = lambda_returns - next_q
+                lambda_returns = (
+                    target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
+                )
+                lambda_returns = (
+                    1 - transition.done
+                ) * lambda_returns + transition.done * transition.reward
+                next_q = jnp.max(transition.q_val, axis=-1)
+                return (lambda_returns, next_q), lambda_returns
+
+            last_q = last_q * (1 - transitions.done[-1])
+            lambda_returns = transitions.reward[-1] + config["GAMMA"] * last_q
+            _, targets = jax.lax.scan(
+                _get_target,
+                (lambda_returns, last_q),
+                jax.tree_util.tree_map(lambda x: x[:-1], transitions),
+                reverse=True,
+            )
+            return jnp.concatenate((targets, lambda_returns[jnp.newaxis]))
+
         def _update_step(runner_state, unused):
             train_state, expl_state, test_metrics, rng = runner_state
 
@@ -471,13 +500,14 @@ def make_train(config):
                 config,
             ).reshape(config["NUM_STEPS"], config["NUM_ENVS"], config["NUM_OMEGAS"])
             lambda_targets = compute_lambda_targets(train_state, transitions, omegas)
+            mean_lambda_targets = compute_mean_lambda_targets(train_state, transitions)
 
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
                 def _learn_phase(carry, minibatch_and_target):
                     train_state, rng = carry
-                    minibatch, target_cf, omega = minibatch_and_target
+                    minibatch, target_cf, omega, target_mean = minibatch_and_target
                     q_vals = q_values_from_state(train_state, minibatch.obs, train=False)
                     chosen_action_qvals = select_action_values(q_vals, minibatch.action)
 
@@ -496,15 +526,33 @@ def make_train(config):
                         pred_scale = select_action_values(
                             outputs["scale"], minibatch.action
                         )
+                        pred_mean = network.apply(
+                            {
+                                "params": params,
+                                "batch_stats": train_state.batch_stats,
+                            },
+                            minibatch.obs,
+                            train=True,
+                            method=CharacteristicQNetwork.q_values,
+                        )
+                        pred_mean = select_action_values(pred_mean, minibatch.action)
                         diff = pred_cf - target_cf
-                        loss = 0.5 * (
+                        cf_loss = 0.5 * (
                             jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
                         ).mean()
-                        return loss, (updates, pred_cf, pred_scale)
+                        mean_loss = 0.5 * jnp.square(pred_mean - target_mean).mean()
+                        loss = (
+                            cf_loss
+                            + config.get("AUX_MEAN_LOSS_WEIGHT", 0.1) * mean_loss
+                        )
+                        return loss, (updates, pred_cf, pred_scale, cf_loss, mean_loss)
 
-                    (loss, (updates, pred_cf, pred_scale)), grads = jax.value_and_grad(
-                        _loss_fn, has_aux=True
-                    )(train_state.params)
+                    (
+                        loss,
+                        (updates, pred_cf, pred_scale, cf_loss, mean_loss),
+                    ), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
+                        train_state.params
+                    )
                     grad_norm = optax.global_norm(grads)
                     if config.get("LOG_LAYER_GRAD_NORMS", False):
                         layer_grad_norms = get_layer_grad_norms(grads)
@@ -522,6 +570,8 @@ def make_train(config):
                         rng,
                     ), (
                         loss,
+                        cf_loss,
+                        mean_loss,
                         chosen_action_qvals.mean(),
                         jnp.abs(pred_cf).mean(),
                         pred_scale.mean(),
@@ -543,10 +593,15 @@ def make_train(config):
                     lambda x: preprocess_transition(x, permutation), transitions
                 )
                 target_minibatches = preprocess_transition(lambda_targets, permutation)
+                mean_target_minibatches = preprocess_transition(
+                    mean_lambda_targets, permutation
+                )
                 omega_minibatches = preprocess_transition(omegas, permutation)
 
                 (train_state, rng), (
                     loss,
+                    cf_loss,
+                    mean_loss,
                     qvals,
                     cf_magnitude,
                     scale_mean,
@@ -555,11 +610,18 @@ def make_train(config):
                 ) = jax.lax.scan(
                     _learn_phase,
                     (train_state, rng),
-                    (minibatches, target_minibatches, omega_minibatches),
+                    (
+                        minibatches,
+                        target_minibatches,
+                        omega_minibatches,
+                        mean_target_minibatches,
+                    ),
                 )
 
                 return (train_state, rng), (
                     loss,
+                    cf_loss,
+                    mean_loss,
                     qvals,
                     cf_magnitude,
                     scale_mean,
@@ -570,6 +632,8 @@ def make_train(config):
             rng, _rng = jax.random.split(rng)
             (train_state, rng), (
                 loss,
+                cf_loss,
+                mean_loss,
                 qvals,
                 cf_magnitude,
                 scale_mean,
@@ -584,7 +648,9 @@ def make_train(config):
                 "env_frame": train_state.timesteps
                 * env.observation_space(env_params).shape[-1],
                 "grad_steps": train_state.grad_steps,
-                "cf_loss": loss.mean(),
+                "loss": loss.mean(),
+                "cf_loss": cf_loss.mean(),
+                "aux_mean_loss": mean_loss.mean(),
                 "qvals": qvals.mean(),
                 "cf_magnitude": cf_magnitude.mean(),
                 "scale_mean": scale_mean.mean(),
