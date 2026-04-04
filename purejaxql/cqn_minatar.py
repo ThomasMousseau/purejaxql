@@ -6,7 +6,7 @@ import copy
 import os
 import random
 import time
-from typing import Any
+from typing import Any, Union
 
 import chex
 import flax.linen as nn
@@ -74,7 +74,7 @@ class CharacteristicQNetwork(nn.Module):
     sigma_min: float = 1e-6
 
     def _prepare_omegas(
-        self, omega: jnp.ndarray | float, batch_size: int, dtype: jnp.dtype
+        self, omega: Union[jnp.ndarray, float], batch_size: int, dtype: jnp.dtype
     ) -> jnp.ndarray:
         omega = jnp.asarray(omega, dtype=dtype)
         if omega.ndim == 0:
@@ -133,7 +133,7 @@ class CharacteristicQNetwork(nn.Module):
         return x
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, omega: jnp.ndarray | float, train: bool):
+    def __call__(self, x: jnp.ndarray, omega: Union[jnp.ndarray, float], train: bool):
         state_latent = self._encode_state(x, train)
         omega = self._prepare_omegas(omega, state_latent.shape[0], state_latent.dtype)
         freq_latent = FrequencyEmbedding(hidden_dim=self.mlp_hidden_dim)(omega)
@@ -178,15 +178,14 @@ def sample_omegas(rng, batch_size: int, config) -> jnp.ndarray:
 
 
 def select_action_values(values: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
-    if values.ndim == 2:
-        return jnp.take_along_axis(values, actions[:, None], axis=-1).squeeze(axis=-1)
-    if values.ndim == 3:
-        action_idx = jnp.broadcast_to(
-            actions[:, None, None],
-            (values.shape[0], values.shape[1], 1),
-        )
-        return jnp.take_along_axis(values, action_idx, axis=-1).squeeze(axis=-1)
-    raise ValueError(f"Unsupported tensor rank for action selection: {values.ndim}")
+    if values.ndim < 2:
+        raise ValueError(f"Unsupported tensor rank for action selection: {values.ndim}")
+    action_idx = actions
+    for _ in range(values.ndim - actions.ndim - 1):
+        action_idx = jnp.expand_dims(action_idx, axis=-1)
+    action_idx = jnp.expand_dims(action_idx, axis=-1)
+    action_idx = jnp.broadcast_to(action_idx, values.shape[:-1] + (1,))
+    return jnp.take_along_axis(values, action_idx, axis=-1).squeeze(axis=-1)
 
 
 @chex.dataclass(frozen=True)
@@ -343,6 +342,88 @@ def make_train(config):
                 method=CharacteristicQNetwork.q_values,
             )
 
+        def compute_lambda_targets(train_state, transitions, base_omegas):
+            num_steps, num_envs, num_omegas = base_omegas.shape
+            obs_shape = transitions.next_obs.shape[2:]
+            gamma = jnp.asarray(config["GAMMA"], dtype=base_omegas.dtype)
+            lambda_coeff = jnp.asarray(config["LAMBDA"], dtype=base_omegas.dtype)
+            start_indices = jnp.arange(num_steps, dtype=jnp.int32)[:, None, None]
+
+            flat_next_obs = transitions.next_obs.reshape(num_steps * num_envs, *obs_shape)
+            next_q_vals = q_values_from_state(train_state, flat_next_obs, train=False)
+            next_q_vals = next_q_vals.reshape(num_steps, num_envs, -1)
+            next_actions = jnp.argmax(next_q_vals, axis=-1)
+
+            def get_bootstrap_cf(step_idx, current_omegas):
+                repeated_next_obs = jnp.broadcast_to(
+                    transitions.next_obs[step_idx][None, ...],
+                    (num_steps, num_envs, *obs_shape),
+                ).reshape(num_steps * num_envs, *obs_shape)
+                repeated_actions = jnp.broadcast_to(
+                    next_actions[step_idx][None, :],
+                    (num_steps, num_envs),
+                )
+                outputs = network.apply(
+                    {
+                        "params": train_state.params,
+                        "batch_stats": train_state.batch_stats,
+                    },
+                    repeated_next_obs,
+                    (gamma * current_omegas).reshape(num_steps * num_envs, num_omegas),
+                    train=False,
+                )
+                cf = outputs["cf"].reshape(num_steps, num_envs, num_omegas, -1)
+                return select_action_values(cf, repeated_actions)
+
+            time_to_end = (num_steps - 1) - jnp.arange(num_steps, dtype=base_omegas.dtype)
+            current_omegas = base_omegas * jnp.power(gamma, time_to_end)[:, None, None]
+
+            last_idx = num_steps - 1
+            last_bootstrap_cf = get_bootstrap_cf(last_idx, current_omegas)
+            last_reward_phase = jnp.exp(
+                1j * current_omegas * transitions.reward[last_idx][None, :, None]
+            )
+            last_done = transitions.done[last_idx][None, :, None]
+            current_targets = last_reward_phase * (
+                (1.0 - last_done) * last_bootstrap_cf + last_done
+            )
+
+            def _scan_target(carry, step_idx):
+                current_targets, current_omegas = carry
+                bootstrap_cf = get_bootstrap_cf(step_idx, current_omegas)
+                reward_phase = jnp.exp(
+                    1j * current_omegas * transitions.reward[step_idx][None, :, None]
+                )
+                done = transitions.done[step_idx][None, :, None]
+                updated_targets = reward_phase * (
+                    done
+                    + (1.0 - done)
+                    * (
+                        (1.0 - lambda_coeff) * bootstrap_cf
+                        + lambda_coeff * current_targets
+                    )
+                )
+                active_mask = start_indices <= step_idx
+                current_targets = jnp.where(
+                    active_mask,
+                    updated_targets,
+                    current_targets,
+                )
+                current_omegas = jnp.where(
+                    start_indices < step_idx,
+                    current_omegas / gamma,
+                    current_omegas,
+                )
+                return (current_targets, current_omegas), None
+
+            scan_indices = jnp.arange(num_steps - 1, dtype=jnp.int32)[::-1]
+            (lambda_targets, _), _ = jax.lax.scan(
+                _scan_target,
+                (current_targets, current_omegas),
+                scan_indices,
+            )
+            return lambda_targets
+
         def _update_step(runner_state, unused):
             train_state, expl_state, test_metrics, rng = runner_state
 
@@ -383,38 +464,22 @@ def make_train(config):
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
             )
 
+            rng, rng_omega_targets = jax.random.split(rng)
+            omegas = sample_omegas(
+                rng_omega_targets,
+                config["NUM_STEPS"] * config["NUM_ENVS"],
+                config,
+            ).reshape(config["NUM_STEPS"], config["NUM_ENVS"], config["NUM_OMEGAS"])
+            lambda_targets = compute_lambda_targets(train_state, transitions, omegas)
+
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
-                def _learn_phase(carry, minibatch):
+                def _learn_phase(carry, minibatch_and_target):
                     train_state, rng = carry
-                    rng, rng_omega = jax.random.split(rng)
-                    batch_size = minibatch.action.shape[0]
-                    omegas = sample_omegas(rng_omega, batch_size, config)
-
+                    minibatch, target_cf, omega = minibatch_and_target
                     q_vals = q_values_from_state(train_state, minibatch.obs, train=False)
                     chosen_action_qvals = select_action_values(q_vals, minibatch.action)
-
-                    next_q_vals = q_values_from_state(
-                        train_state, minibatch.next_obs, train=False
-                    )
-                    next_actions = jnp.argmax(next_q_vals, axis=-1)
-                    next_outputs = network.apply(
-                        {
-                            "params": train_state.params,
-                            "batch_stats": train_state.batch_stats,
-                        },
-                        minibatch.next_obs,
-                        config["GAMMA"] * omegas,
-                        train=False,
-                    )
-                    next_cf = select_action_values(next_outputs["cf"], next_actions)
-                    reward_phase = jnp.exp(1j * omegas * minibatch.reward[:, None])
-                    bootstrap = (
-                        (1.0 - minibatch.done)[:, None] * next_cf
-                        + minibatch.done[:, None]
-                    )
-                    target_cf = jax.lax.stop_gradient(reward_phase * bootstrap)
 
                     def _loss_fn(params):
                         outputs, updates = network.apply(
@@ -423,7 +488,7 @@ def make_train(config):
                                 "batch_stats": train_state.batch_stats,
                             },
                             minibatch.obs,
-                            omegas,
+                            omega,
                             train=True,
                             mutable=["batch_stats"],
                         )
@@ -477,6 +542,8 @@ def make_train(config):
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, permutation), transitions
                 )
+                target_minibatches = preprocess_transition(lambda_targets, permutation)
+                omega_minibatches = preprocess_transition(omegas, permutation)
 
                 (train_state, rng), (
                     loss,
@@ -485,7 +552,11 @@ def make_train(config):
                     scale_mean,
                     grad_norm,
                     layer_grad_norms,
-                ) = jax.lax.scan(_learn_phase, (train_state, rng), minibatches)
+                ) = jax.lax.scan(
+                    _learn_phase,
+                    (train_state, rng),
+                    (minibatches, target_minibatches, omega_minibatches),
+                )
 
                 return (train_state, rng), (
                     loss,
