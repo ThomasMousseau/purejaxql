@@ -62,7 +62,13 @@ class FrequencyEmbedding(nn.Module):
     def __call__(self, omega: jnp.ndarray) -> jnp.ndarray:
         omega = jnp.asarray(omega, dtype=jnp.float32)
         basis = jnp.arange(1, self.hidden_dim + 1, dtype=omega.dtype)
-        return jnp.cos(jnp.pi * omega[..., None] * basis)
+        cos_features = jnp.cos(jnp.pi * omega[..., None] * basis)
+        projected = nn.Dense(
+            self.hidden_dim,
+            kernel_init=nn.initializers.he_normal(),
+            name="proj",
+        )(cos_features)
+        return nn.relu(projected)
 
 
 class CharacteristicQNetwork(nn.Module):
