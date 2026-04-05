@@ -355,18 +355,44 @@ def make_train(config):
                 method=CharacteristicQNetwork.q_values,
             )
 
-        def compute_one_step_targets(train_state, transitions, omegas):
+        def compute_n_step_targets(train_state, transitions, omegas):
             num_steps, num_envs, num_omegas = omegas.shape
             obs_shape = transitions.next_obs.shape[2:]
             reward_dtype = transitions.reward.dtype
             gamma = jnp.asarray(config["GAMMA"], dtype=reward_dtype)
+            n_step = int(config.get("N_STEP", 1))
             flat_batch_size = num_steps * num_envs
 
-            flat_next_obs = transitions.next_obs.reshape(flat_batch_size, *obs_shape)
+            time_indices = jnp.arange(num_steps)
+            bootstrap_mask = jnp.ones((num_steps, num_envs), dtype=reward_dtype)
+            bootstrap_gamma = jnp.ones((num_steps, num_envs), dtype=reward_dtype)
+            reward_sum = jnp.zeros((num_steps, num_envs), dtype=reward_dtype)
+
+            for k in range(n_step):
+                valid = ((time_indices + k) < num_steps).astype(reward_dtype)[:, None]
+                step_indices = jnp.minimum(time_indices + k, num_steps - 1)
+                step_reward = transitions.reward[step_indices]
+                step_done = transitions.done[step_indices].astype(reward_dtype)
+
+                reward_sum = (
+                    reward_sum
+                    + valid * bootstrap_mask * bootstrap_gamma * step_reward
+                )
+                bootstrap_mask = bootstrap_mask * (1.0 - valid * step_done)
+                bootstrap_gamma = bootstrap_gamma * jnp.where(valid > 0, gamma, 1.0)
+
+            effective_horizon = jnp.minimum(n_step, num_steps - time_indices)
+            bootstrap_indices = time_indices + effective_horizon - 1
+            flat_next_obs = transitions.next_obs[bootstrap_indices].reshape(
+                flat_batch_size, *obs_shape
+            )
+            scaled_omegas = (bootstrap_gamma[..., None] * omegas).reshape(
+                flat_batch_size, num_omegas
+            )
             bootstrap_omegas = jnp.concatenate(
                 (
                     jnp.zeros((flat_batch_size, 1), dtype=omegas.dtype),
-                    (gamma * omegas).reshape(flat_batch_size, num_omegas),
+                    scaled_omegas,
                 ),
                 axis=-1,
             )
@@ -384,19 +410,21 @@ def make_train(config):
             )
             next_actions = jnp.argmax(next_mean_values, axis=-1)
             next_mean_bootstrap = select_action_values(next_mean_values, next_actions)
-            done = transitions.done.astype(reward_dtype)
 
             next_cf = bootstrap_outputs["cf"][:, 1:, :].reshape(
                 num_steps, num_envs, num_omegas, -1
             )
             next_cf = select_action_values(next_cf, next_actions)
 
-            reward_phase = jnp.exp(1j * omegas * transitions.reward[..., None])
+            reward_phase = jnp.exp(1j * omegas * reward_sum[..., None])
             cf_targets = reward_phase * (
-                (1.0 - done[..., None]) * next_cf + done[..., None]
+                (1.0 - bootstrap_mask[..., None])
+                + bootstrap_mask[..., None] * next_cf
             )
 
-            mean_targets = transitions.reward + gamma * (1.0 - done) * next_mean_bootstrap
+            mean_targets = (
+                reward_sum + bootstrap_mask * bootstrap_gamma * next_mean_bootstrap
+            )
             return jax.tree_util.tree_map(
                 jax.lax.stop_gradient,
                 (cf_targets, mean_targets),
@@ -448,7 +476,7 @@ def make_train(config):
                 config["NUM_STEPS"] * config["NUM_ENVS"],
                 config,
             ).reshape(config["NUM_STEPS"], config["NUM_ENVS"], config["NUM_OMEGAS"])
-            cf_targets, mean_targets = compute_one_step_targets(
+            cf_targets, mean_targets = compute_n_step_targets(
                 train_state, transitions, omegas
             )
 
