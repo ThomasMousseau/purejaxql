@@ -62,13 +62,7 @@ class FrequencyEmbedding(nn.Module):
     def __call__(self, omega: jnp.ndarray) -> jnp.ndarray:
         omega = jnp.asarray(omega, dtype=jnp.float32)
         basis = jnp.arange(1, self.hidden_dim + 1, dtype=omega.dtype)
-        cos_features = jnp.cos(jnp.pi * omega[..., None] * basis)
-        projected = nn.Dense(
-            self.hidden_dim,
-            kernel_init=nn.initializers.he_normal(),
-            name="proj",
-        )(cos_features)
-        return nn.relu(projected)
+        return jnp.cos(jnp.pi * omega[..., None] * basis)
 
 
 class CharacteristicQNetwork(nn.Module):
@@ -187,13 +181,46 @@ class CharacteristicQNetwork(nn.Module):
 
 def sample_omegas(rng, batch_size: int, config) -> jnp.ndarray:
     num_omegas = config["NUM_OMEGAS"]
-    del config
-    return jax.random.uniform(
-        rng,
-        (batch_size, num_omegas),
-        minval=0.0,
-        maxval=1.0,
-    )
+    shape = (batch_size, num_omegas)
+    sampler = config.get("OMEGA_SAMPLER", "low_freq_mix")
+    omega_scale = jnp.asarray(config.get("OMEGA_SCALE", 1.0), dtype=jnp.float32)
+    omega_clip = jnp.asarray(config.get("OMEGA_CLIP", jnp.inf), dtype=jnp.float32)
+
+    if sampler == "uniform":
+        base_omegas = jax.random.uniform(
+            rng,
+            shape,
+            minval=0.0,
+            maxval=1.0,
+        )
+    elif sampler == "beta":
+        alpha = jnp.asarray(config.get("OMEGA_BETA_ALPHA", 1.0), dtype=jnp.float32)
+        beta = jnp.asarray(config.get("OMEGA_BETA_BETA", 3.0), dtype=jnp.float32)
+        base_omegas = jax.random.beta(rng, alpha, beta, shape=shape)
+    elif sampler == "low_freq_mix":
+        rng_mix, rng_beta, rng_uniform = jax.random.split(rng, 3)
+        alpha = jnp.asarray(config.get("OMEGA_BETA_ALPHA", 1.0), dtype=jnp.float32)
+        beta = jnp.asarray(config.get("OMEGA_BETA_BETA", 3.0), dtype=jnp.float32)
+        uniform_mix_prob = jnp.asarray(
+            config.get("OMEGA_UNIFORM_MIX_PROB", 0.25), dtype=jnp.float32
+        )
+        beta_omegas = jax.random.beta(rng_beta, alpha, beta, shape=shape)
+        uniform_omegas = jax.random.uniform(
+            rng_uniform,
+            shape,
+            minval=0.0,
+            maxval=1.0,
+        )
+        use_uniform = jax.random.uniform(rng_mix, shape) < uniform_mix_prob
+        base_omegas = jnp.where(use_uniform, uniform_omegas, beta_omegas)
+    else:
+        raise ValueError(
+            "Unsupported omega sampler. "
+            f"Got {sampler!r}; expected 'uniform', 'beta', or 'low_freq_mix'."
+        )
+
+    omegas = omega_scale * base_omegas
+    return jnp.clip(omegas, 0.0, omega_clip)
 
 
 def select_action_values(values: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
@@ -654,6 +681,15 @@ def make_train(config):
                 "qvals": qvals.mean(),
                 "cf_magnitude": cf_magnitude.mean(),
                 "scale_mean": scale_mean.mean(),
+                "omega_min": omegas.min(),
+                "omega_mean": omegas.mean(),
+                "omega_std": omegas.std(),
+                "omega_max": omegas.max(),
+                "omega_frac_clipped": jnp.where(
+                    jnp.isfinite(jnp.asarray(config.get("OMEGA_CLIP", jnp.inf))),
+                    (omegas >= jnp.asarray(config["OMEGA_CLIP"], dtype=omegas.dtype)).mean(),
+                    jnp.asarray(0.0, dtype=omegas.dtype),
+                ),
                 "grad_norm": grad_norm.mean(),
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):
