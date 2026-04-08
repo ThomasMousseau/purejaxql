@@ -17,6 +17,8 @@ ROPE_THETA: 10000.0
 LR: 0.0005
 MAX_GRAD_NORM: 10
 PER_LAYER_GRADIENT_CLIPPING: False
+K: 0 # singularclip interval in gradient steps; 0 disables singularclip
+c: 1.0 # singularclip singular value bound, clips into [1/c, c]
 LR_LINEAR_DECAY: True
 GAMMA: 0.99
 LAMBDA: 0.65
