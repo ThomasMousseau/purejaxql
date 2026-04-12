@@ -700,6 +700,9 @@ def make_train(config):
                     {f"grad_norm/{k}": v for k, v in layer_grad_norms.items()}
                 )
             metrics.update({k: v.mean() for k, v in infos.items()})
+            metrics["global_step"] = metrics["env_step"]
+            if "returned_episode_returns" in metrics:
+                metrics["charts/episodic_return"] = metrics["returned_episode_returns"]
 
             if config.get("TEST_DURING_TRAINING", False):
                 rng, _rng = jax.random.split(rng)
@@ -816,15 +819,23 @@ def single_run(config):
 
     maybe_print_network_summary(config)
 
+    _tags = [
+        alg_name.upper(),
+        env_name.upper(),
+        f"jax_{jax.__version__}",
+    ]
+    _et = config.get("EXPERIMENT_TAG")
+    if _et:
+        _tags.append(str(_et))
+    _extra = config.get("WANDB_EXTRA_TAGS")
+    if _extra:
+        _tags.extend(str(x) for x in _extra)
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=[
-            alg_name.upper(),
-            env_name.upper(),
-            f"jax_{jax.__version__}",
-        ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
+        tags=_tags,
+        name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
         config=config,
         mode=config["WANDB_MODE"],
     )

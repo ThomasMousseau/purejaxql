@@ -48,7 +48,6 @@ from purejaxql.utils.craftax_wrappers import (
 )
 from purejaxql.utils.mog_cf import build_mog_cf, mog_q_values, sample_frequencies
 
-
 class MoGQNetwork(nn.Module):
     """Feedforward trunk + MoG heads (π, μ, σ) per action × component (cf. ``CF_QNetwork`` in CVI)."""
 
@@ -380,13 +379,15 @@ def make_train(config: dict):
             if config["WANDB_MODE"] != "disabled":
 
                 def callback(m, seed_idx_):
-                    if m["update_steps"] % int(config.get("WANDB_LOG_INTERVAL", 128)) == 0:
-                        if config.get("WANDB_LOG_ALL_SEEDS", False):
-                            m = {
-                                **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in m.items()},
-                                **m,
-                            }
-                        wandb.log(m, step=m["update_steps"])
+                    _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
+                    if int(m["update_steps"]) % _iv != 0:
+                        return
+                    if config.get("WANDB_LOG_ALL_SEEDS", False):
+                        m = {
+                            **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in m.items()},
+                            **m,
+                        }
+                    wandb.log(m, step=m["update_steps"])
 
                 jax.debug.callback(callback, metrics, seed_idx)
 
@@ -480,7 +481,9 @@ def single_run(config):
     seed_idxs = jnp.arange(config["NUM_SEEDS"], dtype=jnp.int32)
     train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
-    print(f"Took {time.time()-t0} seconds to complete.")
+    _elapsed = time.time() - t0
+    print(f"Took {_elapsed} seconds to complete.")
+    print(f"SPS: {float(config['TOTAL_TIMESTEPS']) / max(_elapsed, 1e-6)}")
 
     if config.get("SAVE_PATH", None) is not None:
         from purejaxql.utils.save_load import save_params

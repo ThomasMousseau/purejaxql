@@ -10,6 +10,8 @@ Plot Craftax **RNN** comparison (**PQN-RNN** vs **MoG-PQN-RNN**) from Weights & 
 - Y-axis: ``returned_episode_returns`` (mean over parallel envs at episode end; same as other Craftax plots).
 - Curve: **mean across seeds**; shaded band: **std** or **SEM** (see ``--error-type``).
 - **Smoothing**: centered moving average on the mean (and on std/sem bands) via ``--smooth-window``.
+- **multi_seed** (optional): runs tagged ``multi_seed`` with ``seed_i/returned_episode_returns`` (``WANDB_LOG_ALL_SEEDS``)
+  are expanded into multiple curves per run — same idea as :func:`old_cvi.plot_wandb_minatar.curves_from_wandb_run`.
 
 Colors (fixed):
   - **MoG-PQN-RNN**: mid blue ``#2077b4``
@@ -44,10 +46,10 @@ except ImportError as e:
 
 from old_cvi.plot_wandb_minatar import (
     _interp_on_grid,
-    _load_series,
     _run_matches_required,
     _smooth_1d,
     _wandb_path,
+    curves_from_wandb_run,
 )
 
 # Fills: MoG mid blue; PQN light green.
@@ -100,6 +102,7 @@ def plot_craftax_rnn_compare(
     smooth_window: int,
     error_type: str,
     env_name_filter: str | None,
+    multi_seed_tag: str = "multi_seed",
 ) -> None:
     required = [experiment_tag]
     api = wandb.Api()
@@ -120,10 +123,13 @@ def plot_craftax_rnn_compare(
         g = _algo_group(run, algo_tags)
         if g is None:
             continue
-        series = _load_series(run, metric, step_metric)
-        if series is None:
-            continue
-        by_algo[g].append(series)
+        for series in curves_from_wandb_run(
+            run,
+            metric=metric,
+            step_metric=step_metric,
+            multi_seed_tag=multi_seed_tag,
+        ):
+            by_algo[g].append(series)
 
     missing = [a for a in algo_tags if len(by_algo.get(a, [])) == 0]
     if len(missing) == len(algo_tags):
@@ -222,6 +228,11 @@ def main() -> None:
         default=None,
         help="If set, filter runs where config ENV_NAME matches (e.g. Craftax-Symbolic-v1).",
     )
+    p.add_argument(
+        "--multi-seed-tag",
+        default="multi_seed",
+        help="If present on a run, load seed_i/metric series (see curves_from_wandb_run). Use '' to disable.",
+    )
     args = p.parse_args()
 
     plot_craftax_rnn_compare(
@@ -237,6 +248,7 @@ def main() -> None:
         smooth_window=args.smooth_window,
         error_type=args.error_type,
         env_name_filter=args.env_name,
+        multi_seed_tag=args.multi_seed_tag or "",
     )
 
 

@@ -11,9 +11,7 @@ Q(λ)-style *exploration* via Q=Σπμ, RAdam, memory window, same rollout/minib
       - ``lambda_q``: **same scalar TD loss as PQN-RNN** — λ-returns vs **Σ_k π_k μ_k** for
         the taken action (only the head differs from PQN; fair scalar baseline).
 
-**Contrast with ``mog_pqn_craftax``** (feedforward MoG): that script keeps **Double DQN +
-target network + Polyak** as in the original CVI MoG-DQN stack. This RNN file deliberately
-matches PQN-RNN training mechanics for controlled comparison.
+This RNN file deliberately matches PQN-RNN training mechanics for controlled comparison.
 
 Run::
 
@@ -596,6 +594,9 @@ def make_train(config: dict):
             if config["WANDB_MODE"] != "disabled":
 
                 def callback(m, seed_idx_):
+                    _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
+                    if int(m["update_steps"]) % _iv != 0:
+                        return
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         m = {
                             **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in m.items()},
@@ -757,6 +758,17 @@ def single_run(config):
     if _extra:
         _tags.extend(str(x) for x in _extra)
 
+    _wk = {}
+    _g = os.environ.get("WANDB_RUN_GROUP") or config.get("WANDB_RUN_GROUP")
+    if _g:
+        _wk["group"] = str(_g)
+    _jt = os.environ.get("WANDB_JOB_TYPE") or config.get("WANDB_JOB_TYPE")
+    if _jt:
+        _wk["job_type"] = str(_jt)
+    _nt = os.environ.get("WANDB_NOTES") or config.get("WANDB_NOTES")
+    if _nt:
+        _wk["notes"] = str(_nt)
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -764,6 +776,7 @@ def single_run(config):
         name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
         config=config,
         mode=config["WANDB_MODE"],
+        **_wk,
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -773,7 +786,9 @@ def single_run(config):
     seed_idxs = jnp.arange(config["NUM_SEEDS"], dtype=jnp.int32)
     train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
-    print(f"Took {time.time()-t0} seconds to complete.")
+    _elapsed = time.time() - t0
+    print(f"Took {_elapsed} seconds to complete.")
+    print(f"SPS: {float(config['TOTAL_TIMESTEPS']) / max(_elapsed, 1e-6)}")
 
     train_metrics = outs.get("metrics")
     if train_metrics is not None:

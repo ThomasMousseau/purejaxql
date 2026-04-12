@@ -1,28 +1,47 @@
 """
-This script is like pqn_gymnax but the network uses a CNN.
+MoG-PQN on MinAtar (gymnax): CNN trunk + mixture-of-Gaussians CF heads.
+
+**Vanilla / fair PQN comparison (this file):** Same training shell as ``pqn_minatar.py`` —
+single network (no target net, no Polyak, no hard sync), RAdam + global grad clip,
+ε schedule over **update index** (``EPS_START`` / ``EPS_FINISH`` / ``EPS_DECAY``), and
+``CustomTrainState`` with batch norm stats. The **only** algorithmic differences vs PQN are:
+
+  - **Actions / values:** Q(s,a) = Σ_k π_k μ_k from the MoG heads (closed form) instead of a
+    scalar logits head.
+  - **Loss:** MoG characteristic-function Bellman backup (|φ − φ'|² in the complex plane)
+    instead of MSE on λ-return scalar targets.
+
+See ``mog_pqn_minatar_stabilized.py`` for Double DQN + Polyak soft targets (deliberate extras).
+
+Run from repo root::
+
+  uv run python -m purejaxql.mog_pqn_minatar \\
+    --config-path purejaxql/config --config-name config +alg=mog_pqn_minatar
 """
+
+from __future__ import annotations
+
+import copy
 import os
-import copy 
 import time
-import jax
-import jax.numpy as jnp
-import numpy as np
-from functools import partial
 from typing import Any
-import random
 
 import chex
+import hydra
+import jax
+import jax.numpy as jnp
 import optax
-import flax.linen as nn
+import wandb
+from flax import linen as nn
 from flax.core import FrozenDict, freeze
 from flax.training.train_state import TrainState
 from flax.traverse_util import flatten_dict, unflatten_dict
-from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
-import hydra
+from gymnax.wrappers.purerl import LogWrapper
 from omegaconf import OmegaConf
-import gymnax
-import wandb
 
+import gymnax
+
+from purejaxql.utils.mog_cf import build_mog_cf, mog_q_values, sample_frequencies
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
     if norm_type == "layer_norm":
         return nn.LayerNorm()(x)
@@ -55,8 +74,11 @@ class CNN(nn.Module):
         return x
 
 
-class QNetwork(nn.Module):
+class MoGMinAtarQNetwork(nn.Module):
+    """CNN trunk + MoG heads (π, μ, σ) per action × component."""
+
     action_dim: int
+    num_components: int
     norm_type: str = "layer_norm"
     norm_input: bool = False
     mlp_num_layers: int = 1
@@ -67,23 +89,18 @@ class QNetwork(nn.Module):
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train, name="input_norm")(x)
         else:
-            # dummy normalize input for global compatibility
             _ = nn.BatchNorm(use_running_average=not train, name="input_norm_dummy")(x)
-            # x = x / 255.0
         x = CNN(norm_type=self.norm_type)(x, train)
-
-        # Project to hidden_dim
         x = nn.Dense(
             self.mlp_hidden_dim,
             kernel_init=nn.initializers.he_normal(),
-            name=f"mlp_proj",
+            name="mlp_proj",
         )(x)
         x = apply_norm(x, self.norm_type, train)
-
         for i in range(self.mlp_num_layers):
             resid = x
             x = nn.Dense(
-                4*self.mlp_hidden_dim,
+                4 * self.mlp_hidden_dim,
                 kernel_init=nn.initializers.he_normal(),
                 use_bias=False,
                 name=f"mlp_up_{i}",
@@ -95,12 +112,15 @@ class QNetwork(nn.Module):
                 use_bias=False,
                 name=f"mlp_down_{i}",
             )(x)
-
             x = apply_norm(x, self.norm_type, train)
-
             x = x + resid
-        x = nn.Dense(self.action_dim, kernel_init=nn.zeros)(x)
-        return x
+
+        a, m = self.action_dim, self.num_components
+        pi_logits = nn.Dense(a * m)(x)
+        pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
+        mu = nn.Dense(a * m)(x).reshape(-1, a, m)
+        sigma = jax.nn.softplus(nn.Dense(a * m)(x).reshape(-1, a, m))
+        return pi, mu, sigma
 
 
 @chex.dataclass(frozen=True)
@@ -110,7 +130,6 @@ class Transition:
     reward: chex.Array
     done: chex.Array
     next_obs: chex.Array
-    q_val: chex.Array
 
 
 class CustomTrainState(TrainState):
@@ -120,21 +139,22 @@ class CustomTrainState(TrainState):
     grad_steps: int = 0
 
 
-def make_train(config):
-
-    config["NUM_UPDATES"] = (
+def make_train(config: dict):
+    config = dict(config)
+    config["NUM_UPDATES"] = int(
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-
-    config["NUM_UPDATES_DECAY"] = (
+    config["NUM_UPDATES_DECAY"] = int(
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     max_grad_norm = config["MAX_GRAD_NORM"]
     per_layer_gradient_clipping = config.get("PER_LAYER_GRADIENT_CLIPPING", False)
 
-    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
-        "NUM_MINIBATCHES"
-    ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
+    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config["NUM_MINIBATCHES"] == 0, (
+        "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
+    )
+
+    minibatch_size = (config["NUM_STEPS"] * config["NUM_ENVS"]) // config["NUM_MINIBATCHES"]
 
     env, env_params = gymnax.make(config["ENV_NAME"])
     env = LogWrapper(env)
@@ -147,21 +167,16 @@ def make_train(config):
         env.step, in_axes=(0, 0, 0, None)
     )(jax.random.split(rng, n_envs), env_state, action, env_params)
 
-    # epsilon-greedy exploration
+    action_dim = env.action_space(env_params).n
+
     def eps_greedy_exploration(rng, q_vals, eps):
-        rng_a, rng_e = jax.random.split(
-            rng
-        )  # a key for sampling random actions and one for picking
+        rng_a, rng_e = jax.random.split(rng)
         greedy_actions = jnp.argmax(q_vals, axis=-1)
-        chosed_actions = jnp.where(
-            jax.random.uniform(rng_e, greedy_actions.shape)
-            < eps,  # pick the actions that should be random
-            jax.random.randint(
-                rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
-            ),  # sample random actions,
+        return jnp.where(
+            jax.random.uniform(rng_e, greedy_actions.shape) < eps,
+            jax.random.randint(rng_a, greedy_actions.shape, 0, q_vals.shape[-1]),
             greedy_actions,
         )
-        return chosed_actions
 
     def get_layer_grad_norms(grads):
         flat_grads = flatten_dict(grads)
@@ -219,28 +234,28 @@ def make_train(config):
         )
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
-        # INIT NETWORK AND OPTIMIZER
-        network = QNetwork(
-            action_dim=env.action_space(env_params).n,
+        network = MoGMinAtarQNetwork(
+            action_dim=action_dim,
+            num_components=int(config["NUM_COMPONENTS"]),
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
             mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
             mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
         )
 
-        def create_agent(rng):
-            init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
-            network_variables = network.init(rng, init_x, train=False)
-            clip_transform = (
-                optax.identity()
-                if per_layer_gradient_clipping
-                else optax.clip_by_global_norm(max_grad_norm)
-            )
-            tx = optax.chain(
-                clip_transform,
-                optax.radam(learning_rate=lr),
-            )
+        clip_transform = (
+            optax.identity()
+            if per_layer_gradient_clipping
+            else optax.clip_by_global_norm(max_grad_norm)
+        )
+        tx = optax.chain(
+            clip_transform,
+            optax.radam(learning_rate=lr),
+        )
 
+        def create_agent(rng_init):
+            init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+            network_variables = network.init(rng_init, init_x, train=False)
             train_state = CustomTrainState.create(
                 apply_fn=network.apply,
                 params=network_variables["params"],
@@ -249,19 +264,110 @@ def make_train(config):
             )
             return train_state
 
-        rng, _rng = jax.random.split(rng)
-        train_state = create_agent(rng)
+        rng, rng_agent = jax.random.split(rng)
+        train_state = create_agent(rng_agent)
 
-        # TRAINING LOOP
+        def mog_gradient_step(train_state, batch, rng_step):
+            """One-step MoG–CF backup using **current** network weights only (same role as PQN's bootstrap)."""
+            rng_step, omega_key = jax.random.split(rng_step)
+            s_obs = batch.obs
+            s_next_obs = batch.next_obs
+            s_actions = batch.action
+            s_rewards = batch.reward
+            s_dones = batch.done
+            bsz = s_obs.shape[0]
+            bidx = jnp.arange(bsz)
+            omegas = sample_frequencies(
+                omega_key, int(config["NUM_OMEGA_SAMPLES"]), float(config["OMEGA_MAX"])
+            )
+
+            pi_n, mu_n, sig_n = network.apply(
+                {
+                    "params": train_state.params,
+                    "batch_stats": train_state.batch_stats,
+                },
+                s_next_obs,
+                train=False,
+            )
+            q_next = mog_q_values(pi_n, mu_n)
+            next_actions = jnp.argmax(q_next, axis=1)
+
+            pi_sel = pi_n[bidx, next_actions]
+            mu_sel = mu_n[bidx, next_actions]
+            sig_sel = sig_n[bidx, next_actions]
+
+            gammas = config["GAMMA"] * (1.0 - s_dones)
+            bellman_mu = s_rewards[:, None] + gammas[:, None] * mu_sel
+            bellman_sigma = gammas[:, None] * sig_sel
+            bellman_pi = pi_sel
+
+            td_target = build_mog_cf(
+                bellman_pi[:, None, :],
+                bellman_mu[:, None, :],
+                bellman_sigma[:, None, :],
+                omegas,
+            )
+            td_target = td_target[:, :, 0]
+            td_target = jax.lax.stop_gradient(td_target)
+
+            def _loss_fn(params):
+                (online_pi, online_mu, online_sigma), updates = network.apply(
+                    {"params": params, "batch_stats": train_state.batch_stats},
+                    s_obs,
+                    train=True,
+                    mutable=["batch_stats"],
+                )
+                online_phi = build_mog_cf(online_pi, online_mu, online_sigma, omegas)
+                online_phi_sel = online_phi[bidx, :, s_actions]
+                loss = jnp.mean(jnp.abs(online_phi_sel - td_target) ** 2)
+                residual = online_phi_sel - td_target
+                cf_im = jnp.mean(jnp.abs(jnp.imag(residual)))
+                q_all = mog_q_values(online_pi, online_mu)
+                q_mean = q_all[bidx, s_actions].mean()
+                q_gap = (q_all.max(axis=1) - q_all.min(axis=1)).mean()
+                mog_ent = -jnp.sum(online_pi * jnp.log(online_pi + 1e-8), axis=-1).mean()
+                sig_m = online_sigma.mean()
+                return loss, (
+                    updates,
+                    q_mean,
+                    q_gap,
+                    mog_ent,
+                    sig_m,
+                    cf_im,
+                )
+
+            (loss, (updates, q_mean, q_gap, mog_ent, sig_m, cf_im)), grads = jax.value_and_grad(
+                _loss_fn, has_aux=True
+            )(train_state.params)
+            grad_norm = optax.global_norm(grads)
+            if config.get("LOG_LAYER_GRAD_NORMS", False):
+                layer_grad_norms = get_layer_grad_norms(grads)
+            else:
+                layer_grad_norms = {}
+            if per_layer_gradient_clipping:
+                grads = clip_grads_per_layer(grads)
+            train_state = train_state.apply_gradients(grads=grads)
+            train_state = train_state.replace(
+                grad_steps=train_state.grad_steps + 1,
+                batch_stats=updates["batch_stats"],
+            )
+            return (
+                train_state,
+                loss,
+                (q_mean, q_gap, mog_ent, sig_m, cf_im),
+                grad_norm,
+                layer_grad_norms,
+            )
+
         def _update_step(runner_state, unused):
-
             train_state, expl_state, test_metrics, rng = runner_state
 
-            # SAMPLE PHASE
+            eps = eps_scheduler(train_state.n_updates)
+
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
-                q_vals = network.apply(
+                pi, mu, sig = network.apply(
                     {
                         "params": train_state.params,
                         "batch_stats": train_state.batch_stats,
@@ -269,27 +375,23 @@ def make_train(config):
                     last_obs,
                     train=False,
                 )
-
-                # different eps for each env
+                q_vals = mog_q_values(pi, mu)
                 _rngs = jax.random.split(rng_a, config["NUM_ENVS"])
-                eps = jnp.full(config["NUM_ENVS"], eps_scheduler(train_state.n_updates))
-                new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
+                eps_vec = jnp.full((config["NUM_ENVS"],), eps)
+                new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps_vec)
 
-                new_obs, new_env_state, reward, new_done, info = vmap_step(
-                    config["NUM_ENVS"]
-                )(rng_s, env_state, new_action)
-
+                new_obs, new_env_state, reward, new_done, info = vmap_step(config["NUM_ENVS"])(
+                    rng_s, env_state, new_action
+                )
                 transition = Transition(
                     obs=last_obs,
                     action=new_action,
-                    reward=config.get("REW_SCALE", 1)*reward,
+                    reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
                     next_obs=new_obs,
-                    q_val=q_vals,
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
-            # step the env
             rng, _rng = jax.random.split(rng)
             (*expl_state, rng), (transitions, infos) = jax.lax.scan(
                 _step_env,
@@ -300,148 +402,112 @@ def make_train(config):
             expl_state = tuple(expl_state)
 
             train_state = train_state.replace(
-                timesteps=train_state.timesteps
-                + config["NUM_STEPS"] * config["NUM_ENVS"]
-            )  # update timesteps count
-
-            # jax.debug.breakpoint()
-
-            last_q = network.apply(
-                {
-                    "params": train_state.params,
-                    "batch_stats": train_state.batch_stats,
-                },
-                transitions.next_obs[-1],
-                train=False,
+                timesteps=train_state.timesteps + config["NUM_STEPS"] * config["NUM_ENVS"]
             )
-            last_q = jnp.max(last_q, axis=-1)
 
-            def _get_target(lambda_returns_and_next_q, transition):
-                lambda_returns, next_q = lambda_returns_and_next_q
-                target_bootstrap = (
-                    transition.reward + config["GAMMA"] * (1 - transition.done) * next_q
-                )
-                delta = lambda_returns - next_q
-                lambda_returns = (
-                    target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
-                )
-                lambda_returns = (
-                    1 - transition.done
-                ) * lambda_returns + transition.done * transition.reward
-                next_q = jnp.max(transition.q_val, axis=-1)
-                return (lambda_returns, next_q), lambda_returns
-
-            last_q = last_q * (1 - transitions.done[-1])
-            lambda_returns = transitions.reward[-1] + config["GAMMA"] * last_q
-            _, targets = jax.lax.scan(
-                _get_target,
-                (lambda_returns, last_q),
-                jax.tree_util.tree_map(lambda x: x[:-1], transitions),
-                reverse=True,
-            )
-            lambda_targets = jnp.concatenate((targets, lambda_returns[np.newaxis]))
-
-            # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
-                def _learn_phase(carry, minibatch_and_target):
-
+                def _learn_phase(carry, minibatch):
                     train_state, rng = carry
-                    minibatch, target = minibatch_and_target
-
-                    def _loss_fn(params):
-                        q_vals, updates = network.apply(
-                            {"params": params, "batch_stats": train_state.batch_stats},
-                            minibatch.obs,
-                            train=True,
-                            mutable=["batch_stats"],
-                        )  # (batch_size*2, num_actions)
-
-                        chosen_action_qvals = jnp.take_along_axis(
-                            q_vals,
-                            jnp.expand_dims(minibatch.action, axis=-1),
-                            axis=-1,
-                        ).squeeze(axis=-1)
-
-                        loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
-
-                        return loss, (updates, chosen_action_qvals)
-
-                    (loss, (updates, qvals)), grads = jax.value_and_grad(
-                        _loss_fn, has_aux=True
-                    )(train_state.params)
-                    grad_norm = optax.global_norm(grads)
-                    if config.get("LOG_LAYER_GRAD_NORMS", False):
-                        layer_grad_norms = get_layer_grad_norms(grads)
-                    else:
-                        layer_grad_norms = {}
-                    if per_layer_gradient_clipping:
-                        grads = clip_grads_per_layer(grads)
-                    train_state = train_state.apply_gradients(grads=grads)
-                    train_state = train_state.replace(
-                        grad_steps=train_state.grad_steps + 1,
-                        batch_stats=updates["batch_stats"],
-                    )
+                    rng, rng_gs = jax.random.split(rng)
+                    (
+                        train_state,
+                        loss,
+                        aux,
+                        grad_norm,
+                        layer_grad_norms,
+                    ) = mog_gradient_step(train_state, minibatch, rng_gs)
+                    q_mean, q_gap, mog_ent, sig_m, cf_im = aux
                     return (
                         train_state,
                         rng,
                     ), (
                         loss,
-                        qvals,
+                        q_mean,
+                        q_gap,
+                        mog_ent,
+                        sig_m,
+                        cf_im,
                         grad_norm,
                         layer_grad_norms,
                     )
 
-                def preprocess_transition(x, rng):
-                    x = x.reshape(
-                        -1, *x.shape[2:]
-                    )  # num_steps*num_envs (batch_size), ...
-                    x = jax.random.permutation(rng, x)  # shuffle the transitions
-                    x = x.reshape(
-                        config["NUM_MINIBATCHES"], -1, *x.shape[1:]
-                    )  # num_mini_updates, batch_size/num_mini_updates, ...
-                    return x
+                def preprocess_transition(x, rng_perm):
+                    x = x.reshape(-1, *x.shape[2:])
+                    x = jax.random.permutation(rng_perm, x)
+                    return x.reshape(
+                        config["NUM_MINIBATCHES"], minibatch_size, *x.shape[1:]
+                    )
 
-                rng, _rng = jax.random.split(rng)
+                rng, rng_perm = jax.random.split(rng)
                 minibatches = jax.tree_util.tree_map(
-                    lambda x: preprocess_transition(x, _rng), transitions
-                )  # num_actors*num_envs (batch_size), ...
-                targets = jax.tree_util.tree_map(
-                    lambda x: preprocess_transition(x, _rng), lambda_targets
+                    lambda x: preprocess_transition(x, rng_perm), transitions
                 )
 
-                rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
-                    _learn_phase, (train_state, rng), (minibatches, targets)
+                rng, rng_epoch = jax.random.split(rng)
+                (train_state, rng), (
+                    losses,
+                    q_means,
+                    q_gaps,
+                    mog_ents,
+                    sig_ms,
+                    cf_ims,
+                    grad_norms,
+                    layer_grad_norms,
+                ) = jax.lax.scan(
+                    _learn_phase,
+                    (train_state, rng_epoch),
+                    minibatches,
                 )
-
-                return (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms)
+                return (train_state, rng), (
+                    losses,
+                    q_means,
+                    q_gaps,
+                    mog_ents,
+                    sig_ms,
+                    cf_ims,
+                    grad_norms,
+                    layer_grad_norms,
+                )
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals, grad_norm, layer_grad_norms) = jax.lax.scan(
-                _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
-            )
+            (
+                train_state,
+                rng,
+            ), (
+                loss,
+                q_mean_e,
+                q_gap_e,
+                mog_ent_e,
+                sig_m_e,
+                cf_im_e,
+                grad_norm,
+                layer_grad_norms,
+            ) = jax.lax.scan(_learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"])
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
+
             metrics = {
                 "env_step": train_state.timesteps,
+                "global_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
-                "env_frame": train_state.timesteps * env.observation_space(env_params).shape[-1],
+                "env_frame": train_state.timesteps
+                * env.observation_space(env_params).shape[-1],
                 "grad_steps": train_state.grad_steps,
-                "td_loss": loss.mean(),
-                "qvals": qvals.mean(),
+                "mog_loss": loss.mean(),
+                "q_values": q_mean_e.mean(),
+                "q_gap": q_gap_e.mean(),
+                "mog_entropy": mog_ent_e.mean(),
+                "sigma_mean": sig_m_e.mean(),
+                "cf_loss_imag": cf_im_e.mean(),
                 "grad_norm": grad_norm.mean(),
+                "epsilon": eps,
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):
-                layer_grad_norms = jax.tree_util.tree_map(
-                    lambda x: x.mean(), layer_grad_norms
-                )
-                metrics.update(
-                    {f"grad_norm/{k}": v for k, v in layer_grad_norms.items()}
-                )
+                layer_grad_norms = jax.tree_util.tree_map(lambda x: x.mean(), layer_grad_norms)
+                metrics.update({f"grad_norm/{k}": v for k, v in layer_grad_norms.items()})
             metrics.update({k: v.mean() for k, v in infos.items()})
-            metrics["global_step"] = metrics["env_step"]
             if "returned_episode_returns" in metrics:
                 metrics["charts/episodic_return"] = metrics["returned_episode_returns"]
 
@@ -457,38 +523,33 @@ def make_train(config):
                 )
                 metrics.update({f"test/{k}": v for k, v in test_metrics.items()})
 
-            # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
-                def callback(metrics, seed_idx):
+                def callback(m, seed_idx_):
                     _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
-                    if int(metrics["update_steps"]) % _iv != 0:
+                    if int(m["update_steps"]) % _iv != 0:
                         return
-                    logged_metrics = dict(metrics)
+                    logged = dict(m)
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
-                        logged_metrics.update(
-                            {
-                                f"seed_{int(seed_idx) + 1}/{k}": v
-                                for k, v in logged_metrics.items()
-                            }
-                        )
-                    wandb.log(logged_metrics, step=logged_metrics["update_steps"])
+                        logged = {
+                            **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in logged.items()},
+                            **logged,
+                        }
+                    wandb.log(logged, step=logged["update_steps"])
 
                 jax.debug.callback(callback, metrics, seed_idx)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, rng)
-
             return runner_state, metrics
 
         def get_test_metrics(train_state, rng):
-
             if not config.get("TEST_DURING_TRAINING", False):
-                return None
+                return {}
 
             def _env_step(carry, _):
                 env_state, last_obs, rng = carry
                 rng, _rng = jax.random.split(rng)
-                q_vals = network.apply(
+                pi, mu, sig = network.apply(
                     {
                         "params": train_state.params,
                         "batch_stats": train_state.batch_stats,
@@ -496,23 +557,22 @@ def make_train(config):
                     last_obs,
                     train=False,
                 )
+                q_vals = mog_q_values(pi, mu)
                 eps = jnp.full(config["TEST_NUM_ENVS"], config["EPS_TEST"])
-                action = jax.vmap(eps_greedy_exploration)(
+                new_action = jax.vmap(eps_greedy_exploration)(
                     jax.random.split(_rng, config["TEST_NUM_ENVS"]), q_vals, eps
                 )
-                new_obs, new_env_state, reward, done, info = vmap_step(
-                    config["TEST_NUM_ENVS"]
-                )(_rng, env_state, action)
+                new_obs, new_env_state, reward, new_done, info = vmap_step(config["TEST_NUM_ENVS"])(
+                    _rng, env_state, new_action
+                )
                 return (new_env_state, new_obs, rng), info
 
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = vmap_reset(config["TEST_NUM_ENVS"])(_rng)
-
             _, infos = jax.lax.scan(
-                _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
+                _env_step, (env_state, init_obs, rng), None, config["TEST_NUM_STEPS"]
             )
-            # return mean of done infos
-            done_infos = jax.tree_util.tree_map(
+            return jax.tree_util.tree_map(
                 lambda x: jnp.nanmean(
                     jnp.where(
                         infos["returned_episode"],
@@ -522,15 +582,13 @@ def make_train(config):
                 ),
                 infos,
             )
-            return done_infos
 
-        rng, _rng = jax.random.split(rng)
-        test_metrics = get_test_metrics(train_state, _rng)
+        rng, rng_test = jax.random.split(rng)
+        test_metrics = get_test_metrics(train_state, rng_test)
 
         rng, _rng = jax.random.split(rng)
         expl_state = vmap_reset(config["NUM_ENVS"])(_rng)
 
-        # train
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, expl_state, test_metrics, _rng)
 
@@ -543,62 +601,39 @@ def make_train(config):
     return train
 
 
-
-def maybe_print_network_summary(config):
-    if not config.get("PRINT_NETWORK_SUMMARY", False):
-        return
-
-    env, env_params = gymnax.make(config["ENV_NAME"])
-    env = LogWrapper(env)
-    network = QNetwork(
-        action_dim=env.action_space(env_params).n,
-        norm_type=config["NORM_TYPE"],
-        norm_input=config.get("NORM_INPUT", False),
-        mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
-        mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
-    )
-    init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
-    summary = network.tabulate(
-        jax.random.PRNGKey(config["SEED"]),
-        init_x,
-        train=False,
-    )
-    print(summary)
+def _wandb_tags(config: dict) -> list[str]:
+    alg_name = config.get("ALG_NAME", "mog_pqn_minatar")
+    env_name = config["ENV_NAME"]
+    tags = [
+        alg_name.upper(),
+        env_name.upper().replace(" ", "_"),
+        f"jax_{jax.__version__}",
+    ]
+    et = config.get("EXPERIMENT_TAG")
+    if et:
+        tags.append(str(et))
+    extra = config.get("WANDB_EXTRA_TAGS")
+    if extra:
+        tags.extend(str(x) for x in extra)
+    return tags
 
 
 def single_run(config):
-
     config = {**config, **config["alg"]}
-    print(config)
 
-    alg_name = config.get("ALG_NAME", "pqn")
+    alg_name = config.get("ALG_NAME", "mog_pqn_minatar")
     env_name = config["ENV_NAME"]
-
-    maybe_print_network_summary(config)
-
-    _tags = [
-        alg_name.upper(),
-        env_name.upper(),
-        f"jax_{jax.__version__}",
-    ]
-    _et = config.get("EXPERIMENT_TAG")
-    if _et:
-        _tags.append(str(_et))
-    _extra = config.get("WANDB_EXTRA_TAGS")
-    if _extra:
-        _tags.extend(str(x) for x in _extra)
 
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=_tags,
+        tags=_wandb_tags(config),
         name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
         config=config,
         mode=config["WANDB_MODE"],
     )
 
-    seed = random.randint(0, 100_000)
-    rng = jax.random.PRNGKey(seed)
+    rng = jax.random.PRNGKey(config["SEED"])
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
@@ -622,7 +657,7 @@ def single_run(config):
             ),
         )
 
-        for i, rng in enumerate(rngs):
+        for i in range(config["NUM_SEEDS"]):
             params = jax.tree_util.tree_map(lambda x: x[i], model_state.params)
             save_path = os.path.join(
                 save_dir,
@@ -632,11 +667,8 @@ def single_run(config):
 
 
 def tune(default_config):
-    """Hyperparameter sweep with wandb."""
-
     default_config = {**default_config, **default_config["alg"]}
-    print(default_config)
-    alg_name = default_config.get("ALG_NAME", "pqn")
+    alg_name = default_config.get("ALG_NAME", "mog_pqn_minatar")
     env_name = default_config["ENV_NAME"]
 
     def wrapped_make_train():
@@ -646,33 +678,17 @@ def tune(default_config):
         for k, v in dict(wandb.config).items():
             config[k] = v
 
-        maybe_print_network_summary(config)
-
-        print("running experiment with params:", config)
-
         rng = jax.random.PRNGKey(config["SEED"])
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
         seed_idxs = jnp.arange(config["NUM_SEEDS"], dtype=jnp.int32)
         train_vjit = jax.jit(jax.vmap(make_train(config)))
-        outs = jax.block_until_ready(train_vjit(rngs, seed_idxs))
+        jax.block_until_ready(train_vjit(rngs, seed_idxs))
 
     sweep_config = {
         "name": f"{alg_name}_{env_name}",
         "method": "bayes",
-        "metric": {
-            "name": "returned_episode_returns",
-            "goal": "maximize",
-        },
-        "parameters": {
-            "LR": {
-                "values": [
-                    0.001,
-                    0.0005,
-                    0.0001,
-                    0.00005,
-                ]
-            },
-        },
+        "metric": {"name": "returned_episode_returns", "goal": "maximize"},
+        "parameters": {"LR": {"values": [0.001, 0.0005, 0.0001, 0.00005]}},
     }
 
     wandb.login()

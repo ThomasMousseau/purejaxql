@@ -69,44 +69,11 @@ echo "Metrics:  ${METRICS_NPZ}"
 echo "=========================================="
 
 # -----------------------------------------------------------------------------
-# After the experiment: push saved curves to W&B (run from repo root on a machine
-# with network; edit PROJECT / NAME / entity as needed). This does not affect training speed.
+# After the experiment: push saved curves to W&B (from repo root; needs network).
 #
-#   export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 #   export METRICS_NPZ="${ROOT}/slurm/metrics/<JOB_ID>/train_metrics.npz"
+#   uv run python -m purejaxql.utils.replay_train_metrics_npz_to_wandb \
+#     "${METRICS_NPZ}" --name posthoc-mog-rnn-stabilized
 #
-#   uv run python <<'PY'
-#   import os
-#   import numpy as np
-#   import wandb
-#
-#   path = os.environ["METRICS_NPZ"]
-#   data = np.load(path)
-#   keys = list(data.files)
-#   step_key = "update_steps" if "update_steps" in keys else "env_step"
-#   y = data[step_key]
-#   # NUM_SEEDS=1: shape (NUM_UPDATES,). If you vmap seeds, use index 0: y = data[step_key][0]
-#   if y.ndim > 1:
-#       y = y[0]
-#   wandb.init(
-#       project=os.environ.get("WANDB_PROJECT", "Deep-CVI-Experiments"),
-#       name="posthoc-mog-rnn-stabilized",
-#       job_type="metrics_replay",
-#       reinit=True,
-#   )
-#   for i in range(y.shape[0]):
-#       row = {}
-#       for k in keys:
-#           v = data[k]
-#           if v.ndim > 1:
-#               v = v[0, i]
-#           else:
-#               v = v[i]
-#           row[k] = float(np.asarray(v))
-#       wandb.log(row, step=int(row[step_key]))
-#   wandb.finish()
-#   PY
-#
-# Or sync an offline W&B run instead (only if you trained with WANDB_MODE=offline):
-#   wandb sync /path/to/wandb/offline-run-*
+# Or: wandb sync wandb/offline-run-*   # only if you trained with WANDB_MODE=offline
 # -----------------------------------------------------------------------------

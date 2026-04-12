@@ -2,6 +2,25 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "W&B: replay train_metrics.npz",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "purejaxql.utils.replay_train_metrics_npz_to_wandb",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "${workspaceFolder}/slurm/metrics/local/train_metrics.npz",
+        "--name",
+        "posthoc-debug",
+        "--project",
+        "Deep-CVI-Experiments",
+        "--entity",
+        "fatty_data",
+        "--npz_path",
+        "${workspaceFolder}/slurm/metrics/12345/train_metrics.npz",
+      ]
+    },
+    {
       "name": "Plot: Craftax RNN 3-algo (wandb)",
       "type": "debugpy",
       "request": "launch",
