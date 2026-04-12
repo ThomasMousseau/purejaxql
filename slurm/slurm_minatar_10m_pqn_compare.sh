@@ -42,8 +42,6 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# Reduce cuDNN "No valid config" failures with vmap+Conv (MoG vanilla on some envs).
-export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_autotune_level=0"
 
 EXPERIMENT_TAG="MinAtar_10M_PQN"
 
@@ -103,8 +101,7 @@ echo "=========================================="
 
 ALGO_EXTRA=()
 if [[ "${ALGO_IDX}" -eq 2 ]]; then
-  # CQN vmaps 5 seeds; default NUM_ENVS=128 can OOM on a single GPU.
-  ALGO_EXTRA+=(++alg.NUM_ENVS=64 ++alg.TEST_NUM_ENVS=64)
+  ALGO_EXTRA+=(++alg.NUM_ENVS=128 ++alg.TEST_NUM_ENVS=128)
 fi
 if [[ "${ALGO_IDX}" -eq 3 ]]; then
   ALGO_EXTRA+=(++alg.ALG_NAME=pqn)
