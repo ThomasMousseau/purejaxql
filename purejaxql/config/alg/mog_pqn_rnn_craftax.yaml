@@ -1,0 +1,50 @@
+# MoG-PQN-RNN — Craftax (LSTM + MoG heads). See ``mog_pqn_rnn_craftax.py`` module docstring.
+# Shared rollout / memory / optimizer defaults match ``pqn_rnn_craftax.yaml`` for fair comparison.
+
+ALG_NAME: "mog_pqn_rnn"
+TOTAL_TIMESTEPS: 1e9
+TOTAL_TIMESTEPS_DECAY: 1e9 # same role as pqn_rnn_craftax (decay schedules vs shorter runs)
+
+NUM_ENVS: 1024 # parallel environments
+MEMORY_WINDOW: 0 # must stay 0 for this MoG-RNN trainer (sliding memory not wired here)
+NUM_STEPS: 128 # steps per environment in each update — match pqn_rnn_craftax
+EPS_START: 1.0
+EPS_FINISH: 0.005
+EPS_DECAY: 0.1 # fraction of NUM_UPDATES_DECAY for linear_schedule
+NUM_MINIBATCHES: 4 # match pqn_rnn_craftax
+NUM_EPOCHS: 4
+
+NORM_INPUT: True
+NORM_TYPE: "layer_norm" # layer_norm or batch_norm
+HIDDEN_SIZE: 512
+NUM_LAYERS: 1
+NUM_RNN_LAYERS: 1
+ADD_LAST_ACTION: True
+
+LR: 0.0003
+MAX_GRAD_NORM: 0.5
+LR_LINEAR_DECAY: True
+REW_SCALE: 1.0
+GAMMA: 0.99
+LAMBDA: 0.5 # Q(λ) when MOG_RNN_LOSS: lambda_q (same as pqn_rnn_craftax)
+
+# MoG-only (CF vs scalar Σπμ — see ``mog_pqn_rnn_craftax.py``)
+MOG_RNN_LOSS: "cf" # "cf" | "lambda_q"
+NUM_OMEGA_SAMPLES: 32
+OMEGA_MAX: 1.0
+NUM_COMPONENTS: 8
+
+# env specific — match pqn_rnn_craftax
+ENV_NAME: "Craftax-Symbolic-v1"
+USE_OPTIMISTIC_RESETS: True
+OPTIMISTIC_RESET_RATIO: 16
+LOG_ACHIEVEMENTS: False
+
+# evaluation — match pqn_rnn_craftax
+TEST_DURING_TRAINING: False
+TEST_INTERVAL: 0.01 # in terms of total updates
+TEST_NUM_ENVS: 512
+TEST_NUM_STEPS: 10000
+EPS_TEST: 0.0 # 0 for greedy policy
+
+WANDB_LOG_INTERVAL: 100

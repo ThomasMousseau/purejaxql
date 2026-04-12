@@ -1,9 +1,25 @@
 import os
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
-from typing import Dict, Union
+from typing import Any, Dict, Union
 from omegaconf import OmegaConf
 import jax
+import numpy as np
+
+
+def save_train_metrics_npz(
+    metrics: Dict[str, Any], filename: Union[str, os.PathLike]
+) -> None:
+    """Save per-update training metrics (flat dict of array leaves) to compressed .npz."""
+    filename = os.path.abspath(filename)
+    parent = os.path.dirname(filename)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {
+        str(k).replace("/", "_"): np.asarray(jax.device_get(v))
+        for k, v in metrics.items()
+    }
+    np.savez_compressed(filename, **payload)
 
 
 def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:

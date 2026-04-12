@@ -5,7 +5,6 @@ __pycache__/
 *.egg-info/
 *.ipynb
 *.DS_Store
-.vscode/
 *.pickle
 *-checkpoint.py
 wandb/
@@ -15,3 +14,6 @@ renders*/
 
 **.npz
 **.safetensors
+
+old_cvi/
+slurm/logs/

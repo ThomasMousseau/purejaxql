@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Plot: Craftax RNN 3-algo (wandb)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/plot_wandb_craftax_rnn_compare.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "--entity",
+        "fatty_data",
+        "--project",
+        "Deep-CVI-Experiments",
+        "--experiment-tag",
+        "Craftax_1B_RNN_3algo",
+        "--env-name",
+        "Craftax-Symbolic-v1",
+        "--smooth-window",
+        "51",
+        "--out",
+        "figures/craftax_1b_rnn_compare.png"
+      ]
+    }
+  ]
+}

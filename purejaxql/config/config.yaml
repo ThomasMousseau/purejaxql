@@ -1,5 +1,5 @@
 # experiment params
-NUM_SEEDS: 5
+NUM_SEEDS: 1
 SEED: 0
 
 # if  hyperparameters tuning
@@ -7,10 +7,18 @@ HYP_TUNE: False
 
 # wandb params
 WANDB_MODE: "online"  # set to online to activate wandb
-ENTITY: "tyler-kastner"
-PROJECT: "purejaxql"
+
+# ENTITY: "tyler-kastner"
+# PROJECT: "purejaxql"
+
+ENTITY: "fatty_data"
+PROJECT: "Deep-CVI-Experiments"
+
 alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 
 # where to save the params (if None, will not save)
 SAVE_PATH:
+
+# optional .npz path for full training curves when WANDB_MODE is disabled (see save_train_metrics_npz)
+METRICS_SAVE_PATH:
