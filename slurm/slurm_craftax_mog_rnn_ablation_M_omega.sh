@@ -6,7 +6,7 @@
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-53%8
+#SBATCH --array=0-53%27
 #
 # Craftax MoG-PQN-RNN ablation: NUM_COMPONENTS × OMEGA_MAX × NUM_OMEGA_SAMPLES.
 # Runs both **vanilla** (mog_pqn_rnn_craftax) and **stabilized** (mog_pqn_rnn_stabilized_craftax).

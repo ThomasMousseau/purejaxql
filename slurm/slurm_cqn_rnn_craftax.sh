@@ -16,7 +16,6 @@
 #   export WANDB_EXPERIMENT_TAG=MyTag
 #   export CRAFTAX_ENV_NAME=Craftax-Symbolic-v1
 #   export SEED=0
-#   export NUM_ENVS=768   # if you still hit OOM, lower parallel envs (default 1024)
 
 set -euo pipefail
 

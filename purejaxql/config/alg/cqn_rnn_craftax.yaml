@@ -26,7 +26,7 @@ GAMMA: 0.99
 # CQN heads (match ``cqn_minatar.yaml`` roles; MLP_HIDDEN_DIM matches LSTM width for no extra bottleneck)
 MLP_NUM_LAYERS: 1
 MLP_HIDDEN_DIM: 512
-NUM_OMEGAS: 16 # 32
+NUM_OMEGAS: 24 # 32
 OMEGA_SAMPLER: "low_freq_mix"
 OMEGA_SCALE: 1.0
 OMEGA_CLIP: 8.0
@@ -46,6 +46,6 @@ LOG_ACHIEVEMENTS: False
 # evaluation — match pqn_rnn_craftax
 TEST_DURING_TRAINING: False
 TEST_INTERVAL: 0.01
-TEST_NUM_ENVS: 768
+TEST_NUM_ENVS: 512
 TEST_NUM_STEPS: 10000
 EPS_TEST: 0.00

@@ -276,6 +276,7 @@ class RNNCharacteristicQNetwork(nn.Module):
 class Transition:
     last_hs: chex.Array
     obs: chex.Array
+    next_obs: chex.Array
     action: chex.Array
     reward: chex.Array
     done: chex.Array
@@ -459,20 +460,32 @@ def make_train(config):
             effective_horizon = jnp.minimum(n_step, num_steps - time_indices)
             bootstrap_indices = time_indices + effective_horizon - 1
 
+            # Build one extra latent step so bootstrap indices can safely use t+h
+            # without clipping at sequence end (uses true final next_obs context).
+            latent_obs = jnp.concatenate(
+                [transitions.obs, transitions.next_obs[-1:]], axis=0
+            )
+            latent_done = jnp.concatenate(
+                [transitions.last_done, transitions.done[-1:]], axis=0
+            )
+            latent_last_action = jnp.concatenate(
+                [transitions.last_action, transitions.action[-1:]], axis=0
+            )
+
             _, state_latent = network.apply(
                 {"params": train_state.params, "batch_stats": train_state.batch_stats},
                 hs_start,
-                transitions.obs,
-                transitions.last_done,
-                transitions.last_action,
+                latent_obs,
+                latent_done,
+                latent_last_action,
                 train=False,
                 method=RNNCharacteristicQNetwork.encode_latent,
             )
             state_latent = jax.lax.stop_gradient(state_latent)
             d = state_latent.shape[-1]
-            # Align with feedforward CQN bootstrap state: latent for next_obs[k] is s_{k+1},
-            # which matches state_latent[k+1] when state_latent[t] encodes obs[t].
-            latent_idx = jnp.minimum(bootstrap_indices + 1, num_steps - 1)
+            # Bootstrap from latent at t+h. With the extra appended step above,
+            # index num_steps is valid for tail transitions.
+            latent_idx = bootstrap_indices + 1
             z_boot = state_latent[latent_idx[:, None], jnp.arange(num_envs)[None, :], :]
             z_flat = z_boot.reshape(flat_batch_size, d)
 
@@ -553,6 +566,7 @@ def make_train(config):
                 transition = Transition(
                     last_hs=hs,
                     obs=last_obs,
+                    next_obs=new_obs,
                     action=new_action,
                     reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
@@ -866,6 +880,7 @@ def make_train(config):
             transition = Transition(
                 last_hs=hs,
                 obs=last_obs,
+                next_obs=new_obs,
                 action=new_action,
                 reward=config.get("REW_SCALE", 1) * reward,
                 done=new_done,
