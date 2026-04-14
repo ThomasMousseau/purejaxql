@@ -39,6 +39,9 @@ from purejaxql.utils.craftax_wrappers import (
 
 
 class ScannedRNN(nn.Module):
+    compute_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
+
     @partial(
         nn.scan,
         variable_broadcast="params",
@@ -57,7 +60,11 @@ class ScannedRNN(nn.Module):
             init_rnn_state,
             rnn_state,
         )
-        new_rnn_state, y = nn.OptimizedLSTMCell(hidden_size)(rnn_state, ins)
+        new_rnn_state, y = nn.OptimizedLSTMCell(
+            hidden_size,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        )(rnn_state, ins)
         return new_rnn_state, y
 
     @staticmethod
@@ -72,14 +79,14 @@ class FrequencyEmbedding(nn.Module):
 
     @nn.compact
     def __call__(self, omega: jnp.ndarray) -> jnp.ndarray:
-        omega = jnp.asarray(omega, dtype=jnp.float32)
+        omega = jnp.asarray(omega)
         basis = jnp.arange(1, self.hidden_dim + 1, dtype=omega.dtype)
         return jnp.cos(jnp.pi * omega[..., None] * basis)
 
 
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
     if norm_type == "layer_norm":
-        return nn.LayerNorm()(x)
+        return nn.LayerNorm(dtype=x.dtype, param_dtype=jnp.float32)(x)
     if norm_type == "batch_norm":
         return BatchRenorm(use_running_average=not train)(x)
     return x
@@ -98,6 +105,8 @@ class RNNCharacteristicQNetwork(nn.Module):
     mlp_num_layers: int = 1
     mlp_hidden_dim: int = 128
     sigma_min: float = 1e-6
+    compute_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     def _prepare_omegas(
         self, omega: Union[jnp.ndarray, float], batch_size: int, dtype: jnp.dtype
@@ -126,6 +135,8 @@ class RNNCharacteristicQNetwork(nn.Module):
                 4 * self.mlp_hidden_dim,
                 kernel_init=nn.initializers.he_normal(),
                 use_bias=False,
+                dtype=self.compute_dtype,
+                param_dtype=self.param_dtype,
                 name=f"mlp_up_{i}",
             )(x)
             x = nn.relu(x)
@@ -133,6 +144,8 @@ class RNNCharacteristicQNetwork(nn.Module):
                 self.mlp_hidden_dim,
                 kernel_init=nn.initializers.zeros,
                 use_bias=False,
+                dtype=self.compute_dtype,
+                param_dtype=self.param_dtype,
                 name=f"mlp_down_{i}",
             )(x)
             x = apply_norm(x, self.norm_type, train)
@@ -154,25 +167,35 @@ class RNNCharacteristicQNetwork(nn.Module):
             x = BatchRenorm(use_running_average=not train)(x)
         else:
             _ = BatchRenorm(use_running_average=not train)(x)
+        x = x.astype(self.compute_dtype)
 
         for _ in range(self.num_layers):
-            x = nn.Dense(self.hidden_size)(x)
+            x = nn.Dense(
+                self.hidden_size,
+                dtype=self.compute_dtype,
+                param_dtype=self.param_dtype,
+            )(x)
             x = apply_norm(x, self.norm_type, train)
             x = nn.relu(x)
 
         if self.add_last_action:
-            la = jax.nn.one_hot(last_action, self.action_dim)
+            la = jax.nn.one_hot(last_action, self.action_dim, dtype=self.compute_dtype)
             x = jnp.concatenate([x, la], axis=-1)
 
         new_hidden = []
         for i in range(self.num_rnn_layers):
             rnn_in = (x, done)
-            hidden_aux, x = ScannedRNN()(hidden[i], rnn_in)
+            hidden_aux, x = ScannedRNN(
+                compute_dtype=self.compute_dtype,
+                param_dtype=self.param_dtype,
+            )(hidden[i], rnn_in)
             new_hidden.append(hidden_aux)
 
         state_latent = nn.Dense(
             self.mlp_hidden_dim,
             kernel_init=nn.initializers.he_normal(),
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
             name="state_proj",
         )(x)
         return new_hidden, state_latent
@@ -198,14 +221,22 @@ class RNNCharacteristicQNetwork(nn.Module):
             hidden = self._shared_trunk(state_latent[:, None, :], train)
             hidden = hidden.reshape(state_latent.shape[0], 1, -1)
 
-        mean = nn.Dense(self.action_dim, kernel_init=nn.initializers.zeros, name="mean_head")(
-            hidden
-        )
+        mean = nn.Dense(
+            self.action_dim,
+            kernel_init=nn.initializers.zeros,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+            name="mean_head",
+        )(hidden)
         if not compute_cf:
             return {"mean": mean}
 
         scale = nn.Dense(
-            self.action_dim, kernel_init=nn.initializers.zeros, name="scale_head"
+            self.action_dim,
+            kernel_init=nn.initializers.zeros,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+            name="scale_head",
         )(hidden)
         scale = nn.softplus(scale) + self.sigma_min
 
@@ -392,6 +423,7 @@ def make_train(config):
             * config["NUM_EPOCHS"],
         )
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
+        compute_dtype = jnp.bfloat16 if config.get("USE_BF16", False) else jnp.float32
 
         network = RNNCharacteristicQNetwork(
             action_dim=env.action_space(env_params).n,
@@ -404,6 +436,8 @@ def make_train(config):
             mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
             mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
             sigma_min=config.get("SIGMA_MIN", 1e-6),
+            compute_dtype=compute_dtype,
+            param_dtype=jnp.float32,
         )
 
         def create_agent(rng_key):
@@ -649,19 +683,21 @@ def make_train(config):
                             *agent_in,
                             omega_input,
                         )
-                        pred_qvals = outputs["mean"][..., 0, :]
+                        pred_qvals = outputs["mean"][..., 0, :].astype(jnp.float32)
                         chosen_action_qvals = select_action_values(
                             pred_qvals, minibatch.action
                         )
                         pred_cf = select_action_values(
                             outputs["cf"][..., 1:, :], minibatch.action
-                        )
+                        ).astype(jnp.complex64)
                         pred_mean = chosen_action_qvals
-                        diff = pred_cf - cf_targets
+                        diff = pred_cf - cf_targets.astype(jnp.complex64)
                         cf_loss = 0.5 * (
                             jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
                         ).mean()
-                        mean_loss = 0.5 * jnp.square(pred_mean - mean_targets).mean()
+                        mean_loss = 0.5 * jnp.square(
+                            pred_mean - mean_targets.astype(jnp.float32)
+                        ).mean()
                         loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 0.1) * mean_loss
                         return loss, (
                             updates,
