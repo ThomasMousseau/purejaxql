@@ -17,3 +17,5 @@ renders*/
 
 old_cvi/
 slurm/logs/
+
+checkpoints/

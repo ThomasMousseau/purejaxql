@@ -471,12 +471,19 @@ def make_train(config):
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
+                _sps_state = {"t": time.time(), "s": 0}
 
                 def callback(metrics, seed_idx):
                     _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
                     if int(metrics["update_steps"]) % _iv != 0:
                         return
+                    now = time.time()
+                    steps = int(metrics["env_step"])
+                    dt = now - _sps_state["t"]
+                    sps = (steps - _sps_state["s"]) / max(dt, 1e-9)
+                    _sps_state["t"], _sps_state["s"] = now, steps
                     logged_metrics = dict(metrics)
+                    logged_metrics["sps"] = sps
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         logged_metrics.update(
                             {
@@ -676,11 +683,12 @@ def single_run(config):
     print(f"Took {_elapsed} seconds to complete.")
     print(f"SPS: {float(config['TOTAL_TIMESTEPS']) / max(_elapsed, 1e-6)}")
 
-    if config.get("SAVE_PATH", None) is not None:
+    _save_root = config.get("SAVE_PATH")
+    if _save_root is not None and str(_save_root).strip() != "":
         from purejaxql.utils.save_load import save_params
 
         model_state = outs["runner_state"][0]
-        save_dir = os.path.join(config["SAVE_PATH"], env_name)
+        save_dir = os.path.join(os.path.abspath(str(_save_root)), env_name)
         os.makedirs(save_dir, exist_ok=True)
         OmegaConf.save(
             config,
@@ -696,6 +704,7 @@ def single_run(config):
                 f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors',
             )
             save_params(params, save_path)
+            print(f"Saved final training checkpoint: {save_path}")
 
 
 def tune(default_config):

@@ -773,11 +773,12 @@ def single_run(config):
             save_train_metrics_npz(train_metrics, metrics_path)
             print(f"Saved training metrics to {metrics_path}")
 
-    if config.get("SAVE_PATH", None) is not None:
+    _save_root = config.get("SAVE_PATH")
+    if _save_root is not None and str(_save_root).strip() != "":
         from purejaxql.utils.save_load import save_params
 
         model_state = outs["runner_state"][0]
-        save_dir = os.path.join(config["SAVE_PATH"], env_name)
+        save_dir = os.path.join(os.path.abspath(str(_save_root)), env_name)
         os.makedirs(save_dir, exist_ok=True)
         OmegaConf.save(
             config,
@@ -793,6 +794,7 @@ def single_run(config):
                 f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors',
             )
             save_params(params, save_path)
+            print(f"Saved final training checkpoint: {save_path}")
 
 
 def tune(default_config):

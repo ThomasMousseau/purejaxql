@@ -2,6 +2,7 @@
 # Shared rollout / memory / optimizer defaults match ``pqn_rnn_craftax.yaml`` for fair comparison.
 
 ALG_NAME: "mog_pqn_rnn"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 1e9
 TOTAL_TIMESTEPS_DECAY: 1e9 # same role as pqn_rnn_craftax (decay schedules vs shorter runs)
 
