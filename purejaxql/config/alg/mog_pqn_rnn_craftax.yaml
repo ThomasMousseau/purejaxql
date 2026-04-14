@@ -26,13 +26,13 @@ MAX_GRAD_NORM: 0.5
 LR_LINEAR_DECAY: True
 REW_SCALE: 1.0
 GAMMA: 0.99
-LAMBDA: 0.5 # Q(λ) when MOG_RNN_LOSS: lambda_q (same as pqn_rnn_craftax)
+LAMBDA: 0.5 # Q(λ) return mixing coefficient (same as pqn_rnn_craftax)
 
-# MoG-only (CF vs scalar Σπμ — see ``mog_pqn_rnn_craftax.py``)
-MOG_RNN_LOSS: "cf" # "cf" | "lambda_q"
+# MoG-only — fused dual loss (see ``mog_pqn_rnn_craftax.py`` docstring)
 NUM_OMEGA_SAMPLES: 32
 OMEGA_MAX: 1.0
 NUM_COMPONENTS: 8
+AUX_MEAN_LOSS_WEIGHT: 1.0 # weight on TD(λ) loss relative to CF loss
 
 # env specific — match pqn_rnn_craftax
 ENV_NAME: "Craftax-Symbolic-v1"

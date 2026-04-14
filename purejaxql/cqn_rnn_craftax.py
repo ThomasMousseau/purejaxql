@@ -39,7 +39,7 @@ from purejaxql.utils.craftax_wrappers import (
 
 
 class ScannedRNN(nn.Module):
-    compute_dtype: Any = jnp.bfloat16
+    compute_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     @partial(
@@ -148,7 +148,11 @@ class RNNCharacteristicQNetwork(nn.Module):
                 param_dtype=self.param_dtype,
                 name=f"mlp_down_{i}",
             )(x)
-            x = apply_norm(x, self.norm_type, train)
+            # Fix #3: Always use LayerNorm inside the shared trunk.
+            # BatchRenorm here would corrupt running stats because the batch
+            # dimension mixes different sampled frequencies (ω).  LayerNorm
+            # normalises across the feature dimension and is immune to this.
+            x = nn.LayerNorm(dtype=x.dtype, param_dtype=jnp.float32)(x)
             x = x + resid
         return x
 
@@ -366,10 +370,10 @@ def select_action_values(values: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarr
 
 
 def make_train(config):
-    config["NUM_UPDATES"] = (
+    config["NUM_UPDATES"] = int(
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    config["NUM_UPDATES_DECAY"] = (
+    config["NUM_UPDATES_DECAY"] = int(
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
 
@@ -423,7 +427,9 @@ def make_train(config):
             * config["NUM_EPOCHS"],
         )
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
-        compute_dtype = jnp.bfloat16 if config.get("USE_BF16", False) else jnp.float32
+        # Fix #4: CQN *requires* float32 for complex trig precision.
+        # bfloat16's 7-bit mantissa causes catastrophic phase noise in exp(iωm).
+        compute_dtype = jnp.float32
 
         network = RNNCharacteristicQNetwork(
             action_dim=env.action_space(env_params).n,
@@ -557,13 +563,7 @@ def make_train(config):
                 + bootstrap_mask[..., None] * next_cf
             )
 
-            mean_targets = (
-                reward_sum + bootstrap_mask * bootstrap_gamma * next_mean_bootstrap
-            )
-            return jax.tree_util.tree_map(
-                jax.lax.stop_gradient,
-                (cf_targets, mean_targets),
-            )
+            return jax.lax.stop_gradient(cf_targets)
 
         def _update_step(runner_state, unused):
             train_state, memory_transitions, expl_state, test_metrics, rng = runner_state
@@ -662,7 +662,7 @@ def make_train(config):
                         config["NUM_OMEGAS"],
                     )
 
-                    cf_targets, mean_targets = compute_n_step_targets_rnn(
+                    cf_targets = compute_n_step_targets_rnn(
                         train_state, minibatch, om_mb, hs
                     )
 
@@ -674,6 +674,39 @@ def make_train(config):
                         axis=-1,
                     )
 
+                    # Fix #1: PQN-style recursive TD(λ) for the mean (policy) head.
+                    # This gives the agent 128-step credit assignment for greedy
+                    # action selection, while the CF heads keep their n-step targets.
+                    def _compute_td_lambda_targets(last_q, q_vals, reward, done):
+                        """Backward scan computing TD(λ) exactly as PQN does."""
+                        def _get_target(lambda_returns_and_next_q, rew_q_done):
+                            reward, q, done = rew_q_done
+                            lambda_returns, next_q = lambda_returns_and_next_q
+                            target_bootstrap = (
+                                reward + config["GAMMA"] * (1 - done) * next_q
+                            )
+                            delta = lambda_returns - next_q
+                            lambda_returns = (
+                                target_bootstrap
+                                + config["GAMMA"] * config["LAMBDA"] * delta
+                            )
+                            lambda_returns = (1 - done) * lambda_returns + done * reward
+                            next_q = jnp.max(q, axis=-1)
+                            return (lambda_returns, next_q), lambda_returns
+
+                        lambda_returns = (
+                            reward[-1] + config["GAMMA"] * (1 - done[-1]) * last_q
+                        )
+                        last_q = jnp.max(q_vals[-1], axis=-1)
+                        _, targets = jax.lax.scan(
+                            _get_target,
+                            (lambda_returns, last_q),
+                            jax.tree_util.tree_map(lambda x: x[:-1], (reward, q_vals, done)),
+                            reverse=True,
+                        )
+                        targets = jnp.concatenate([targets, lambda_returns[np.newaxis]])
+                        return targets
+
                     def _loss_fn(params):
                         (_hs, outputs), updates = partial(
                             network.apply, train=True, mutable=["batch_stats"]
@@ -684,24 +717,39 @@ def make_train(config):
                             omega_input,
                         )
                         pred_qvals = outputs["mean"][..., 0, :].astype(jnp.float32)
-                        chosen_action_qvals = select_action_values(
+
+                        # --- CF loss (n-step targets, all timesteps) ---
+                        chosen_action_qvals_all = select_action_values(
                             pred_qvals, minibatch.action
                         )
                         pred_cf = select_action_values(
                             outputs["cf"][..., 1:, :], minibatch.action
                         ).astype(jnp.complex64)
-                        pred_mean = chosen_action_qvals
                         diff = pred_cf - cf_targets.astype(jnp.complex64)
                         cf_loss = 0.5 * (
                             jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))
                         ).mean()
+
+                        # --- Mean / policy loss (TD-λ targets, steps [:-1]) ---
+                        # Exactly mirrors PQN: last step's Q is used only for
+                        # bootstrapping, the loss is computed on steps 0..T-2.
+                        target_q_vals = jax.lax.stop_gradient(pred_qvals)
+                        last_q = target_q_vals[-1].max(axis=-1)
+                        mean_targets = _compute_td_lambda_targets(
+                            last_q,
+                            target_q_vals[:-1],
+                            minibatch.reward[:-1],
+                            minibatch.done[:-1],
+                        ).reshape(-1)
+                        chosen_action_qvals = chosen_action_qvals_all[:-1].reshape(-1)
                         mean_loss = 0.5 * jnp.square(
-                            pred_mean - mean_targets.astype(jnp.float32)
+                            chosen_action_qvals - mean_targets
                         ).mean()
-                        loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 0.1) * mean_loss
+
+                        loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 1.0) * mean_loss
                         return loss, (
                             updates,
-                            chosen_action_qvals,
+                            chosen_action_qvals_all,
                             pred_cf,
                             cf_loss,
                             mean_loss,
@@ -796,12 +844,19 @@ def make_train(config):
                 }
 
             if config["WANDB_MODE"] != "disabled":
+                _sps_state = {"t": time.time(), "s": 0}
 
                 def callback(metrics_cb, seed_idx_cb):
                     _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
                     if int(metrics_cb["update_steps"]) % _iv != 0:
                         return
+                    now = time.time()
+                    steps = int(metrics_cb["env_step"])
+                    dt = now - _sps_state["t"]
+                    sps = (steps - _sps_state["s"]) / max(dt, 1e-9)
+                    _sps_state["t"], _sps_state["s"] = now, steps
                     logged_metrics = dict(metrics_cb)
+                    logged_metrics["sps"] = sps
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         logged_metrics.update(
                             {

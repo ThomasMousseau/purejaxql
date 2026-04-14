@@ -4,12 +4,14 @@ Q(λ)-style *exploration* via Q=Σπμ, RAdam, memory window, same rollout/minib
 
 **What differs from PQN-RNN** (the MoG novelty):
   - Trunk ends in **MoG heads** (π, μ, σ) instead of scalar Q logits.
-  - **Loss** (see ``MOG_RNN_LOSS`` in alg YAML):
-      - ``cf`` (default): **MoG characteristic-function** Bellman MSE on one-step transitions
-        ``t = 0 … T-2``, with bootstrap built from **stop-gradient** MoG at ``t+1`` on the
-        **same** weights (no separate target net, **no** Polyak). This is *not* Double DQN.
-      - ``lambda_q``: **same scalar TD loss as PQN-RNN** — λ-returns vs **Σ_k π_k μ_k** for
-        the taken action (only the head differs from PQN; fair scalar baseline).
+  - **Fused dual loss** (every update applies both):
+      1. **TD(λ) loss** — scalar λ-returns vs **Σ_k π_k μ_k** over the full 128-step sequence,
+         anchoring component means and mixture weights for stable greedy policy.
+      2. **MoG CF loss** — one-step characteristic-function Bellman MSE (stop-gradient bootstrap
+         from the same weights; no target net), shaping σ to capture local return variance.
+      ``total_loss = cf_loss + AUX_MEAN_LOSS_WEIGHT * lambda_loss``
+
+  See ``AUX_MEAN_LOSS_WEIGHT`` in the alg YAML (default 1.0).
 
 This RNN file deliberately matches PQN-RNN training mechanics for controlled comparison.
 
@@ -212,10 +214,6 @@ def mog_cf_loss_single_network(
 def make_train(config: dict):
     config = dict(config)
 
-    loss_mode = str(config.get("MOG_RNN_LOSS", "cf")).lower()
-    if loss_mode not in ("cf", "lambda_q"):
-        raise ValueError(f"MOG_RNN_LOSS must be 'cf' or 'lambda_q', got {loss_mode!r}")
-
     config["NUM_UPDATES"] = int(
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -393,126 +391,104 @@ def make_train(config: dict):
                         minibatch.last_action,
                     )
 
-                    if loss_mode == "lambda_q":
-
-                        def _compute_targets(last_q, q_vals, reward, done):
-                            def _get_target(lambda_returns_and_next_q, rew_q_done):
-                                reward, q, done = rew_q_done
-                                lambda_returns, next_q = lambda_returns_and_next_q
-                                target_bootstrap = (
-                                    reward + config["GAMMA"] * (1 - done) * next_q
-                                )
-                                delta = lambda_returns - next_q
-                                lambda_returns = (
-                                    target_bootstrap
-                                    + config["GAMMA"] * config["LAMBDA"] * delta
-                                )
-                                lambda_returns = (
-                                    1 - done
-                                ) * lambda_returns + done * reward
-                                next_q = jnp.max(q, axis=-1)
-                                return (lambda_returns, next_q), lambda_returns
-
+                    def _compute_targets(last_q, q_vals, reward, done):
+                        def _get_target(lambda_returns_and_next_q, rew_q_done):
+                            reward, q, done = rew_q_done
+                            lambda_returns, next_q = lambda_returns_and_next_q
+                            target_bootstrap = (
+                                reward + config["GAMMA"] * (1 - done) * next_q
+                            )
+                            delta = lambda_returns - next_q
                             lambda_returns = (
-                                reward[-1]
-                                + config["GAMMA"] * (1 - done[-1]) * last_q
+                                target_bootstrap
+                                + config["GAMMA"] * config["LAMBDA"] * delta
                             )
-                            last_q = jnp.max(q_vals[-1], axis=-1)
-                            _, targets = jax.lax.scan(
-                                _get_target,
-                                (lambda_returns, last_q),
-                                jax.tree_util.tree_map(
-                                    lambda x: x[:-1],
-                                    (reward, q_vals, done),
-                                ),
-                                reverse=True,
-                            )
-                            targets = jnp.concatenate(
-                                [targets, lambda_returns[np.newaxis]]
-                            )
-                            return targets
+                            lambda_returns = (
+                                1 - done
+                            ) * lambda_returns + done * reward
+                            next_q = jnp.max(q, axis=-1)
+                            return (lambda_returns, next_q), lambda_returns
 
-                        def _loss_fn(params):
-                            (_, (pi, mu, sigma)), updates = partial(
-                                network.apply, train=True, mutable=["batch_stats"]
-                            )(
-                                {
-                                    "params": params,
-                                    "batch_stats": train_state.batch_stats,
-                                },
-                                hs,
-                                *agent_in,
-                            )
-                            q_vals = mog_q_values(pi, mu)
-                            target_q_vals = jax.lax.stop_gradient(q_vals)
-                            last_q = target_q_vals[-1].max(axis=-1)
-                            target = _compute_targets(
-                                last_q,
-                                target_q_vals[:-1],
-                                minibatch.reward[:-1],
-                                minibatch.done[:-1],
-                            ).reshape(-1)
+                        lambda_returns = (
+                            reward[-1]
+                            + config["GAMMA"] * (1 - done[-1]) * last_q
+                        )
+                        last_q = jnp.max(q_vals[-1], axis=-1)
+                        _, targets = jax.lax.scan(
+                            _get_target,
+                            (lambda_returns, last_q),
+                            jax.tree_util.tree_map(
+                                lambda x: x[:-1],
+                                (reward, q_vals, done),
+                            ),
+                            reverse=True,
+                        )
+                        targets = jnp.concatenate(
+                            [targets, lambda_returns[np.newaxis]]
+                        )
+                        return targets
 
-                            chosen_action_qvals = jnp.take_along_axis(
-                                q_vals,
-                                jnp.expand_dims(minibatch.action, axis=-1),
-                                axis=-1,
-                            ).squeeze(axis=-1)
-                            chosen_action_qvals = chosen_action_qvals[:-1].reshape(-1)
+                    def _loss_fn(params):
+                        omegas = sample_frequencies(
+                            rng_omega,
+                            int(config["NUM_OMEGA_SAMPLES"]),
+                            float(config["OMEGA_MAX"]),
+                        )
+                        (_, (pi, mu, sigma)), updates = partial(
+                            network.apply, train=True, mutable=["batch_stats"]
+                        )(
+                            {
+                                "params": params,
+                                "batch_stats": train_state.batch_stats,
+                            },
+                            hs,
+                            *agent_in,
+                        )
 
-                            loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
-                            return loss, (updates, chosen_action_qvals)
+                        # TD(λ) loss — anchors component means over the full 128-step horizon
+                        q_vals = mog_q_values(pi, mu)
+                        target_q_vals = jax.lax.stop_gradient(q_vals)
+                        last_q = target_q_vals[-1].max(axis=-1)
+                        target = _compute_targets(
+                            last_q,
+                            target_q_vals[:-1],
+                            minibatch.reward[:-1],
+                            minibatch.done[:-1],
+                        ).reshape(-1)
+                        chosen_action_qvals = jnp.take_along_axis(
+                            q_vals,
+                            jnp.expand_dims(minibatch.action, axis=-1),
+                            axis=-1,
+                        ).squeeze(axis=-1)
+                        chosen_action_qvals = chosen_action_qvals[:-1].reshape(-1)
+                        lambda_loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
 
-                    else:
+                        # MoG CF loss — shapes σ via 1-step characteristic-function Bellman
+                        cf_loss, cf_im = mog_cf_loss_single_network(
+                            pi,
+                            mu,
+                            sigma,
+                            minibatch.action,
+                            minibatch.reward,
+                            minibatch.done.astype(jnp.float32),
+                            omegas,
+                            float(config["GAMMA"]),
+                        )
 
-                        def _loss_fn(params):
-                            omegas = sample_frequencies(
-                                rng_omega,
-                                int(config["NUM_OMEGA_SAMPLES"]),
-                                float(config["OMEGA_MAX"]),
-                            )
-                            (_, (pi, mu, sigma)), updates = partial(
-                                network.apply, train=True, mutable=["batch_stats"]
-                            )(
-                                {
-                                    "params": params,
-                                    "batch_stats": train_state.batch_stats,
-                                },
-                                hs,
-                                *agent_in,
-                            )
-                            loss, cf_im = mog_cf_loss_single_network(
-                                pi,
-                                mu,
-                                sigma,
-                                minibatch.action,
-                                minibatch.reward,
-                                minibatch.done.astype(jnp.float32),
-                                omegas,
-                                float(config["GAMMA"]),
-                            )
-                            q_flat = mog_q_values(pi, mu)
-                            return loss, (updates, cf_im, q_flat)
+                        total_loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 1.0) * lambda_loss
+                        return total_loss, (updates, cf_loss, lambda_loss, cf_im, chosen_action_qvals)
 
                     (loss, aux), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
                         train_state.params
                     )
                     grad_norm = optax.global_norm(grads)
                     train_state = train_state.apply_gradients(grads=grads)
-                    if loss_mode == "lambda_q":
-                        updates, qv = aux
-                    else:
-                        updates, cf_im, q_flat = aux
+                    updates, cf_loss, lambda_loss, cf_im, qvals = aux
                     train_state = train_state.replace(
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    if loss_mode == "lambda_q":
-                        return (train_state, rng), (loss, qv, grad_norm)
-                    return (
-                        (train_state, rng),
-                        (loss, cf_im, jnp.mean(q_flat), grad_norm),
-                    )
+                    return (train_state, rng), (loss, cf_loss, lambda_loss, cf_im, qvals, grad_norm)
 
                 def preprocess_transition(x, rng_perm):
                     x = jax.random.permutation(rng_perm, x, axis=1)
@@ -528,16 +504,11 @@ def make_train(config: dict):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                out = jax.lax.scan(
+                (train_state, rng), scan_out = jax.lax.scan(
                     _learn_phase, (train_state, _rng), minibatches
                 )
-                (train_state, rng), scan_out = out
-
-                if loss_mode == "lambda_q":
-                    loss, qvals, grad_norm = scan_out
-                    return (train_state, rng), (loss, qvals, grad_norm)
-                loss, cf_im, qmean, grad_norm = scan_out
-                return (train_state, rng), (loss, cf_im, qmean, grad_norm)
+                loss, cf_loss, lambda_loss, cf_im, qvals, grad_norm = scan_out
+                return (train_state, rng), (loss, cf_loss, lambda_loss, cf_im, qvals, grad_norm)
 
             rng, _rng = jax.random.split(rng)
             scan_epochs = jax.lax.scan(_learn_epoch, (train_state, _rng), None, config["NUM_EPOCHS"])
@@ -545,27 +516,18 @@ def make_train(config: dict):
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
 
-            if loss_mode == "lambda_q":
-                loss, qvals, grad_norm = epoch_metrics
-                metrics = {
-                    "env_step": train_state.timesteps,
-                    "update_steps": train_state.n_updates,
-                    "grad_steps": train_state.grad_steps,
-                    "td_loss": loss.mean(),
-                    "qvals": qvals.mean(),
-                    "grad_norm": grad_norm.mean(),
-                }
-            else:
-                loss, cf_im, qmean, grad_norm = epoch_metrics
-                metrics = {
-                    "env_step": train_state.timesteps,
-                    "update_steps": train_state.n_updates,
-                    "grad_steps": train_state.grad_steps,
-                    "mog_cf_loss": loss.mean(),
-                    "cf_loss_imag": cf_im.mean(),
-                    "qvals": qmean.mean(),
-                    "grad_norm": grad_norm.mean(),
-                }
+            loss, cf_loss, lambda_loss, cf_im, qvals, grad_norm = epoch_metrics
+            metrics = {
+                "env_step": train_state.timesteps,
+                "update_steps": train_state.n_updates,
+                "grad_steps": train_state.grad_steps,
+                "total_loss": loss.mean(),
+                "mog_cf_loss": cf_loss.mean(),
+                "td_lambda_loss": lambda_loss.mean(),
+                "cf_loss_imag": cf_im.mean(),
+                "qvals": qvals.mean(),
+                "grad_norm": grad_norm.mean(),
+            }
 
             done_infos = jax.tree_util.tree_map(
                 lambda x: (x * infos["returned_episode"]).sum()
@@ -592,17 +554,25 @@ def make_train(config: dict):
                 }
 
             if config["WANDB_MODE"] != "disabled":
+                _sps_state = {"t": time.time(), "s": 0}
 
                 def callback(m, seed_idx_):
                     _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
                     if int(m["update_steps"]) % _iv != 0:
                         return
+                    now = time.time()
+                    steps = int(m["env_step"])
+                    dt = now - _sps_state["t"]
+                    sps = (steps - _sps_state["s"]) / max(dt, 1e-9)
+                    _sps_state["t"], _sps_state["s"] = now, steps
+                    logged = dict(m)
+                    logged["sps"] = sps
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
-                        m = {
-                            **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in m.items()},
-                            **m,
+                        logged = {
+                            **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in logged.items()},
+                            **logged,
                         }
-                    wandb.log(m, step=m["update_steps"])
+                    wandb.log(logged, step=logged["update_steps"])
 
                 jax.debug.callback(callback, metrics, seed_idx)
 

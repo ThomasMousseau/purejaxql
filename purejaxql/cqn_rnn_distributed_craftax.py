@@ -16,6 +16,7 @@ from functools import partial
 import hydra
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import wandb
 from omegaconf import OmegaConf
@@ -36,10 +37,10 @@ from purejaxql.utils.craftax_wrappers import (
 
 
 def make_train(config):
-    config["NUM_UPDATES"] = (
+    config["NUM_UPDATES"] = int(
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    config["NUM_UPDATES_DECAY"] = (
+    config["NUM_UPDATES_DECAY"] = int(
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
 
@@ -117,6 +118,9 @@ def make_train(config):
             mlp_num_layers=config.get("MLP_NUM_LAYERS", 1),
             mlp_hidden_dim=config.get("MLP_HIDDEN_DIM", 128),
             sigma_min=config.get("SIGMA_MIN", 1e-6),
+            # Fix #4: Force float32 — bfloat16 destroys complex trig precision.
+            compute_dtype=jnp.float32,
+            param_dtype=jnp.float32,
         )
 
         def create_agent(rng_key):
@@ -207,8 +211,7 @@ def make_train(config):
                 cf_targets = reward_phase * (
                     (1.0 - bootstrap_mask[..., None]) + bootstrap_mask[..., None] * next_cf
                 )
-                mean_targets = reward_sum + bootstrap_mask * bootstrap_gamma * next_mean_boot
-                return jax.tree_util.tree_map(jax.lax.stop_gradient, (cf_targets, mean_targets))
+                return jax.lax.stop_gradient(cf_targets)
 
             def update_step(runner_state, _):
                 train_state, memory_transitions, expl_state, rng_local = runner_state
@@ -276,10 +279,41 @@ def make_train(config):
                             num_envs_local // config["NUM_MINIBATCHES"],
                             config["NUM_OMEGAS"],
                         )
-                        cf_targets, mean_targets = compute_targets(train_state, minibatch, om_mb, hs)
+                        cf_targets = compute_targets(train_state, minibatch, om_mb, hs)
                         omega_input = jnp.concatenate(
                             [jnp.zeros((*om_mb.shape[:2], 1), dtype=om_mb.dtype), om_mb], axis=-1
                         )
+
+                        # Fix #1: PQN-style recursive TD(λ) for the mean (policy) head.
+                        def _compute_td_lambda_targets(last_q, q_vals, reward, done):
+                            """Backward scan computing TD(λ) exactly as PQN does."""
+                            def _get_target(lambda_returns_and_next_q, rew_q_done):
+                                reward, q, done = rew_q_done
+                                lambda_returns, next_q = lambda_returns_and_next_q
+                                target_bootstrap = (
+                                    reward + config["GAMMA"] * (1 - done) * next_q
+                                )
+                                delta = lambda_returns - next_q
+                                lambda_returns = (
+                                    target_bootstrap
+                                    + config["GAMMA"] * config["LAMBDA"] * delta
+                                )
+                                lambda_returns = (1 - done) * lambda_returns + done * reward
+                                next_q = jnp.max(q, axis=-1)
+                                return (lambda_returns, next_q), lambda_returns
+
+                            lambda_returns = (
+                                reward[-1] + config["GAMMA"] * (1 - done[-1]) * last_q
+                            )
+                            last_q = jnp.max(q_vals[-1], axis=-1)
+                            _, targets = jax.lax.scan(
+                                _get_target,
+                                (lambda_returns, last_q),
+                                jax.tree_util.tree_map(lambda x: x[:-1], (reward, q_vals, done)),
+                                reverse=True,
+                            )
+                            targets = jnp.concatenate([targets, lambda_returns[np.newaxis]])
+                            return targets
 
                         def loss_fn(params):
                             (_, outputs), updates = partial(
@@ -292,14 +326,30 @@ def make_train(config):
                                 minibatch.last_action,
                                 omega_input,
                             )
-                            pred_q = outputs["mean"][..., 0, :]
-                            chosen_q = select_action_values(pred_q, minibatch.action)
-                            pred_cf = select_action_values(outputs["cf"][..., 1:, :], minibatch.action)
-                            diff = pred_cf - cf_targets
+                            pred_q = outputs["mean"][..., 0, :].astype(jnp.float32)
+
+                            # --- CF loss (n-step targets, all timesteps) ---
+                            chosen_q_all = select_action_values(pred_q, minibatch.action)
+                            pred_cf = select_action_values(
+                                outputs["cf"][..., 1:, :], minibatch.action
+                            ).astype(jnp.complex64)
+                            diff = pred_cf - cf_targets.astype(jnp.complex64)
                             cf_loss = 0.5 * (jnp.square(jnp.real(diff)) + jnp.square(jnp.imag(diff))).mean()
+
+                            # --- Mean / policy loss (TD-λ targets, steps [:-1]) ---
+                            target_q_vals = jax.lax.stop_gradient(pred_q)
+                            last_q = target_q_vals[-1].max(axis=-1)
+                            mean_targets = _compute_td_lambda_targets(
+                                last_q,
+                                target_q_vals[:-1],
+                                minibatch.reward[:-1],
+                                minibatch.done[:-1],
+                            ).reshape(-1)
+                            chosen_q = chosen_q_all[:-1].reshape(-1)
                             mean_loss = 0.5 * jnp.square(chosen_q - mean_targets).mean()
-                            loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 0.1) * mean_loss
-                            return loss, (updates, chosen_q, pred_cf, cf_loss, mean_loss)
+
+                            loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 1.0) * mean_loss
+                            return loss, (updates, chosen_q_all, pred_cf, cf_loss, mean_loss)
 
                         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
                         #! Core DDP sync: average grads across devices before optimizer step.
@@ -364,13 +414,20 @@ def make_train(config):
 
                 if config["WANDB_MODE"] != "disabled":
                     leader = jax.lax.axis_index("devices") == 0
+                    _sps_state = {"t": time.time(), "s": 0}
 
                     def _log(_):
                         def callback(metrics_cb, seed_idx_cb):
                             _iv = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
                             if int(metrics_cb["update_steps"]) % _iv != 0:
                                 return
+                            now = time.time()
+                            steps = int(metrics_cb["env_step"])
+                            dt = now - _sps_state["t"]
+                            sps = (steps - _sps_state["s"]) / max(dt, 1e-9)
+                            _sps_state["t"], _sps_state["s"] = now, steps
                             logged = dict(metrics_cb)
+                            logged["sps"] = sps
                             if config.get("WANDB_LOG_ALL_SEEDS", False):
                                 logged.update(
                                     {f"seed_{int(seed_idx_cb) + 1}/{k}": v for k, v in logged.items()}
