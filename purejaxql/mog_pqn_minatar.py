@@ -1,22 +1,18 @@
 """
 MoG-PQN on MinAtar (gymnax): CNN trunk + mixture-of-Gaussians CF heads.
 
-**Vanilla / fair PQN comparison (this file):** Same training shell as ``pqn_minatar.py`` —
-single network (no target net, no Polyak, no hard sync), RAdam + global grad clip,
-ε schedule over **update index** (``EPS_START`` / ``EPS_FINISH`` / ``EPS_DECAY``), and
-``CustomTrainState`` with batch norm stats. The **only** algorithmic differences vs PQN are:
+**Fair PQN comparison:** Same training shell as ``pqn_minatar.py`` — single network (no target
+net, no Polyak), RAdam + global grad clip, ε schedule over **update index**, and
+``CustomTrainState`` with batch norm stats.
 
-  - **Actions / values:** Q(s,a) = Σ_k π_k μ_k from the MoG heads (closed form) instead of a
-    scalar logits head.
-  - **Loss:** MoG characteristic-function Bellman backup (|φ − φ'|² in the complex plane)
-    instead of MSE on λ-return scalar targets.
+Algorithm vs PQN baseline:
 
-See ``mog_pqn_minatar_stabilized.py`` for Double DQN + Polyak soft targets (deliberate extras).
-
-Run from repo root::
-
-  uv run python -m purejaxql.mog_pqn_minatar \\
-    --config-path purejaxql/config --config-name config +alg=mog_pqn_minatar
+  - **Actions / values:** Q(s,a) = Σ_k π_k μ_k (``mog_q_values``) instead of scalar logits.
+  - **Rollout:** stores ``q_mog_mean`` = full vector Q(s,·) at collection time — same role as
+    ``q_val`` in ``pqn_minatar.py``.
+  - **Loss (fused):** (1) MoG characteristic-function Bellman MSE on φ; (2) TD(λ) half-MSE on
+    chosen-action ``q_mog_mean`` vs λ-return targets built **like** ``pqn_minatar`` (reverse scan,
+    rollout ``q_mog_mean`` in the bootstrap). ``total = cf_loss + AUX_MEAN_LOSS_WEIGHT * td_lambda``.
 """
 
 from __future__ import annotations
@@ -130,6 +126,7 @@ class Transition:
     reward: chex.Array
     done: chex.Array
     next_obs: chex.Array
+    q_mog_mean: chex.Array  # (NUM_ENVS, action_dim), same contract as ``q_val`` in pqn_minatar
 
 
 class CustomTrainState(TrainState):
@@ -267,8 +264,10 @@ def make_train(config: dict):
         rng, rng_agent = jax.random.split(rng)
         train_state = create_agent(rng_agent)
 
-        def mog_gradient_step(train_state, batch, rng_step):
-            """One-step MoG–CF backup using **current** network weights only (same role as PQN's bootstrap)."""
+        aux_w = float(config.get("AUX_MEAN_LOSS_WEIGHT", 1.0))
+
+        def mog_gradient_step(train_state, batch, lambda_target, rng_step):
+            """MoG–CF Bellman + TD(λ) on mean Q (same bootstrap role as PQN)."""
             rng_step, omega_key = jax.random.split(rng_step)
             s_obs = batch.obs
             s_next_obs = batch.next_obs
@@ -319,24 +318,35 @@ def make_train(config: dict):
                 )
                 online_phi = build_mog_cf(online_pi, online_mu, online_sigma, omegas)
                 online_phi_sel = online_phi[bidx, :, s_actions]
-                loss = jnp.mean(jnp.abs(online_phi_sel - td_target) ** 2)
+                cf_loss = jnp.mean(jnp.abs(online_phi_sel - td_target) ** 2)
                 residual = online_phi_sel - td_target
                 cf_im = jnp.mean(jnp.abs(jnp.imag(residual)))
                 q_all = mog_q_values(online_pi, online_mu)
-                q_mean = q_all[bidx, s_actions].mean()
+                chosen_action_qvals = jnp.take_along_axis(
+                    q_all,
+                    jnp.expand_dims(s_actions, axis=-1),
+                    axis=-1,
+                ).squeeze(axis=-1)
+                td_lambda_loss = 0.5 * jnp.mean(
+                    jnp.square(chosen_action_qvals - lambda_target)
+                )
+                total_loss = cf_loss + aux_w * td_lambda_loss
+                q_mean = chosen_action_qvals.mean()
                 q_gap = (q_all.max(axis=1) - q_all.min(axis=1)).mean()
                 mog_ent = -jnp.sum(online_pi * jnp.log(online_pi + 1e-8), axis=-1).mean()
                 sig_m = online_sigma.mean()
-                return loss, (
+                return total_loss, (
                     updates,
                     q_mean,
                     q_gap,
                     mog_ent,
                     sig_m,
                     cf_im,
+                    cf_loss,
+                    td_lambda_loss,
                 )
 
-            (loss, (updates, q_mean, q_gap, mog_ent, sig_m, cf_im)), grads = jax.value_and_grad(
+            (loss, (updates, q_mean, q_gap, mog_ent, sig_m, cf_im, cf_loss, td_lambda_loss)), grads = jax.value_and_grad(
                 _loss_fn, has_aux=True
             )(train_state.params)
             grad_norm = optax.global_norm(grads)
@@ -354,7 +364,7 @@ def make_train(config: dict):
             return (
                 train_state,
                 loss,
-                (q_mean, q_gap, mog_ent, sig_m, cf_im),
+                (q_mean, q_gap, mog_ent, sig_m, cf_im, cf_loss, td_lambda_loss),
                 grad_norm,
                 layer_grad_norms,
             )
@@ -375,10 +385,10 @@ def make_train(config: dict):
                     last_obs,
                     train=False,
                 )
-                q_vals = mog_q_values(pi, mu)
+                q_mog_mean = mog_q_values(pi, mu)
                 _rngs = jax.random.split(rng_a, config["NUM_ENVS"])
                 eps_vec = jnp.full((config["NUM_ENVS"],), eps)
-                new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps_vec)
+                new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_mog_mean, eps_vec)
 
                 new_obs, new_env_state, reward, new_done, info = vmap_step(config["NUM_ENVS"])(
                     rng_s, env_state, new_action
@@ -389,6 +399,7 @@ def make_train(config: dict):
                     reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
                     next_obs=new_obs,
+                    q_mog_mean=q_mog_mean,
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
@@ -405,11 +416,46 @@ def make_train(config: dict):
                 timesteps=train_state.timesteps + config["NUM_STEPS"] * config["NUM_ENVS"]
             )
 
+            pi_last, mu_last, _ = network.apply(
+                {
+                    "params": train_state.params,
+                    "batch_stats": train_state.batch_stats,
+                },
+                transitions.next_obs[-1],
+                train=False,
+            )
+            last_q = jnp.max(mog_q_values(pi_last, mu_last), axis=-1)
+            last_q = last_q * (1 - transitions.done[-1])
+            lambda_returns = transitions.reward[-1] + config["GAMMA"] * last_q
+
+            def _get_target(lambda_returns_and_next_q, transition):
+                lambda_returns, next_q = lambda_returns_and_next_q
+                target_bootstrap = (
+                    transition.reward
+                    + config["GAMMA"] * (1 - transition.done) * next_q
+                )
+                delta = lambda_returns - next_q
+                lambda_returns = (
+                    target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
+                )
+                lambda_returns = (1 - transition.done) * lambda_returns + transition.done * transition.reward
+                next_q = jnp.max(transition.q_mog_mean, axis=-1)
+                return (lambda_returns, next_q), lambda_returns
+
+            _, targets = jax.lax.scan(
+                _get_target,
+                (lambda_returns, last_q),
+                jax.tree_util.tree_map(lambda x: x[:-1], transitions),
+                reverse=True,
+            )
+            lambda_targets = jnp.concatenate((targets, lambda_returns[jnp.newaxis]))
+
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
-                def _learn_phase(carry, minibatch):
+                def _learn_phase(carry, mb_and_td):
                     train_state, rng = carry
+                    minibatch, lambda_td = mb_and_td
                     rng, rng_gs = jax.random.split(rng)
                     (
                         train_state,
@@ -417,8 +463,8 @@ def make_train(config: dict):
                         aux,
                         grad_norm,
                         layer_grad_norms,
-                    ) = mog_gradient_step(train_state, minibatch, rng_gs)
-                    q_mean, q_gap, mog_ent, sig_m, cf_im = aux
+                    ) = mog_gradient_step(train_state, minibatch, lambda_td, rng_gs)
+                    q_mean, q_gap, mog_ent, sig_m, cf_im, cf_l, td_l = aux
                     return (
                         train_state,
                         rng,
@@ -429,6 +475,8 @@ def make_train(config: dict):
                         mog_ent,
                         sig_m,
                         cf_im,
+                        cf_l,
+                        td_l,
                         grad_norm,
                         layer_grad_norms,
                     )
@@ -444,6 +492,7 @@ def make_train(config: dict):
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, rng_perm), transitions
                 )
+                lambda_mb = preprocess_transition(lambda_targets, rng_perm)
 
                 rng, rng_epoch = jax.random.split(rng)
                 (train_state, rng), (
@@ -453,12 +502,14 @@ def make_train(config: dict):
                     mog_ents,
                     sig_ms,
                     cf_ims,
+                    cf_losses,
+                    td_lambda_losses,
                     grad_norms,
                     layer_grad_norms,
                 ) = jax.lax.scan(
                     _learn_phase,
                     (train_state, rng_epoch),
-                    minibatches,
+                    (minibatches, lambda_mb),
                 )
                 return (train_state, rng), (
                     losses,
@@ -467,6 +518,8 @@ def make_train(config: dict):
                     mog_ents,
                     sig_ms,
                     cf_ims,
+                    cf_losses,
+                    td_lambda_losses,
                     grad_norms,
                     layer_grad_norms,
                 )
@@ -482,6 +535,8 @@ def make_train(config: dict):
                 mog_ent_e,
                 sig_m_e,
                 cf_im_e,
+                cf_loss_e,
+                td_lambda_e,
                 grad_norm,
                 layer_grad_norms,
             ) = jax.lax.scan(_learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"])
@@ -495,7 +550,9 @@ def make_train(config: dict):
                 "env_frame": train_state.timesteps
                 * env.observation_space(env_params).shape[-1],
                 "grad_steps": train_state.grad_steps,
-                "mog_loss": loss.mean(),
+                "total_loss": loss.mean(),
+                "mog_cf_loss": cf_loss_e.mean(),
+                "td_lambda_loss": td_lambda_e.mean(),
                 "q_values": q_mean_e.mean(),
                 "q_gap": q_gap_e.mean(),
                 "mog_entropy": mog_ent_e.mean(),
@@ -602,7 +659,7 @@ def make_train(config: dict):
 
 
 def _wandb_tags(config: dict) -> list[str]:
-    alg_name = config.get("ALG_NAME", "mog_pqn_minatar")
+    alg_name = config.get("ALG_NAME", "mog_pqn")
     env_name = config["ENV_NAME"]
     tags = [
         alg_name.upper(),
@@ -621,7 +678,7 @@ def _wandb_tags(config: dict) -> list[str]:
 def single_run(config):
     config = {**config, **config["alg"]}
 
-    alg_name = config.get("ALG_NAME", "mog_pqn_minatar")
+    alg_name = config.get("ALG_NAME", "mog_pqn")
     env_name = config["ENV_NAME"]
 
     wandb.init(
@@ -668,7 +725,7 @@ def single_run(config):
 
 def tune(default_config):
     default_config = {**default_config, **default_config["alg"]}
-    alg_name = default_config.get("ALG_NAME", "mog_pqn_minatar")
+    alg_name = default_config.get("ALG_NAME", "mog_pqn")
     env_name = default_config["ENV_NAME"]
 
     def wrapped_make_train():

@@ -3,33 +3,30 @@
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1
-#SBATCH --array=0,3,4,5,7,8,11,12,15%9
+#SBATCH --array=0,3,6,9%4
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 
 ################################################################################
-# MinAtar 10M: 4 envs × 4 algos = 16 Slurm tasks.
+# MinAtar 10M: 4 envs × 3 algos = 12 Slurm tasks (full grid: ``#SBATCH --array=0-11%12``).
+#
+# **Current array** ``0,3,6,9``: MoG only, one task per game (TID/3 = env, TID%3 = 0 → MoG).
 #
 # Each task: **NUM_SEEDS=5** (vmap) — one process, one W&B run per (env, algo).
 # Tag **multi_seed** + ``WANDB_LOG_ALL_SEEDS`` → logs ``seed_i/charts/episodic_return``.
-# Plots: ``old_cvi/plot_wandb_minatar.py`` / ``plot_wandb_craftax_rnn_compare.py`` use
-# :func:`curves_from_wandb_run` to expand those into mean ± std (same as 5 separate runs).
 #
 # Algorithms:
-#   - mog_pqn_minatar_stabilized (Double DQN + Polyak TAU)
-#   - mog_pqn_minatar (PQN shell; MoG CF loss)
+#   - mog_pqn_minatar (canonical MoG: CF + TD(λ) on ``q_mog_mean``, same shell as PQN)
 #   - cqn_minatar
 #   - pqn_minatar
 #
-# W&B tags: EXPERIMENT_TAG=MinAtar_10M_PQN, WANDB_EXTRA_TAGS=[algo, multi_seed]
+# W&B: EXPERIMENT_TAG=MinAtar_10M_PQN, algo tags ``MoG``, ``CQN``, ``PQN`` (MoG = this trainer).
 #
-# TID → env_idx = TID/4, algo_idx = TID%4
+# TID → env_idx = TID/3, algo_idx = TID%3  (MoG: TID ∈ {0,3,6,9})
 #
 # Submit from repo root:  sbatch slurm/slurm_minatar_10m_pqn_compare.sh
-#
-# GPU: ``--gres=gpu:l40s:1``. Array below reruns only tasks that failed in job 9243202
-# (already succeeded: 1,2,6,9,10,13,14). For a full 16-task sweep use ``--array=0-15%16``.
+# (Edit ``--array`` above for full MoG+CQN+PQN: ``0-11%12``.)
 ################################################################################
 
 set -euo pipefail
@@ -46,8 +43,8 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 EXPERIMENT_TAG="MinAtar_10M_PQN"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
-ENV_IDX=$((TID / 4))
-ALGO_IDX=$((TID % 4))
+ENV_IDX=$((TID / 3))
+ALGO_IDX=$((TID % 3))
 
 ENV_IDS=(
     "Asterix-MinAtar"
@@ -57,20 +54,17 @@ ENV_IDS=(
 )
 
 PY_MODULES=(
-    "purejaxql.mog_pqn_minatar_stabilized"
     "purejaxql.mog_pqn_minatar"
     "purejaxql.cqn_minatar"
     "purejaxql.pqn_minatar"
 )
 HYDRA_ALG=(
-    "mog_pqn_minatar_stabilized"
     "mog_pqn_minatar"
     "cqn_minatar"
     "pqn_minatar"
 )
 WANDB_ALGO_TAGS=(
-    "MoG-PQN-stab"
-    "MoG-PQN"
+    "MoG"
     "CQN"
     "PQN"
 )
@@ -80,11 +74,10 @@ PY_MODULE="${PY_MODULES[$ALGO_IDX]}"
 ALG_GROUP="${HYDRA_ALG[$ALGO_IDX]}"
 WANDB_TAG_ALGO="${WANDB_ALGO_TAGS[$ALGO_IDX]}"
 
-# One run name per (env, algo) — no per-seed suffix (seeds live under seed_i/* in W&B)
 RUN_NAME="${ENV_ID}__${WANDB_TAG_ALGO}__x5"
 
 echo "=========================================="
-echo "MinAtar 10M PQN — 16 tasks (4 envs × 4 algos), NUM_SEEDS=5 vmap, W&B multi_seed"
+echo "MinAtar 10M PQN — 12 tasks (4 envs × 3 algos), NUM_SEEDS=5 vmap, W&B multi_seed"
 echo "=========================================="
 echo "Task:     ${TID} (env ${ENV_IDX}, algo ${ALGO_IDX})"
 echo "Module:   ${PY_MODULE}"
@@ -100,10 +93,10 @@ echo "Start:    $(date)"
 echo "=========================================="
 
 ALGO_EXTRA=()
-if [[ "${ALGO_IDX}" -eq 2 ]]; then
+if [[ "${ALGO_IDX}" -eq 1 ]]; then
   ALGO_EXTRA+=(++alg.NUM_ENVS=128 ++alg.TEST_NUM_ENVS=128)
 fi
-if [[ "${ALGO_IDX}" -eq 3 ]]; then
+if [[ "${ALGO_IDX}" -eq 2 ]]; then
   ALGO_EXTRA+=(++alg.ALG_NAME=pqn)
 fi
 

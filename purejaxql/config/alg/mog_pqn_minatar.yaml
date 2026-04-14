@@ -1,6 +1,6 @@
-# MoG-PQN MinAtar — match ``pqn_minatar.yaml`` training shell (ε schedule, RAdam, batch stats);
-# differs only in MoG heads + CF loss (see ``mog_pqn_minatar.py``).
-ALG_NAME: "mog_pqn_minatar"
+# Canonical MoG MinAtar — match ``pqn_minatar.yaml`` shell (ε schedule, RAdam, batch stats);
+# MoG heads + CF Bellman + TD(λ) on ``q_mog_mean`` (see ``mog_pqn_minatar.py``).
+ALG_NAME: "mog_pqn"
 TOTAL_TIMESTEPS: 10000000
 TOTAL_TIMESTEPS_DECAY: 10000000
 
@@ -27,9 +27,11 @@ LR_LINEAR_DECAY: True
 NUM_OMEGA_SAMPLES: 128
 OMEGA_MAX: 1.0
 NUM_COMPONENTS: 8
+AUX_MEAN_LOSS_WEIGHT: 1.0  # TD(λ) half-MSE weight vs CF loss
 
 REW_SCALE: 1.0
 GAMMA: 0.99
+LAMBDA: 0.65  # same default as pqn_minatar.yaml (Q(λ) mixing)
 
 ENV_NAME: "Asterix-MinAtar"
 ENV_KWARGS: {}
