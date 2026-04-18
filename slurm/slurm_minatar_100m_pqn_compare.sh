@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=minatar-10m-pqn
+#SBATCH --job-name=minatar-100m-pqn
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1
-#SBATCH --array=0,3,6,9%4
+#SBATCH --array=0-11%12
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 
 ################################################################################
-# MinAtar 10M: 4 envs × 3 algos = 12 Slurm tasks (full grid: ``#SBATCH --array=0-11%12``).
+# MinAtar 30M: 4 envs × 3 algos = 12 Slurm tasks (full grid: ``#SBATCH --array=0-11%12``).
 #
-# **Current array** ``0,3,6,9``: MoG only, one task per game (TID/3 = env, TID%3 = 0 → MoG).
+# **Current array** ``0-11%12``: MoG only, one task per game (TID/3 = env, TID%3 = 0 → MoG).
 #
 # Each task: **NUM_SEEDS=5** (vmap) — one process, one W&B run per (env, algo).
 # Tag **multi_seed** + ``WANDB_LOG_ALL_SEEDS`` → logs ``seed_i/charts/episodic_return``.
@@ -21,12 +21,12 @@
 #   - cqn_minatar
 #   - pqn_minatar
 #
-# W&B: EXPERIMENT_TAG=MinAtar_10M_PQN, algo tags ``MoG``, ``CQN``, ``PQN`` (MoG = this trainer).
+# W&B: EXPERIMENT_TAG=MinAtar_30M_PQN, algo tags ``MoG``, ``CQN``, ``PQN`` (MoG = this trainer).
 #
-# TID → env_idx = TID/3, algo_idx = TID%3  (MoG: TID ∈ {0,3,6,9})
+# TID → env_idx = TID/3, algo_idx = TID%3  (MoG: TID ∈ {0-11})
 #
-# Submit from repo root:  sbatch slurm/slurm_minatar_10m_pqn_compare.sh
-# (Edit ``--array`` above for full MoG+CQN+PQN: ``0-11%12``.)
+# Submit from repo root:  sbatch slurm/slurm_minatar_100m_pqn_compare.sh
+# (Edit ``--array`` above for full MoG+CQN+PQN: ``0-11``.)
 ################################################################################
 
 set -euo pipefail
@@ -40,7 +40,7 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="MinAtar_10M_PQN"
+EXPERIMENT_TAG="MinAtar_100M_PQN"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
 ENV_IDX=$((TID / 3))
@@ -110,6 +110,8 @@ uv run --no-sync python -m "${PY_MODULE}" \
   "+alg.EXPERIMENT_TAG=${EXPERIMENT_TAG}" \
   "+alg.WANDB_EXTRA_TAGS=[\"${WANDB_TAG_ALGO}\",\"multi_seed\"]" \
   "+alg.NAME=${RUN_NAME}" \
+  "alg.TOTAL_TIMESTEPS=100000000" \
+  "alg.TOTAL_TIMESTEPS_DECAY=100000000" \
   "${ALGO_EXTRA[@]}"
 
 echo "Task ${TID} completed"

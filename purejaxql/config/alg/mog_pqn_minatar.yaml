@@ -1,8 +1,8 @@
 # Canonical MoG MinAtar — match ``pqn_minatar.yaml`` shell (ε schedule, RAdam, batch stats);
 # MoG heads + CF Bellman + TD(λ) on ``q_mog_mean`` (see ``mog_pqn_minatar.py``).
 ALG_NAME: "mog_pqn"
-TOTAL_TIMESTEPS: 10000000
-TOTAL_TIMESTEPS_DECAY: 10000000
+TOTAL_TIMESTEPS: 30000000
+TOTAL_TIMESTEPS_DECAY: 30000000
 
 NUM_ENVS: 128
 NUM_STEPS: 32
