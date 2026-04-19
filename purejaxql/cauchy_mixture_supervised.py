@@ -3,22 +3,28 @@ Supervised Cauchy-mixture IQN vs characteristic-function network (local toy expe
 
 Ground truth: equal mixture of Cauchy(mu=-5, gamma=0.5) and Cauchy(mu=5, gamma=0.5).
 
-IQN: cosine tau embedding -> MLP trunk -> scalar. CF net: scalar t -> Linear(embed_dim)+ReLU
+IQN: cosine tau embedding -> MLP trunk -> scalar. CQN: scalar t -> Linear(embed_dim)+ReLU
 -> same trunk -> 2D head on the unit disk. Each training step uses one shared reward batch R.
 
 Eval uses a **fixed** RNG seed for IQN quantile levels tau so empirical CF curves across
 checkpoints reflect learning, not independent Monte Carlo noise.
 
 Run: python -m purejaxql.cauchy_mixture_supervised
-Outputs under figures/ with suffix from TrainConfig.figure_tag; metrics also saved as CSV.
+
+Replot checkpoints only (no training), same PDFs + PNGs + metrics CSV::
+
+    python -m purejaxql.cauchy_mixture_supervised --replot purejaxql/cauchy_mixture_run_TAG.npz
+
+Outputs under figures/: vector PDF + 300 dpi PNG per figure; metrics CSV alongside.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -31,6 +37,92 @@ from flax.training import train_state
 
 import flax.linen as nn
 
+# --- Publication plotting: system sans-serif stack (SF on macOS via -apple-system), vector PDF ---
+NEURIPS_STYLE = {
+    "font.family": "sans-serif",
+    "font.sans-serif": [
+        "system-ui",
+        "-apple-system",
+        "BlinkMacSystemFont",
+        "Segoe UI",
+        "Roboto",
+        "Helvetica Neue",
+        "Helvetica",
+        "Arial",
+        "DejaVu Sans",
+        "sans-serif",
+    ],
+    "mathtext.fontset": "dejavusans",
+    "font.size": 10,
+    "axes.labelsize": 10,
+    "axes.titlesize": 9,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+    "text.color": "#2E2E2E",
+    "axes.labelcolor": "#2E2E2E",
+    "axes.titlecolor": "#2E2E2E",
+    "xtick.color": "#2E2E2E",
+    "ytick.color": "#2E2E2E",
+    "axes.edgecolor": "#444444",
+    "axes.linewidth": 0.8,
+    "lines.linewidth": 1.5,
+    "grid.linewidth": 0.5,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+}
+plt.rcParams.update(NEURIPS_STYLE)
+
+# GT nearly black; CQN saturated purple. Tiered lw (gap widened ~10%) keeps overlays readable.
+COLORS = {
+    "truth": "#0A0A0A",
+    "cqn": "#7C3AED",
+    "iqn": "#56B4E9",
+}
+LW_GT, LW_CQN, LW_IQN = 2.15, 1.41, 1.05  # GT > purple > blue (alignment overlay)
+
+
+def minimal_style(ax: plt.Axes) -> None:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, linestyle="--", color="#E0E0E0", alpha=0.7, zorder=0)
+    ax.set_axisbelow(True)
+
+
+def _save_figure_pdf_png(fig: plt.Figure, pdf_path: str, *, png_dpi: int = 300) -> None:
+    """Save the same layout as PDF and as a raster PNG (`pdf_path` may end with .pdf or any name)."""
+    stem = os.path.splitext(pdf_path)[0]
+    # Extra padding avoids tight-bbox clipping (e.g. first-column title ``1k``, y-axis labels).
+    fig.savefig(f"{stem}.pdf", format="pdf", bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(f"{stem}.png", format="png", bbox_inches="tight", pad_inches=0.08, dpi=png_dpi)
+
+
+def _legend_below_panels(
+    fig: plt.Figure,
+    axes: list,
+    ncol: int,
+    *,
+    y_anchor: float = 0.12,
+    label_order: tuple[str, ...] | None = None,
+) -> None:
+    """Legend centered below subplot area (main title via fig.suptitle at top)."""
+    handles, labels = axes[-1].get_legend_handles_labels()
+    if label_order is not None:
+        by_label = dict(zip(labels, handles))
+        handles = [by_label[L] for L in label_order if L in by_label]
+        labels = [L for L in label_order if L in by_label]
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, y_anchor),
+        bbox_transform=fig.transFigure,
+        ncol=ncol,
+        frameon=False,
+        fontsize=8,
+        labelcolor="#2E2E2E",
+    )
+
 
 # --- Mixture parameters (ground truth) ---
 MIX_PROB = jnp.float32(0.5)
@@ -39,8 +131,8 @@ GAMMA1 = jnp.float32(0.5)
 MU2 = jnp.float32(5.0)
 GAMMA2 = jnp.float32(0.5)
 
-# Filename suffix for figures / npz (|mu|=5, gamma=2.0)
-FIG_FILE_TAG = "_5-mu_05-gamma_v3"
+# Filename suffix for figures / npz (|mu|=5, gamma=0.5)
+FIG_FILE_TAG = "_5-mu_05-gamma_finale"
 
 
 @dataclass(frozen=True)
@@ -419,80 +511,35 @@ def evaluate_checkpoint_to_dict(
     }
 
 
-def plot_frequency_figure(
-    checkpoint_results: list[dict],
-    steps: list[int],
-    out_path: str,
-    plot_t_max: float,
-) -> None:
-    fig, axes = plt.subplots(1, len(steps), figsize=(4.2 * len(steps), 3.8), sharey=True)
-    if len(steps) == 1:
-        axes = [axes]
-    for ax, step, res in zip(axes, steps, checkpoint_results):
-        t = res["t_eval"]
-        m = np.abs(t) <= plot_t_max
-        ax.plot(t[m], np.real(res["phi_true"])[m], color="black", lw=2.0, label=r"$\mathrm{Re}\,\varphi_{\mathrm{true}}$")
-        ax.plot(t[m], np.real(res["phi_cf"])[m], color="C0", lw=1.5, label="CF net")
-        ax.plot(t[m], np.real(res["phi_iqn"])[m], color="C1", lw=1.5, alpha=0.9, label="IQN empirical")
-        ax.set_title(f"{step:,} steps")
-        ax.set_xlabel(r"$t$")
-        ax.set_xlim(-plot_t_max, plot_t_max)
-        ax.grid(True, alpha=0.3)
-    axes[0].set_ylabel(r"$\mathrm{Re}\,\varphi(t)$")
-    handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.08))
-    fig.suptitle(
-        r"(IQN empirical CF uses the same $\tau$ grid at every checkpoint — curve changes reflect learning, not resampling noise)",
-        fontsize=8,
-        y=1.02,
-    )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
+_CKPT_SCALAR_KEYS = ("mse_iqn", "mse_cf", "ks_iqn", "ks_cf", "w1_iqn", "w1_cf")
+_CKPT_ARRAY_KEYS = ("t_eval", "x_eval", "phi_true", "phi_iqn", "phi_cf", "f_true", "f_iqn", "f_cf")
 
 
-def plot_spatial_figure(
-    checkpoint_results: list[dict],
-    steps: list[int],
-    out_path: str,
-    plot_x_min: float,
-    plot_x_max: float,
-) -> None:
-    fig, axes = plt.subplots(1, len(steps), figsize=(4.2 * len(steps), 4.0), sharey=True)
-    if len(steps) == 1:
-        axes = [axes]
-    for ax, step, res in zip(axes, steps, checkpoint_results):
-        x = res["x_eval"]
-        m = (x >= plot_x_min) & (x <= plot_x_max)
-        ax.plot(x[m], res["f_true"][m], color="black", lw=2.0, label=r"$F_{\mathrm{true}}$")
-        ax.plot(x[m], res["f_cf"][m], color="C0", lw=1.5, label="CF net (Gil–Pelaez)")
-        ax.plot(x[m], res["f_iqn"][m], color="C1", lw=1.5, alpha=0.9, label="IQN empirical")
-        ax.set_title(f"{step:,} steps")
-        ax.set_xlabel(r"$x$")
-        ax.set_xlim(plot_x_min, plot_x_max)
-        ax.grid(True, alpha=0.3)
-        ax.text(
-            0.03,
-            0.97,
-            f"KS  IQN {res['ks_iqn']:.3g}   CF {res['ks_cf']:.3g}\n"
-            f"W₁  IQN {res['w1_iqn']:.3g}   CF {res['w1_cf']:.3g}",
-            transform=ax.transAxes,
-            fontsize=8,
-            verticalalignment="top",
-            fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.88, edgecolor="0.8"),
-        )
-    axes[0].set_ylabel(r"$F(x)$")
-    handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.06))
-    fig.suptitle(
-        r"$W_1=\int |F_{\mathrm{est}}-F_{\mathrm{true}}|\,dx$ on full eval grid (KS is pointwise max $\|F_{\mathrm{est}}-F_{\mathrm{true}}\|_\infty$)",
-        fontsize=8,
-        y=1.05,
-    )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
+def checkpoints_dict_from_npz(npz_path: str) -> tuple[dict[int, dict], list[int]]:
+    """Rebuild checkpoint dicts produced by ``main()``'s ``np.savez`` (``ck{i}_*`` keys)."""
+    z = np.load(npz_path, allow_pickle=False)
+    if "steps" not in z.files:
+        raise ValueError(f"No 'steps' array in {npz_path}")
+    ordered_steps = [int(x) for x in np.asarray(z["steps"]).flatten()]
+    checkpoints_data: dict[int, dict] = {}
+    for i, s in enumerate(ordered_steps):
+        pre = f"ck{i}_"
+        d: dict = {}
+        for k in _CKPT_SCALAR_KEYS:
+            d[k] = float(np.asarray(z[pre + k]))
+        for k in _CKPT_ARRAY_KEYS:
+            d[k] = np.asarray(z[pre + k])
+        checkpoints_data[s] = d
+    return checkpoints_data, ordered_steps
+
+
+def figure_tag_from_npz_filename(npz_path: str) -> str | None:
+    """Parse ``.../cauchy_mixture_run{tag}.npz`` basename → ``tag`` (includes leading ``_`` if present)."""
+    base = os.path.basename(npz_path)
+    prefix, suffix = "cauchy_mixture_run", ".npz"
+    if base.startswith(prefix) and base.endswith(suffix):
+        return base[len(prefix) : -len(suffix)]
+    return None
 
 
 def _checkpoint_col_label(step: int) -> str:
@@ -506,6 +553,120 @@ def _fmt_metric(v: float) -> str:
     return f"{float(v):.3g}"
 
 
+def plot_frequency_figure(
+    checkpoint_results: list[dict],
+    steps: list[int],
+    out_path: str,
+    plot_t_max: float,
+) -> None:
+    fig, axes = plt.subplots(1, len(steps), figsize=(3.35 * len(steps), 2.6), sharey=True)
+    if len(steps) == 1:
+        axes = [axes]
+    # z-order: black (GT) back, purple (CQN) mid, blue (IQN) front
+    z_gt, z_cqn, z_iqn = 1, 2, 3
+    lg_gt = r"GT ($\mathrm{Re}\,\varphi$)"
+    lg_cqn, lg_iqn = "CQN", "IQN (empirical)"
+    legend_order = (lg_gt, lg_cqn, lg_iqn)
+
+    for ax, step, res in zip(axes, steps, checkpoint_results):
+        t = res["t_eval"]
+        m = np.abs(t) <= plot_t_max
+        ax.plot(
+            t[m],
+            np.real(res["phi_true"])[m],
+            color=COLORS["truth"],
+            lw=LW_GT,
+            label=lg_gt,
+            zorder=z_gt,
+        )
+        ax.plot(
+            t[m],
+            np.real(res["phi_cf"])[m],
+            color=COLORS["cqn"],
+            lw=LW_CQN,
+            label=lg_cqn,
+            zorder=z_cqn,
+        )
+        ax.plot(
+            t[m],
+            np.real(res["phi_iqn"])[m],
+            color=COLORS["iqn"],
+            lw=LW_IQN,
+            alpha=0.95,
+            label=lg_iqn,
+            zorder=z_iqn,
+        )
+        minimal_style(ax)
+        ax.set_title(_checkpoint_col_label(step), fontsize=9, color="#6E6E6E")
+        # SP-style: abscissa is the CF “frequency” parameter (ω; also written W in some signal texts)
+        ax.set_xlabel(r"$\omega$ ($W$)")
+        ax.set_xlim(-plot_t_max, plot_t_max)
+    axes[0].set_ylabel(r"$\mathrm{Re}\,\varphi(\omega)$")
+    fig.suptitle("Frequency Domain", fontsize=11, y=0.97, color="#2E2E2E")
+    _legend_below_panels(fig, axes, ncol=3, y_anchor=0.13, label_order=legend_order)
+    fig.subplots_adjust(bottom=0.27, top=0.83, left=0.11, right=0.98, wspace=0.12)
+    _save_figure_pdf_png(fig, out_path)
+    plt.close(fig)
+
+
+def plot_spatial_figure(
+    checkpoint_results: list[dict],
+    steps: list[int],
+    out_path: str,
+    plot_x_min: float,
+    plot_x_max: float,
+) -> None:
+    fig, axes = plt.subplots(1, len(steps), figsize=(3.35 * len(steps), 2.75), sharey=True)
+    if len(steps) == 1:
+        axes = [axes]
+    z_gt, z_cqn, z_iqn = 1, 2, 3
+    lg_gt, lg_cqn, lg_iqn = "GT", "CQN (Gil–Pelaez)", "IQN (empirical)"
+    legend_order = (lg_gt, lg_cqn, lg_iqn)
+
+    for ax, step, res in zip(axes, steps, checkpoint_results):
+        x = res["x_eval"]
+        m = (x >= plot_x_min) & (x <= plot_x_max)
+        ax.plot(x[m], res["f_true"][m], color=COLORS["truth"], lw=LW_GT, label=lg_gt, zorder=z_gt)
+        ax.plot(
+            x[m],
+            res["f_cf"][m],
+            color=COLORS["cqn"],
+            lw=LW_CQN,
+            label=lg_cqn,
+            zorder=z_cqn,
+        )
+        ax.plot(
+            x[m],
+            res["f_iqn"][m],
+            color=COLORS["iqn"],
+            lw=LW_IQN,
+            alpha=0.95,
+            label=lg_iqn,
+            zorder=z_iqn,
+        )
+        minimal_style(ax)
+        ax.set_title(_checkpoint_col_label(step), fontsize=9, color="#6E6E6E")
+        ax.set_xlabel(r"$x$")
+        ax.set_xlim(plot_x_min, plot_x_max)
+        ax.text(
+            0.03,
+            0.97,
+            f"KS  IQN {res['ks_iqn']:.3g}   CQN {res['ks_cf']:.3g}\n"
+            f"W₁  IQN {res['w1_iqn']:.3g}   CQN {res['w1_cf']:.3g}",
+            transform=ax.transAxes,
+            fontsize=7,
+            verticalalignment="top",
+            family="sans-serif",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.92, edgecolor="#DDDDDD", linewidth=0.6),
+        )
+    axes[0].set_ylabel(r"$F(x)$")
+    fig.suptitle("Spatial Domain", fontsize=11, y=0.97, color="#2E2E2E")
+    _legend_below_panels(fig, axes, ncol=3, y_anchor=0.13, label_order=legend_order)
+    fig.subplots_adjust(bottom=0.27, top=0.82, left=0.11, right=0.98, wspace=0.12)
+    _save_figure_pdf_png(fig, out_path)
+    plt.close(fig)
+
+
 def plot_mixture_pdf_figure(
     out_path: str,
     rng: jax.Array,
@@ -517,38 +678,39 @@ def plot_mixture_pdf_figure(
     y = pdf_true(x)
     rng, rk = jax.random.split(rng)
     samp = sample_cauchy_mixture(rk, 80_000)
-    fig, ax = plt.subplots(figsize=(6.8, 3.5))
+    fig, ax = plt.subplots(figsize=(4.2, 2.6))
     ax.hist(
         np.asarray(samp),
-        bins=90,
+        bins=72,
         range=(x_min, x_max),
         density=True,
-        color="0.88",
-        edgecolor="0.75",
-        linewidth=0.25,
-        label="80k samples",
+        color="#E8E8E8",
+        edgecolor="#CCCCCC",
+        linewidth=0.2,
+        label=r"Samples ($n{=}80\mathrm{k}$)",
         zorder=1,
     )
-    ax.plot(np.asarray(x), np.asarray(y), color="black", lw=2.2, label="Mixture PDF", zorder=2)
+    ax.plot(np.asarray(x), np.asarray(y), color=COLORS["truth"], lw=LW_GT, label=r"Truth PDF", zorder=3)
+    minimal_style(ax)
     ax.set_xlim(x_min, x_max)
-    ax.set_xlabel(r"$x$ (reward)")
+    ax.set_xlabel(r"$x$")
     ax.set_ylabel("density")
-    ax.set_title(
-        r"Ground truth: $\frac{1}{2}\mathrm{Cauchy}(-5,0.5)+\frac{1}{2}\mathrm{Cauchy}(5,0.5)$"
-    )
-    ax.text(
-        0.02,
-        0.98,
-        f"zoom: [{x_min:.0f}, {x_max:.0f}] — tails omitted (heavy-tailed Cauchy)",
-        transform=ax.transAxes,
+    
+    fig.suptitle("Cauchy Distribution", fontsize=11, y=0.96, color="#2E2E2E")
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.06),
+        bbox_transform=fig.transFigure,
+        ncol=2,
+        frameon=False,
         fontsize=8,
-        verticalalignment="top",
-        color="0.35",
+        labelcolor="#2E2E2E",
     )
-    ax.legend(loc="upper right", fontsize=9)
-    ax.grid(True, alpha=0.35)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.subplots_adjust(bottom=0.22, top=0.86, left=0.12, right=0.96)
+    _save_figure_pdf_png(fig, out_path)
     plt.close(fig)
 
 
@@ -557,24 +719,24 @@ def plot_metrics_table_figure(
     ordered_steps: list[int],
     out_path: str,
 ) -> None:
-    """PNG summary table: rows = method/metric, cols = checkpoints."""
+    """Compact metrics table PDF (numbers also in companion CSV)."""
     col_labels = [_checkpoint_col_label(s) for s in ordered_steps]
     row_labels = [
         "IQN  φ MSE",
-        "CF   φ MSE",
+        "CQN  φ MSE",
         "IQN  KS",
-        "CF   KS",
+        "CQN  KS",
         "IQN  W₁",
-        "CF   W₁",
+        "CQN  W₁",
     ]
     keys = ("mse_iqn", "mse_cf", "ks_iqn", "ks_cf", "w1_iqn", "w1_cf")
     cell_text = [
         [_fmt_metric(checkpoints_data[s][k]) for s in ordered_steps] for k in keys
     ]
 
-    fig, ax = plt.subplots(figsize=(6.5, 2.65))
+    fig, ax = plt.subplots(figsize=(5.8, 2.4))
     ax.axis("off")
-    fig.subplots_adjust(top=0.88)
+    fig.subplots_adjust(top=0.85, bottom=0.06)
     tbl = ax.table(
         cellText=cell_text,
         rowLabels=row_labels,
@@ -585,14 +747,15 @@ def plot_metrics_table_figure(
         rowLoc="right",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    tbl.scale(1.05, 1.45)
+    tbl.set_fontsize(9)
+    tbl.scale(1.02, 1.38)
     for (row, col), cell in tbl.get_celld().items():
         if row == 0 or col < 0:
             cell.set_text_props(fontweight="bold")
-        cell.set_edgecolor("0.85")
-    fig.suptitle("vs truth (lower is better) — same CSV on disk", fontsize=11, y=0.98)
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+        cell.set_edgecolor("#CCCCCC")
+        cell.set_linewidth(0.6)
+    fig.suptitle("Metrics", fontsize=11, y=0.96, color="#2E2E2E")
+    _save_figure_pdf_png(fig, out_path)
     plt.close(fig)
 
 
@@ -627,6 +790,69 @@ def save_metrics_csv(
                     "w1_cf": r["w1_cf"],
                 }
             )
+
+
+def export_plots_and_metrics(
+    cfg: TrainConfig,
+    checkpoints_data: dict[int, dict],
+    ordered_steps: list[int],
+) -> None:
+    """Write frequency/spatial/PDF figures (PDF + PNG each), metrics table, and CSV."""
+    os.makedirs(cfg.figures_dir, exist_ok=True)
+    results_list = [checkpoints_data[s] for s in ordered_steps]
+    tag = cfg.figure_tag
+    plot_frequency_figure(
+        results_list,
+        ordered_steps,
+        os.path.join(cfg.figures_dir, f"cauchy_mixture_frequency{tag}.pdf"),
+        cfg.plot_t_max,
+    )
+    plot_spatial_figure(
+        results_list,
+        ordered_steps,
+        os.path.join(cfg.figures_dir, f"cauchy_mixture_spatial{tag}.pdf"),
+        cfg.plot_x_min,
+        cfg.plot_x_max,
+    )
+    metrics_pdf = os.path.join(cfg.figures_dir, f"cauchy_mixture_metrics{tag}.pdf")
+    metrics_csv = os.path.join(cfg.figures_dir, f"cauchy_mixture_metrics{tag}.csv")
+    plot_metrics_table_figure(checkpoints_data, ordered_steps, metrics_pdf)
+    save_metrics_csv(checkpoints_data, ordered_steps, metrics_csv)
+    print(f"Saved {metrics_csv}")
+
+    rng_pdf = jax.random.PRNGKey(cfg.seed + 9_001)
+    plot_mixture_pdf_figure(
+        os.path.join(cfg.figures_dir, f"cauchy_mixture_pdf{tag}.pdf"),
+        rng_pdf,
+        cfg.plot_x_min,
+        cfg.plot_x_max,
+    )
+
+
+def replot_from_npz(
+    npz_path: str,
+    cfg: TrainConfig | None = None,
+    *,
+    infer_figure_tag: bool = True,
+) -> None:
+    """Regenerate figures from a saved ``np.savez`` archive (no training)."""
+    checkpoints_data, ordered_steps = checkpoints_dict_from_npz(npz_path)
+    c = cfg or TrainConfig()
+    if infer_figure_tag:
+        inferred = figure_tag_from_npz_filename(npz_path)
+        if inferred is not None:
+            c = replace(c, figure_tag=inferred)
+    export_plots_and_metrics(c, checkpoints_data, ordered_steps)
+    print(f"Replotted from {npz_path} → {c.figures_dir}/ (PDF + PNG + metrics CSV)")
+
+
+def _cli_train_config(args: argparse.Namespace) -> TrainConfig:
+    c = TrainConfig()
+    if args.figures_dir:
+        c = replace(c, figures_dir=args.figures_dir)
+    if args.figure_tag is not None:
+        c = replace(c, figure_tag=args.figure_tag)
+    return c
 
 
 def main(cfg: TrainConfig | None = None) -> None:
@@ -678,35 +904,7 @@ def main(cfg: TrainConfig | None = None) -> None:
     print(f"Done {cfg.total_steps:,} steps in {total_time:.1f}s ({cfg.total_steps/total_time:.1f} steps/s).")
 
     ordered_steps = sorted(checkpoints_data.keys())
-    results_list = [checkpoints_data[s] for s in ordered_steps]
-
-    tag = cfg.figure_tag
-    plot_frequency_figure(
-        results_list,
-        ordered_steps,
-        os.path.join(cfg.figures_dir, f"cauchy_mixture_frequency{tag}.png"),
-        cfg.plot_t_max,
-    )
-    plot_spatial_figure(
-        results_list,
-        ordered_steps,
-        os.path.join(cfg.figures_dir, f"cauchy_mixture_spatial{tag}.png"),
-        cfg.plot_x_min,
-        cfg.plot_x_max,
-    )
-    metrics_png = os.path.join(cfg.figures_dir, f"cauchy_mixture_metrics{tag}.png")
-    metrics_csv = os.path.join(cfg.figures_dir, f"cauchy_mixture_metrics{tag}.csv")
-    plot_metrics_table_figure(checkpoints_data, ordered_steps, metrics_png)
-    save_metrics_csv(checkpoints_data, ordered_steps, metrics_csv)
-    print(f"Saved {metrics_csv}")
-
-    rng_pdf = jax.random.PRNGKey(cfg.seed + 9_001)
-    plot_mixture_pdf_figure(
-        os.path.join(cfg.figures_dir, f"cauchy_mixture_pdf{tag}.png"),
-        rng_pdf,
-        cfg.plot_x_min,
-        cfg.plot_x_max,
-    )
+    export_plots_and_metrics(cfg, checkpoints_data, ordered_steps)
 
     save_dict = {"steps": np.array(ordered_steps)}
     for i, s in enumerate(ordered_steps):
@@ -719,4 +917,27 @@ def main(cfg: TrainConfig | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Cauchy-mixture IQN vs CQN supervised toy.")
+    parser.add_argument(
+        "--replot",
+        default=None,
+        metavar="NPZ",
+        help="Load arrays from an np.savez checkpoint and regenerate figures + CSV (no JAX training).",
+    )
+    parser.add_argument(
+        "--figures-dir",
+        default=None,
+        help="Output directory for figures (default: TrainConfig.figures_dir).",
+    )
+    parser.add_argument(
+        "--figure-tag",
+        default=None,
+        help="Suffix in filenames, e.g. _5-mu_05-gamma_v3. With --replot, omit to infer from NPZ name.",
+    )
+    cli = parser.parse_args()
+
+    if cli.replot:
+        cfg = _cli_train_config(cli)
+        replot_from_npz(cli.replot, cfg, infer_figure_tag=cli.figure_tag is None)
+    else:
+        main(_cli_train_config(cli))
