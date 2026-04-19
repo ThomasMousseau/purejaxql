@@ -12,7 +12,6 @@ outputs/
 models*/
 renders*/
 
-**.npz
 **.safetensors
 
 old_cvi/
