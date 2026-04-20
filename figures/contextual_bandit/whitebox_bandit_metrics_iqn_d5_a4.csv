@@ -1,0 +1,6 @@
+metric,Gaussian (baseline),Cauchy mixture (heavy-tailed),MoG (sharp / bimodal),Log-Normal (skewed)
+phi_mse,0.00416,0.00421,0.0657,0.035
+ks,0.069,0.0871,0.192,0.161
+w1,0.179,0.318,0.37,0.167
+cvar_0p05_err,0.397,0.647,0.26,0.186
+entropic_risk_err,0.0126,0.0235,0.0434,0.0241
