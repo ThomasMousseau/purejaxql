@@ -18,3 +18,8 @@ old_cvi/
 slurm/logs/
 
 checkpoints/
+
+figures/
+
+purejaxql/*.npz
+purejaxql/*.msgpack

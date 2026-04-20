@@ -1,15 +1,16 @@
 """
-White-box contextual-bandit benchmark: IQN (spatial) vs CQN (frequency).
+White-box contextual-bandit benchmark: IQN (spatial) vs CQN-family (frequency).
 
 Continuous state ``x ~ N(0, I_d)`` (default ``d=5``); four discrete actions, each with a
 state-conditioned reward distribution chosen to stress different geometries
 (Gaussian baseline, heavy-tailed Cauchy mixture, sharp/bimodal MoG, skewed Log-Normal).
-Both networks share an *identical* (separate-weights) trunk over ``(x, a)`` and differ
-only in their head: IQN predicts spatial quantiles via cosine-tau embedding + Hadamard
+All networks share an *identical* (separate-weights) trunk over ``(x, a)`` and differ
+in their head: IQN predicts spatial quantiles via cosine-tau embedding + Hadamard
 merge; CQN predicts complex unit-disk-bounded characteristic-function values via a
-learned omega projection + Hadamard merge.
+learned omega projection + Hadamard merge; MoG-CQN predicts a state-conditioned
+mixture-of-Gaussians whose CF is computed analytically.
 
-Both are trained on the **same** static offline dataset (Distributional Fitted-Q with
+All are trained on the **same** static offline dataset (Distributional Fitted-Q with
 gamma=0, i.e. supervised regression to the conditional reward distribution).
 
 Run::
@@ -22,7 +23,7 @@ Replot from a saved archive (no retraining)::
 
 Outputs (in ``figures/``):
   - ``whitebox_bandit_panels{tag}.{pdf,png}`` -- 4x3 faceted comparison for one fixed test state
-  - ``whitebox_bandit_metrics_iqn{tag}.csv`` and ``..._cqn{tag}.csv`` -- per-algorithm tables
+  - ``whitebox_bandit_metrics_iqn{tag}.csv`` / ``..._cqn{tag}.csv`` / ``..._mog_cqn{tag}.csv`` -- per-algorithm tables
     (rows = metrics, columns = action distributions)
   - ``whitebox_bandit_metrics_iqn{tag}.{pdf,png}`` and ``..._cqn{tag}.{pdf,png}`` -- table figures
   - ``purejaxql/whitebox_bandit_run{tag}.npz`` -- replot archive (panel curves + per-state metrics)
@@ -94,8 +95,8 @@ NEURIPS_STYLE = {
 }
 plt.rcParams.update(NEURIPS_STYLE)
 
-COLORS = {"truth": "#0A0A0A", "cqn": "#7C3AED", "iqn": "#56B4E9"}
-LW_GT, LW_CQN, LW_IQN = 2.15, 1.41, 1.05
+COLORS = {"truth": "#0A0A0A", "cqn": "#7C3AED", "iqn": "#56B4E9", "mog_cqn": "#E41A1C"}
+LW_GT, LW_CQN, LW_IQN, LW_MOG = 2.15, 1.41, 1.05, 1.20
 
 
 def minimal_style(ax: plt.Axes) -> None:
@@ -194,6 +195,8 @@ def entropic_risk_from_cdf(F: jax.Array, x_grid: jax.Array, beta: float) -> jax.
     expected = jnp.maximum(expected, 1e-300)
     return jnp.log(expected) / beta
 
+
+#! THIS IS HOW THE CONTEXT (x ~ 5D Gaussian) AFFECTS THE ACTION DISTRIBUTION
 
 # ---------------------------------------------------------------------------
 # ACTION DISTRIBUTIONS — tweak these constants to reshape the benchmark.
@@ -452,6 +455,34 @@ class CQNNet(nn.Module):
         return mean, scale
 
 
+class MoGCQNNet(nn.Module):
+    """
+    State-conditioned MoG head with analytic CF.
+
+    This intentionally follows the ``mog_pqn_minatar.py`` parameterization (pi, mu, sigma)
+    while dropping all PQN-specific mechanisms. The trunk is the same (x, a) MLP used by
+    IQN/CQN so the comparison remains apples-to-apples.
+    """
+
+    n_actions: int
+    hidden_dim: int
+    trunk_depth: int
+    num_components: int
+    sigma_min: float = 1e-6
+
+    @nn.compact
+    def __call__(self, x: jax.Array, a_onehot: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        h = jnp.concatenate([x, a_onehot], axis=-1)
+        for i in range(self.trunk_depth):
+            h = nn.relu(nn.Dense(self.hidden_dim, name=f"trunk_{i}")(h))
+        pi_logits = nn.Dense(self.num_components, name="pi_head")(h)
+        pi = jax.nn.softmax(pi_logits, axis=-1)
+        mu = nn.Dense(self.num_components, name="mu_head")(h)
+        raw_sigma = nn.Dense(self.num_components, name="sigma_head")(h)
+        sigma = nn.softplus(raw_sigma) + self.sigma_min
+        return pi, mu, sigma
+
+
 def compose_cf(
     omega_signed: jax.Array,
     mean_abs: jax.Array,
@@ -474,10 +505,44 @@ def compose_cf(
     return jnp.exp(log_mag.astype(dtype) + 1j * phase.astype(dtype))
 
 
+def compose_mog_cf(
+    omega_signed: jax.Array,
+    pi: jax.Array,
+    mu: jax.Array,
+    sigma: jax.Array,
+    dtype: jnp.dtype = jnp.complex128,
+) -> jax.Array:
+    """Analytic CF for a Gaussian mixture: sum_k pi_k exp(i w mu_k - 0.5 w^2 sigma_k^2)."""
+    omega = omega_signed[..., None]
+
+    # Align mixture params to broadcast with omega:
+    # - training: omega (B, K, 1), params (B, C) -> (B, 1, C)
+    # - eval:     omega (T, 1),    params (C,)   -> (1, C)
+    def _align_param(param: jax.Array) -> jax.Array:
+        if param.ndim == omega_signed.ndim:
+            return param[..., None, :]
+        if param.ndim == omega_signed.ndim + 1:
+            return param
+        raise ValueError(
+            "MoG parameter rank incompatible with omega rank: "
+            f"param.ndim={param.ndim}, omega.ndim={omega_signed.ndim}"
+        )
+
+    pi = _align_param(pi)
+    mu = _align_param(mu)
+    sigma = _align_param(sigma)
+
+    term = jnp.exp(
+        (1j * omega * mu).astype(dtype)
+        - 0.5 * jnp.square(omega).astype(dtype) * jnp.square(sigma).astype(dtype)
+    )
+    return jnp.sum(pi.astype(dtype) * term, axis=-1)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-FIG_FILE_TAG = "_d5_a4"
+FIG_FILE_TAG = "_omega_15"
 
 PANEL_STATE_SEED_OFFSET = 9_001
 PANEL_HIST_SAMPLES = 50_000
@@ -491,9 +556,9 @@ PANEL_HIST_SAMPLES = 50_000
 #
 # ``gp_t_max`` below is unrelated: it is only the truncation for *Gil–Pelaez integration*
 # when mapping φ → F(x); it must be large enough for stable CDF inversion, not tied to ω_max.
-DEFAULT_OMEGA_MAX = 15.0
 
 
+DEFAULT_OMEGA_MAX = 15.0 #! 15.0
 @dataclass(frozen=True)
 class TrainConfig:
     seed: int = 0
@@ -504,15 +569,15 @@ class TrainConfig:
     dataset_seed_offset: int = 1_001
 
     # Training
-    total_steps: int = 20_000
-    log_every: int = 2_000        # also the size of one JIT'd lax.scan chunk
-    batch_size: int = 2048 #! 512
+    total_steps: int = 100_000
+    log_every: int = 20_000        # also the size of one JIT'd lax.scan chunk
+    batch_size: int = 1024 #! 512
     num_tau: int = 32
     num_omega: int = 32
     omega_max: float = DEFAULT_OMEGA_MAX  # IQN-side reference; eval grid half-width
     huber_kappa: float = 1.0
-    lr_iqn: float = 3e-4
-    lr_cf: float = 5e-4
+    lr_iqn: float = 1e-3
+    lr_cf: float = 1e-3
     max_grad_norm: float = 10.0   # global-norm clip (matches cqn_minatar MAX_GRAD_NORM)
 
     # CQN training ω: truncated exponential on (0, omega_clip] — purejaxql/utils/mog_cf.sample_frequencies
@@ -521,6 +586,7 @@ class TrainConfig:
     omega_laplace_scale: float | None = None  # None → omega_clip / 3 (same default as mog_cf.py)
     sigma_min: float = 1e-6
     aux_mean_loss_weight: float = 0.1
+    num_mog_components: int = 5
 
     # Architecture
     embed_dim: int = 64
@@ -528,7 +594,7 @@ class TrainConfig:
     trunk_depth: int = 3
 
     # Eval
-    n_test: int = 5_000
+    n_test: int = 10_000
     test_seed_offset: int = 7_777
     eval_chunk_size: int = 50
     num_taus_iqn_eval: int = 2_000
@@ -539,7 +605,7 @@ class TrainConfig:
     eval_x_max: float = 15.0
     eval_num_x: int = 301
     gp_t_delta: float = 1e-4
-    gp_t_max: float = 30.0
+    gp_t_max: float = DEFAULT_OMEGA_MAX
     gp_num_t: int = 501
     cvar_alpha: float = 0.05
     er_beta: float = 0.1
@@ -589,9 +655,16 @@ def _make_optimizer(lr: float, max_grad_norm: float) -> optax.GradientTransforma
 
 
 def create_train_states(rng: jax.Array, cfg: TrainConfig):
-    rng_i, rng_c = jax.random.split(rng)
+    rng_i, rng_c, rng_m = jax.random.split(rng, 3)
     iqn = IQNNet(NUM_ACTIONS, cfg.embed_dim, cfg.hidden_dim, cfg.trunk_depth)
     cqn = CQNNet(NUM_ACTIONS, cfg.embed_dim, cfg.hidden_dim, cfg.trunk_depth, sigma_min=cfg.sigma_min)
+    mog = MoGCQNNet(
+        NUM_ACTIONS,
+        cfg.hidden_dim,
+        cfg.trunk_depth,
+        num_components=cfg.num_mog_components,
+        sigma_min=cfg.sigma_min,
+    )
 
     x0 = jnp.zeros((2, cfg.state_dim), jnp.float32)
     a0 = jnp.zeros((2, NUM_ACTIONS), jnp.float32)
@@ -601,6 +674,7 @@ def create_train_states(rng: jax.Array, cfg: TrainConfig):
 
     v_iqn = iqn.init(rng_i, x0, a0, tau0)
     v_cqn = cqn.init(rng_c, x0, a0, om0)
+    v_mog = mog.init(rng_m, x0, a0)
 
     state_i = train_state.TrainState.create(
         apply_fn=iqn.apply, params=v_iqn["params"], tx=_make_optimizer(cfg.lr_iqn, cfg.max_grad_norm),
@@ -608,10 +682,13 @@ def create_train_states(rng: jax.Array, cfg: TrainConfig):
     state_c = train_state.TrainState.create(
         apply_fn=cqn.apply, params=v_cqn["params"], tx=_make_optimizer(cfg.lr_cf, cfg.max_grad_norm),
     )
-    return state_i, state_c, iqn, cqn
+    state_m = train_state.TrainState.create(
+        apply_fn=mog.apply, params=v_mog["params"], tx=_make_optimizer(cfg.lr_cf, cfg.max_grad_norm),
+    )
+    return state_i, state_c, state_m, iqn, cqn, mog
 
 
-def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet,
+def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNNet,
                      dataset: tuple[jax.Array, jax.Array, jax.Array]):
     """JIT-compiled scan over ``cfg.log_every`` steps. Returns (states, rng) -> (states, rng, mean_losses)."""
     x_all, a_all, r_all = dataset
@@ -619,7 +696,7 @@ def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet,
     aux_w = jnp.float32(cfg.aux_mean_loss_weight)
 
     def step(carry, _):
-        state_i, state_c, rng = carry
+        state_i, state_c, state_m, rng = carry
         rng, kb, kt, ko = jax.random.split(rng, 4)
         idx = jax.random.randint(kb, (cfg.batch_size,), 0, n)
         x_b = x_all[idx]
@@ -669,16 +746,35 @@ def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet,
             mean_loss = jnp.mean(_huber(mean_at_zero - r_b, cfg.huber_kappa))
             return cf_loss + aux_w * mean_loss
 
+        def loss_mog(params):
+            pi, mu, sigma = mog.apply({"params": params}, x_b, a_oh)
+            cf_pred = compose_mog_cf(omegas_pos, pi, mu, sigma, dtype=jnp.complex64)
+            cf_target = jnp.exp(
+                1j * omegas_pos.astype(jnp.complex64) * r_b[:, None].astype(jnp.complex64)
+            )
+            d = cf_pred - cf_target
+            cf_loss = 0.5 * jnp.mean(jnp.real(d) ** 2 + jnp.imag(d) ** 2)
+            mean_pred = jnp.sum(pi * mu, axis=-1)
+            mean_loss = jnp.mean(_huber(mean_pred - r_b, cfg.huber_kappa))
+            return cf_loss + aux_w * mean_loss
+
         li, gi = jax.value_and_grad(loss_iqn)(state_i.params)
         lc, gc = jax.value_and_grad(loss_cqn)(state_c.params)
+        lm, gm = jax.value_and_grad(loss_mog)(state_m.params)
         state_i = state_i.apply_gradients(grads=gi)
         state_c = state_c.apply_gradients(grads=gc)
-        return (state_i, state_c, rng), (li, lc)
+        state_m = state_m.apply_gradients(grads=gm)
+        return (state_i, state_c, state_m, rng), (li, lc, lm)
 
     @jax.jit
-    def run_chunk(state_i, state_c, rng):
-        (state_i, state_c, rng), losses = jax.lax.scan(step, (state_i, state_c, rng), None, length=cfg.log_every)
-        return state_i, state_c, rng, losses
+    def run_chunk(state_i, state_c, state_m, rng):
+        (state_i, state_c, state_m, rng), losses = jax.lax.scan(
+            step,
+            (state_i, state_c, state_m, rng),
+            None,
+            length=cfg.log_every,
+        )
+        return state_i, state_c, state_m, rng, losses
 
     return run_chunk
 
@@ -686,9 +782,9 @@ def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet,
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet):
+def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNNet):
     """
-    Returns ``eval_one_state(params_iqn, params_cqn, x_state)`` -> dict of arrays / scalars,
+    Returns ``eval_one_state(params_iqn, params_cqn, params_mog, x_state)`` -> dict of arrays / scalars,
     stacked over the four actions (leading dim = NUM_ACTIONS).
     """
     t_eval = jnp.linspace(-cfg.eval_t_max, cfg.eval_t_max, cfg.eval_num_t, dtype=jnp.float64)
@@ -700,7 +796,7 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet):
         dtype=jnp.float32,
     )
 
-    def per_action(params_iqn, params_cqn, x_state, k):
+    def per_action(params_iqn, params_cqn, params_mog, x_state, k):
         a_oh = jax.nn.one_hot(jnp.array(k), NUM_ACTIONS, dtype=jnp.float32)
         x1 = x_state[None, :].astype(jnp.float32)
         a1 = a_oh[None, :]
@@ -722,6 +818,11 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet):
         mean_gp, scale_gp = cqn.apply({"params": params_cqn}, x1, a1, t_pos[None, :].astype(jnp.float32))
         phi_cqn_gp = compose_cf(t_pos, mean_gp[0], scale_gp[0])
         F_cqn = gil_pelaez_cdf(phi_cqn_gp, t_pos, x_eval)
+        # MoG-CQN: state-conditioned mixture with closed-form CF.
+        pi_eval, mu_eval, sigma_eval = mog.apply({"params": params_mog}, x1, a1)
+        phi_mog_cqn = compose_mog_cf(t_eval, pi_eval[0], mu_eval[0], sigma_eval[0])
+        phi_mog_cqn_gp = compose_mog_cf(t_pos, pi_eval[0], mu_eval[0], sigma_eval[0])
+        F_mog_cqn = gil_pelaez_cdf(phi_mog_cqn_gp, t_pos, x_eval)
 
         # Ground truth from the registry (via lax.switch over k).
         phi_true = jax.lax.switch(k, [d.phi for d in ACTION_DISTS], t_eval, x_state.astype(jnp.float64))
@@ -731,35 +832,43 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet):
         # Distributional metrics (per-state scalars).
         phi_mse_iqn = cf_mse_vs_truth(phi_iqn, phi_true)
         phi_mse_cqn = cf_mse_vs_truth(phi_cqn, phi_true)
+        phi_mse_mog_cqn = cf_mse_vs_truth(phi_mog_cqn, phi_true)
         ks_iqn = ks_on_grid(F_iqn, F_true)
         ks_cqn = ks_on_grid(F_cqn, F_true)
+        ks_mog_cqn = ks_on_grid(F_mog_cqn, F_true)
         w1_iqn_v = w1_cdf(F_iqn, F_true, x_eval)
         w1_cqn_v = w1_cdf(F_cqn, F_true, x_eval)
+        w1_mog_cqn_v = w1_cdf(F_mog_cqn, F_true, x_eval)
 
         # Risk metrics: identical procedure on each algo's CDF for apples-to-apples.
         cvar_true = cvar_from_cdf(F_true, x_eval, cfg.cvar_alpha)
         cvar_iqn = cvar_from_cdf(F_iqn, x_eval, cfg.cvar_alpha)
         cvar_cqn = cvar_from_cdf(F_cqn, x_eval, cfg.cvar_alpha)
+        cvar_mog_cqn = cvar_from_cdf(F_mog_cqn, x_eval, cfg.cvar_alpha)
         er_true = entropic_risk_from_cdf(F_true, x_eval, cfg.er_beta)
         er_iqn = entropic_risk_from_cdf(F_iqn, x_eval, cfg.er_beta)
         er_cqn = entropic_risk_from_cdf(F_cqn, x_eval, cfg.er_beta)
+        er_mog_cqn = entropic_risk_from_cdf(F_mog_cqn, x_eval, cfg.er_beta)
 
         return dict(
-            phi_iqn=phi_iqn, phi_cqn=phi_cqn, phi_true=phi_true,
-            F_iqn=F_iqn, F_cqn=F_cqn, F_true=F_true, pdf_true=pdf_true,
+            phi_iqn=phi_iqn, phi_cqn=phi_cqn, phi_mog_cqn=phi_mog_cqn, phi_true=phi_true,
+            F_iqn=F_iqn, F_cqn=F_cqn, F_mog_cqn=F_mog_cqn, F_true=F_true, pdf_true=pdf_true,
             phi_mse_iqn=phi_mse_iqn, phi_mse_cqn=phi_mse_cqn,
-            ks_iqn=ks_iqn, ks_cqn=ks_cqn,
-            w1_iqn=w1_iqn_v, w1_cqn=w1_cqn_v,
+            phi_mse_mog_cqn=phi_mse_mog_cqn,
+            ks_iqn=ks_iqn, ks_cqn=ks_cqn, ks_mog_cqn=ks_mog_cqn,
+            w1_iqn=w1_iqn_v, w1_cqn=w1_cqn_v, w1_mog_cqn=w1_mog_cqn_v,
             cvar_err_iqn=jnp.abs(cvar_iqn - cvar_true),
             cvar_err_cqn=jnp.abs(cvar_cqn - cvar_true),
+            cvar_err_mog_cqn=jnp.abs(cvar_mog_cqn - cvar_true),
             er_err_iqn=jnp.abs(er_iqn - er_true),
             er_err_cqn=jnp.abs(er_cqn - er_true),
+            er_err_mog_cqn=jnp.abs(er_mog_cqn - er_true),
         )
 
     @jax.jit
-    def eval_one_state(params_iqn, params_cqn, x_state):
+    def eval_one_state(params_iqn, params_cqn, params_mog, x_state):
         # Stack across actions (Python loop because GT callables differ).
-        per = [per_action(params_iqn, params_cqn, x_state, k) for k in range(NUM_ACTIONS)]
+        per = [per_action(params_iqn, params_cqn, params_mog, x_state, k) for k in range(NUM_ACTIONS)]
         out = {key: jnp.stack([p[key] for p in per], axis=0) for key in per[0]}
         return out
 
@@ -767,10 +876,10 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet):
 
 
 def evaluate_test_set(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet,
-                      params_iqn, params_cqn, x_test: jax.Array):
+                      mog: MoGCQNNet, params_iqn, params_cqn, params_mog, x_test: jax.Array):
     """Vmapped over a chunk of test states; iterated over chunks via lax.map."""
-    eval_one, t_eval, x_eval = make_eval_one_state(cfg, iqn, cqn)
-    eval_chunk = jax.jit(jax.vmap(eval_one, in_axes=(None, None, 0)))
+    eval_one, t_eval, x_eval = make_eval_one_state(cfg, iqn, cqn, mog)
+    eval_chunk = jax.jit(jax.vmap(eval_one, in_axes=(None, None, None, 0)))
 
     n = x_test.shape[0]
     cs = cfg.eval_chunk_size
@@ -780,7 +889,7 @@ def evaluate_test_set(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet,
 
     chunks_out = []
     for c in range(n_chunks):
-        chunks_out.append(eval_chunk(params_iqn, params_cqn, x_chunks[c]))
+        chunks_out.append(eval_chunk(params_iqn, params_cqn, params_mog, x_chunks[c]))
     # Concatenate over leading axis
     out = {
         key: jnp.concatenate([co[key] for co in chunks_out], axis=0)
@@ -811,25 +920,29 @@ def _draw_pdf_panel(ax, pdf_true, hist_samples, x_grid, plot_x_min, plot_x_max,
     ax.set_xlabel(r"$x$")
 
 
-def _draw_phi_panel(ax, t_grid, phi_true, phi_cqn, phi_iqn, plot_t_max, *,
-                    legend_labels=("GT", "CQN", "IQN (empirical)")):
-    lg_gt, lg_cqn, lg_iqn = legend_labels
+def _draw_phi_panel(ax, t_grid, phi_true, phi_cqn, phi_iqn, phi_mog_cqn, plot_t_max, *,
+                    legend_labels=("GT", "CQN", "IQN (empirical)", "MoG-CQN")):
+    lg_gt, lg_cqn, lg_iqn, lg_mog = legend_labels
     m = np.abs(t_grid) <= plot_t_max
     ax.plot(t_grid[m], np.real(phi_true)[m], color=COLORS["truth"], lw=LW_GT, label=lg_gt, zorder=1)
     ax.plot(t_grid[m], np.real(phi_cqn)[m], color=COLORS["cqn"], lw=LW_CQN, label=lg_cqn, zorder=2)
-    ax.plot(t_grid[m], np.real(phi_iqn)[m], color=COLORS["iqn"], lw=LW_IQN, alpha=0.95, label=lg_iqn, zorder=3)
+    if phi_mog_cqn is not None:
+        ax.plot(t_grid[m], np.real(phi_mog_cqn)[m], color=COLORS["mog_cqn"], lw=LW_MOG, alpha=0.95, label=lg_mog, zorder=3)
+    ax.plot(t_grid[m], np.real(phi_iqn)[m], color=COLORS["iqn"], lw=LW_IQN, alpha=0.95, label=lg_iqn, zorder=4)
     minimal_style(ax)
     ax.set_xlim(-plot_t_max, plot_t_max)
     ax.set_xlabel(r"$\omega$")
 
 
-def _draw_cdf_panel(ax, x_grid, F_true, F_cqn, F_iqn, plot_x_min, plot_x_max, *,
-                    legend_labels=("GT", "CQN", "IQN (empirical)")):
-    lg_gt, lg_cqn, lg_iqn = legend_labels
+def _draw_cdf_panel(ax, x_grid, F_true, F_cqn, F_iqn, F_mog_cqn, plot_x_min, plot_x_max, *,
+                    legend_labels=("GT", "CQN", "IQN (empirical)", "MoG-CQN")):
+    lg_gt, lg_cqn, lg_iqn, lg_mog = legend_labels
     m = (x_grid >= plot_x_min) & (x_grid <= plot_x_max)
     ax.plot(x_grid[m], F_true[m], color=COLORS["truth"], lw=LW_GT, label=lg_gt, zorder=1)
     ax.plot(x_grid[m], F_cqn[m], color=COLORS["cqn"], lw=LW_CQN, label=lg_cqn, zorder=2)
-    ax.plot(x_grid[m], F_iqn[m], color=COLORS["iqn"], lw=LW_IQN, alpha=0.95, label=lg_iqn, zorder=3)
+    if F_mog_cqn is not None:
+        ax.plot(x_grid[m], F_mog_cqn[m], color=COLORS["mog_cqn"], lw=LW_MOG, alpha=0.95, label=lg_mog, zorder=3)
+    ax.plot(x_grid[m], F_iqn[m], color=COLORS["iqn"], lw=LW_IQN, alpha=0.95, label=lg_iqn, zorder=4)
     minimal_style(ax)
     ax.set_xlim(plot_x_min, plot_x_max)
     ax.set_xlabel(r"$x$")
@@ -857,6 +970,7 @@ def plot_panels_figure(panel_data: dict, t_eval: np.ndarray, x_eval: np.ndarray,
         _draw_phi_panel(
             ax_phi, t_eval,
             panel_data["phi_true"][row], panel_data["phi_cqn"][row], panel_data["phi_iqn"][row],
+            panel_data.get("phi_mog_cqn", None)[row] if "phi_mog_cqn" in panel_data else None,
             dist.plot_t_max,
         )
         if row == 0:
@@ -866,6 +980,7 @@ def plot_panels_figure(panel_data: dict, t_eval: np.ndarray, x_eval: np.ndarray,
         _draw_cdf_panel(
             ax_cdf, x_eval,
             panel_data["F_true"][row], panel_data["F_cqn"][row], panel_data["F_iqn"][row],
+            panel_data.get("F_mog_cqn", None)[row] if "F_mog_cqn" in panel_data else None,
             dist.plot_x_min, dist.plot_x_max,
         )
         if row == 0:
@@ -904,6 +1019,12 @@ def _fmt_metric(v: float) -> str:
     return f"{float(v):.3g}"
 
 
+ALGO_TITLES = {
+    "iqn": "IQN (spatial)",
+    "cqn": "CQN (frequency)",
+    "mog_cqn": "MoG-CQN (frequency)",
+}
+
 _METRIC_KEYS = ("phi_mse", "ks", "w1", "cvar_err", "er_err")
 _METRIC_ROW_LABELS = (
     r"$\varphi$-MSE ($\downarrow$)",
@@ -923,6 +1044,10 @@ def _per_action_means(per_state_metrics: dict, algo: str) -> np.ndarray:
     )
 
 
+def _available_algos(per_state_metrics: dict) -> list[str]:
+    return [algo for algo in ALGO_TITLES if all(f"{mk}_{algo}" in per_state_metrics for mk in _METRIC_KEYS)]
+
+
 def _algo_metric_table(per_state_metrics: dict, algo: str) -> tuple[list[str], list[str], list[list[str]]]:
     means = _per_action_means(per_state_metrics, algo)
     cells = [[_fmt_metric(v) for v in row] for row in means]
@@ -934,11 +1059,15 @@ def plot_metrics_table_figure(per_state_metrics: dict, algo: str, out_path: str)
     Per-algorithm table with cell-by-cell green highlighting for the cells where this
     algorithm beats the other (lower distributional / risk error is better).
     """
-    other = "cqn" if algo == "iqn" else "iqn"
+    available_algos = _available_algos(per_state_metrics)
+    other_algos = [a for a in available_algos if a != algo]
     row_labels, col_labels, cells = _algo_metric_table(per_state_metrics, algo)
     means_self = _per_action_means(per_state_metrics, algo)
-    means_other = _per_action_means(per_state_metrics, other)
-    win_mask = means_self < means_other  # (n_metrics, n_actions)
+    if other_algos:
+        means_others = np.stack([_per_action_means(per_state_metrics, a) for a in other_algos], axis=0)
+        win_mask = means_self < np.min(means_others, axis=0)  # (n_metrics, n_actions)
+    else:
+        win_mask = np.zeros_like(means_self, dtype=bool)
 
     fig, ax = plt.subplots(figsize=(8.0, 2.6))
     ax.axis("off")
@@ -960,15 +1089,14 @@ def plot_metrics_table_figure(per_state_metrics: dict, algo: str, out_path: str)
         if row >= 1 and col >= 0 and win_mask[row - 1, col]:
             cell.set_facecolor(_WIN_FACECOLOR)
             cell.set_text_props(fontweight="bold", color="#0A0A0A")
-    title = "IQN (spatial)" if algo == "iqn" else "CQN (frequency)"
-    other_title = "CQN" if algo == "iqn" else "IQN"
+    title = ALGO_TITLES.get(algo, algo)
     fig.suptitle(
         f"{title} — per-action distributional & risk metrics (mean over test states)",
         fontsize=10, y=0.965, color="#2E2E2E",
     )
     fig.text(
         0.5, 0.04,
-        f"Green cells: {title.split(' (')[0]} outperforms {other_title} on this (metric, action) pair "
+        f"Green cells: {title.split(' (')[0]} is best across compared algorithms on this (metric, action) pair "
         f"(lower is better).",
         ha="center", fontsize=7, color="#5A5A5A",
     )
@@ -999,7 +1127,7 @@ def _build_panel_data(rng: jax.Array, panel_eval: dict, x_eval: np.ndarray,
         samples = dist.sample(sub_keys[k], x_tile)
         hist.append(np.asarray(samples))
 
-    return {
+    out = {
         "pdf_true": np.asarray(panel_eval["pdf_true"]),
         "phi_true": np.asarray(panel_eval["phi_true"]),
         "phi_iqn": np.asarray(panel_eval["phi_iqn"]),
@@ -1009,6 +1137,11 @@ def _build_panel_data(rng: jax.Array, panel_eval: dict, x_eval: np.ndarray,
         "F_cqn": np.asarray(panel_eval["F_cqn"]),
         "hist_samples": np.stack(hist, axis=0),
     }
+    if "phi_mog_cqn" in panel_eval:
+        out["phi_mog_cqn"] = np.asarray(panel_eval["phi_mog_cqn"])
+    if "F_mog_cqn" in panel_eval:
+        out["F_mog_cqn"] = np.asarray(panel_eval["F_mog_cqn"])
+    return out
 
 
 def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x_eval: np.ndarray,
@@ -1020,20 +1153,35 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
     per_state_metrics = {
         "phi_mse_iqn": np.asarray(eval_results["phi_mse_iqn"]),
         "phi_mse_cqn": np.asarray(eval_results["phi_mse_cqn"]),
+        "phi_mse_mog_cqn": np.asarray(eval_results["phi_mse_mog_cqn"]),
         "ks_iqn": np.asarray(eval_results["ks_iqn"]),
         "ks_cqn": np.asarray(eval_results["ks_cqn"]),
+        "ks_mog_cqn": np.asarray(eval_results["ks_mog_cqn"]),
         "w1_iqn": np.asarray(eval_results["w1_iqn"]),
         "w1_cqn": np.asarray(eval_results["w1_cqn"]),
+        "w1_mog_cqn": np.asarray(eval_results["w1_mog_cqn"]),
         "cvar_err_iqn": np.asarray(eval_results["cvar_err_iqn"]),
         "cvar_err_cqn": np.asarray(eval_results["cvar_err_cqn"]),
+        "cvar_err_mog_cqn": np.asarray(eval_results["cvar_err_mog_cqn"]),
         "er_err_iqn": np.asarray(eval_results["er_err_iqn"]),
         "er_err_cqn": np.asarray(eval_results["er_err_cqn"]),
+        "er_err_mog_cqn": np.asarray(eval_results["er_err_mog_cqn"]),
     }
 
     # Panel-state slice (one row over actions) from full eval results.
     panel_eval = {
         key: np.asarray(eval_results[key])[panel_state_index]
-        for key in ("pdf_true", "phi_true", "phi_iqn", "phi_cqn", "F_true", "F_iqn", "F_cqn")
+        for key in (
+            "pdf_true",
+            "phi_true",
+            "phi_iqn",
+            "phi_cqn",
+            "phi_mog_cqn",
+            "F_true",
+            "F_iqn",
+            "F_cqn",
+            "F_mog_cqn",
+        )
     }
     panel_data = _build_panel_data(jax.random.PRNGKey(panel_rng_seed),
                                    panel_eval, x_eval, panel_state_x)
@@ -1045,7 +1193,7 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
     plot_panels_figure(panel_data, t_eval, x_eval, panels_path)
     print(f"Saved {panels_path} (+ .png)")
 
-    for algo in ("iqn", "cqn"):
+    for algo in _available_algos(per_state_metrics):
         csv_path = os.path.join(cfg.figures_dir, f"whitebox_bandit_metrics_{algo}{tag}.csv")
         pdf_path = os.path.join(cfg.figures_dir, f"whitebox_bandit_metrics_{algo}{tag}.pdf")
         save_metrics_csv(per_state_metrics, algo, csv_path)
@@ -1077,8 +1225,8 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
     print(f"Saved {npz_out}")
 
 
-def save_params_msgpack(cfg: TrainConfig, params_iqn, params_cqn) -> None:
-    blob = flax.serialization.to_bytes({"iqn": params_iqn, "cqn": params_cqn})
+def save_params_msgpack(cfg: TrainConfig, params_iqn, params_cqn, params_mog_cqn) -> None:
+    blob = flax.serialization.to_bytes({"iqn": params_iqn, "cqn": params_cqn, "mog_cqn": params_mog_cqn})
     out = cfg.msgpack_filename()
     with open(out, "wb") as f:
         f.write(blob)
@@ -1121,7 +1269,7 @@ def replot_from_npz(npz_path: str, cfg: TrainConfig | None = None,
     plot_panels_figure(panel_data, t_eval, x_eval, panels_path)
     print(f"Saved {panels_path} (+ .png)")
 
-    for algo in ("iqn", "cqn"):
+    for algo in _available_algos(per_state_metrics):
         csv_path = os.path.join(c.figures_dir, f"whitebox_bandit_metrics_{algo}{c.figure_tag}.csv")
         pdf_path = os.path.join(c.figures_dir, f"whitebox_bandit_metrics_{algo}{c.figure_tag}.pdf")
         save_metrics_csv(per_state_metrics, algo, csv_path)
@@ -1146,8 +1294,8 @@ def main(cfg: TrainConfig | None = None) -> None:
     jax.tree.map(lambda x: x.block_until_ready(), dataset)
     print(f"  dataset built in {time.perf_counter() - t_data:.1f}s", flush=True)
 
-    state_i, state_c, iqn, cqn = create_train_states(rng_init, cfg)
-    run_chunk = make_train_chunk(cfg, iqn, cqn, dataset)
+    state_i, state_c, state_m, iqn, cqn, mog = create_train_states(rng_init, cfg)
+    run_chunk = make_train_chunk(cfg, iqn, cqn, mog, dataset)
 
     n_chunks = cfg.total_steps // cfg.log_every
     print(f"Training: {cfg.total_steps:,} steps in {n_chunks} chunks of {cfg.log_every:,}", flush=True)
@@ -1156,13 +1304,14 @@ def main(cfg: TrainConfig | None = None) -> None:
     rng_local = rng_train
     for c in range(n_chunks):
         t_c = time.perf_counter()
-        state_i, state_c, rng_local, (li, lc) = run_chunk(state_i, state_c, rng_local)
+        state_i, state_c, state_m, rng_local, (li, lc, lm) = run_chunk(state_i, state_c, state_m, rng_local)
         li.block_until_ready()
         dt_c = time.perf_counter() - t_c
         cur_steps = (c + 1) * cfg.log_every
         sps = cur_steps / (time.perf_counter() - t0)
         print(
             f"  step={cur_steps:>6,}  loss_iqn={float(li[-1]):.5f}  loss_cqn={float(lc[-1]):.5f}  "
+            f"loss_mog_cqn={float(lm[-1]):.5f}  "
             f"chunk_dt={dt_c:.1f}s  sps={sps:.1f}",
             flush=True,
         )
@@ -1184,7 +1333,7 @@ def main(cfg: TrainConfig | None = None) -> None:
     print(f"Evaluating on {cfg.n_test:,} test states (chunk size {cfg.eval_chunk_size}) ...", flush=True)
     t_eval0 = time.perf_counter()
     eval_results, t_eval, x_eval = evaluate_test_set(
-        cfg, iqn, cqn, state_i.params, state_c.params, x_test
+        cfg, iqn, cqn, mog, state_i.params, state_c.params, state_m.params, x_test
     )
     jax.tree.map(lambda x: x.block_until_ready(), eval_results)
     print(f"  eval done in {time.perf_counter() - t_eval0:.1f}s", flush=True)
@@ -1194,7 +1343,7 @@ def main(cfg: TrainConfig | None = None) -> None:
         panel_state_x=panel_state_x, panel_state_index=panel_idx,
         panel_rng_seed=panel_seed,
     )
-    save_params_msgpack(cfg, state_i.params, state_c.params)
+    save_params_msgpack(cfg, state_i.params, state_c.params, state_m.params)
 
 
 def _cli_train_config(args: argparse.Namespace) -> TrainConfig:
@@ -1209,6 +1358,24 @@ def _cli_train_config(args: argparse.Namespace) -> TrainConfig:
         c = replace(c, dataset_size=int(args.dataset_size))
     if args.n_test is not None:
         c = replace(c, n_test=int(args.n_test))
+    if args.num_omega is not None:
+        c = replace(c, num_omega=int(args.num_omega))
+    if args.omega_max is not None:
+        c = replace(c, omega_max=float(args.omega_max))
+    if args.omega_clip is not None:
+        c = replace(c, omega_clip=float(args.omega_clip))
+    if args.omega_laplace_scale is not None:
+        c = replace(c, omega_laplace_scale=float(args.omega_laplace_scale))
+    if args.eval_t_max is not None:
+        c = replace(c, eval_t_max=float(args.eval_t_max))
+    if args.gp_t_delta is not None:
+        c = replace(c, gp_t_delta=float(args.gp_t_delta))
+    if args.gp_t_max is not None:
+        c = replace(c, gp_t_max=float(args.gp_t_max))
+    if args.gp_num_t is not None:
+        c = replace(c, gp_num_t=int(args.gp_num_t))
+    if args.num_mog_components is not None:
+        c = replace(c, num_mog_components=int(args.num_mog_components))
     return c
 
 
@@ -1223,6 +1390,17 @@ if __name__ == "__main__":
     parser.add_argument("--total-steps", type=int, default=None, help="Override TrainConfig.total_steps.")
     parser.add_argument("--dataset-size", type=int, default=None, help="Override TrainConfig.dataset_size.")
     parser.add_argument("--n-test", type=int, default=None, help="Override TrainConfig.n_test.")
+    parser.add_argument("--num-omega", type=int, default=None, help="Override TrainConfig.num_omega.")
+    parser.add_argument("--omega-max", type=float, default=None, help="Override TrainConfig.omega_max.")
+    parser.add_argument("--omega-clip", type=float, default=None, help="Override TrainConfig.omega_clip.")
+    parser.add_argument("--omega-laplace-scale", type=float, default=None,
+                        help="Override TrainConfig.omega_laplace_scale.")
+    parser.add_argument("--eval-t-max", type=float, default=None, help="Override TrainConfig.eval_t_max.")
+    parser.add_argument("--gp-t-delta", type=float, default=None, help="Override TrainConfig.gp_t_delta.")
+    parser.add_argument("--gp-t-max", type=float, default=None, help="Override TrainConfig.gp_t_max.")
+    parser.add_argument("--gp-num-t", type=int, default=None, help="Override TrainConfig.gp_num_t.")
+    parser.add_argument("--num-mog-components", type=int, default=None,
+                        help="Override TrainConfig.num_mog_components.")
     cli = parser.parse_args()
 
     if cli.replot:
