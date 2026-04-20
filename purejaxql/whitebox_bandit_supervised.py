@@ -10,8 +10,8 @@ merge; CQN predicts complex unit-disk-bounded characteristic-function values via
 learned omega projection + Hadamard merge; MoG-CQN predicts a state-conditioned
 mixture-of-Gaussians whose CF is computed analytically.
 
-All are trained on the **same** static offline dataset (Distributional Fitted-Q with
-gamma=0, i.e. supervised regression to the conditional reward distribution).
+All are trained on the **same** static offline dataset using a white-box 1-step Bellman
+target ``R + gamma * Z_next`` with analytical next-state distributions.
 
 Run::
 
@@ -25,7 +25,7 @@ Outputs (in ``figures/``):
   - ``whitebox_bandit_panels{tag}.{pdf,png}`` -- 4x3 faceted comparison for one fixed test state
   - ``whitebox_bandit_metrics_iqn{tag}.csv`` / ``..._cqn{tag}.csv`` / ``..._mog_cqn{tag}.csv`` -- per-algorithm tables
     (rows = metrics, columns = action distributions)
-  - ``whitebox_bandit_metrics_iqn{tag}.{pdf,png}`` and ``..._cqn{tag}.{pdf,png}`` -- table figures
+  - ``whitebox_bandit_metrics_combined{tag}.{pdf,png}`` -- one stacked 3-table comparison figure
   - ``purejaxql/whitebox_bandit_run{tag}.npz`` -- replot archive (panel curves + per-state metrics)
   - ``purejaxql/whitebox_bandit_run{tag}.msgpack`` -- final IQN/CQN params (for re-evaluation)
 
@@ -194,6 +194,23 @@ def entropic_risk_from_cdf(F: jax.Array, x_grid: jax.Array, beta: float) -> jax.
     expected = jnp.sum(jnp.exp(beta * x_mid) * dF)
     expected = jnp.maximum(expected, 1e-300)
     return jnp.log(expected) / beta
+
+
+def entropic_risk_mog_cqn(pi: jax.Array, mu: jax.Array, sigma: jax.Array, beta: float) -> jax.Array:
+    """
+    Closed-form entropic risk for a Gaussian mixture.
+
+    ER_beta(X) = (1 / beta) * log E[exp(beta X)],
+    and for each component N(mu_k, sigma_k^2):
+    E[exp(beta X_k)] = exp(beta * mu_k + 0.5 * beta^2 * sigma_k^2).
+    """
+    dtype = jnp.result_type(pi, mu, sigma, jnp.float32)
+    beta_arr = jnp.asarray(beta, dtype=dtype)
+    component_mgf = jnp.exp(beta_arr * mu + 0.5 * (beta_arr ** 2) * jnp.square(sigma))
+    expected_exp = jnp.sum(pi * component_mgf, axis=-1)
+    expected_exp = jnp.maximum(expected_exp, jnp.finfo(expected_exp.dtype).tiny)
+    mean = jnp.sum(pi * mu, axis=-1)
+    return jnp.where(jnp.abs(beta_arr) < 1e-8, mean, jnp.log(expected_exp) / beta_arr)
 
 
 #! THIS IS HOW THE CONTEXT (x ~ 5D Gaussian) AFFECTS THE ACTION DISTRIBUTION
@@ -574,6 +591,8 @@ class TrainConfig:
     batch_size: int = 1024 #! 512
     num_tau: int = 32
     num_omega: int = 32
+    gamma: float = 0.99
+    immediate_reward_std: float = 0.1
     omega_max: float = DEFAULT_OMEGA_MAX  # IQN-side reference; eval grid half-width
     huber_kappa: float = 1.0
     lr_iqn: float = 1e-3
@@ -601,14 +620,20 @@ class TrainConfig:
     eval_iqn_seed: int = 42
     eval_t_max: float = DEFAULT_OMEGA_MAX  # CF grid half-width; keep <= omega_max (see DEFAULT_OMEGA_MAX)
     eval_num_t: int = 201
+    # Primary visualization support (kept compact for readable 4x3 panels).
     eval_x_min: float = -15.0
     eval_x_max: float = 15.0
     eval_num_x: int = 301
+    # Dual-grid "gold standard" risk support (tail-safe integration; prevents truncation masking).
+    risk_x_min: float = -200.0
+    risk_x_max: float = 200.0
+    risk_num_x: int = 2001
     gp_t_delta: float = 1e-4
     gp_t_max: float = DEFAULT_OMEGA_MAX
     gp_num_t: int = 501
     cvar_alpha: float = 0.05
     er_beta: float = 0.1
+    mv_lambda: float = 0.1
 
     # Output
     figures_dir: str = "figures/whitebox_bandit"
@@ -628,22 +653,24 @@ def panel_state_seed(cfg: TrainConfig) -> int:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-def build_dataset(rng: jax.Array, cfg: TrainConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """x ~ N(0, I_d), a ~ Uniform{0..A-1}, r ~ Z(x, a) sampled from each ActionDist."""
-    rng_x, rng_a, rng_r = jax.random.split(rng, 3)
+def build_dataset(rng: jax.Array, cfg: TrainConfig) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """x ~ N(0, I_d), a ~ Uniform{0..A-1}, with white-box Bellman pieces (r_immediate, z_next)."""
+    rng_x, rng_a, rng_r, rng_z = jax.random.split(rng, 4)
     n, d = cfg.dataset_size, cfg.state_dim
     x = jax.random.normal(rng_x, (n, d), dtype=jnp.float32)
     a = jax.random.randint(rng_a, (n,), 0, NUM_ACTIONS)
 
-    # Sample one reward per row from each action's distribution; select by `a`.
-    # (Per-row arithmetic is cheap; this avoids dynamic-shape segment indexing under JIT.)
-    sub_keys = jax.random.split(rng_r, NUM_ACTIONS)
-    r_per_action = jnp.stack(
+    # Immediate reward used for Bellman target: simple dense Gaussian noise.
+    r_immediate = jax.random.normal(rng_r, (n,), dtype=jnp.float32) * jnp.float32(cfg.immediate_reward_std)
+
+    # "Complex" distributions are injected as exact next-state samples z_next.
+    sub_keys = jax.random.split(rng_z, NUM_ACTIONS)
+    z_next_per_action = jnp.stack(
         [dist.sample(sub_keys[k], x).astype(jnp.float32) for k, dist in enumerate(ACTION_DISTS)],
         axis=0,
     )  # (A, N)
-    r = r_per_action[a, jnp.arange(n)]
-    return x, a, r
+    z_next = z_next_per_action[a, jnp.arange(n)]
+    return x, a, r_immediate, z_next
 
 
 # ---------------------------------------------------------------------------
@@ -689,11 +716,12 @@ def create_train_states(rng: jax.Array, cfg: TrainConfig):
 
 
 def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNNet,
-                     dataset: tuple[jax.Array, jax.Array, jax.Array]):
+                     dataset: tuple[jax.Array, jax.Array, jax.Array, jax.Array]):
     """JIT-compiled scan over ``cfg.log_every`` steps. Returns (states, rng) -> (states, rng, mean_losses)."""
-    x_all, a_all, r_all = dataset
+    x_all, a_all, r_all, z_next_all = dataset
     n = x_all.shape[0]
     aux_w = jnp.float32(cfg.aux_mean_loss_weight)
+    gamma = jnp.float32(cfg.gamma)
 
     def step(carry, _):
         state_i, state_c, state_m, rng = carry
@@ -702,6 +730,7 @@ def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNNet,
         x_b = x_all[idx]
         a_b = a_all[idx]
         r_b = r_all[idx]
+        z_next_b = z_next_all[idx]
         a_oh = jax.nn.one_hot(a_b, NUM_ACTIONS, dtype=jnp.float32)
 
         taus = jax.random.uniform(kt, (cfg.batch_size, cfg.num_tau), dtype=jnp.float32)
@@ -719,9 +748,12 @@ def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNNet,
             [jnp.zeros((cfg.batch_size, 1), dtype=omegas_pos.dtype), omegas_pos], axis=1,
         )  # (B, K+1)
 
+        # One-sample spatial Bellman targets for the batch.
+        target_samples = r_b + gamma * z_next_b
+
         def loss_iqn(params):
             q = iqn.apply({"params": params}, x_b, a_oh, taus)  # (B, M)
-            return quantile_huber_loss_pairwise(q, r_b, taus, cfg.huber_kappa)
+            return quantile_huber_loss_pairwise(q, target_samples, taus, cfg.huber_kappa)
 
         def loss_cqn(params):
             mean_pred, scale_pred = cqn.apply({"params": params}, x_b, a_oh, omegas_with_zero)
@@ -733,29 +765,43 @@ def make_train_chunk(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNNet,
                 omegas_with_zero[:, 1:], mean_pred[:, 1:], scale_pred[:, 1:],
                 dtype=jnp.complex64,
             )
-            cf_target = jnp.exp(
-                1j * omegas_with_zero[:, 1:].astype(jnp.complex64)
-                * r_b[:, None].astype(jnp.complex64)
-            )
+            omega_pos = omegas_with_zero[:, 1:]
+            gamma_omega = gamma * omega_pos
+
+            # Analytical Bellman convolution in frequency domain:
+            # phi(r + gamma * Z_next) = exp(i * omega * r) * phi_Z_next(gamma * omega).
+            cf_r = jnp.exp(1j * omega_pos.astype(jnp.complex64) * r_b[:, None].astype(jnp.complex64))
+
+            def _phi_one(a_i: jax.Array, w_i: jax.Array, x_i: jax.Array) -> jax.Array:
+                return jax.lax.switch(a_i, [d.phi for d in ACTION_DISTS], w_i.astype(jnp.float64), x_i.astype(jnp.float64))
+
+            cf_z_next = jax.vmap(_phi_one)(a_b, gamma_omega, x_b).astype(jnp.complex64)
+            cf_target = cf_r * cf_z_next
             d = cf_pred - cf_target
             cf_loss = 0.5 * jnp.mean(jnp.real(d) ** 2 + jnp.imag(d) ** 2)
             # Aux mean loss is Huber (kappa=1) instead of MSE: Cauchy-mixture rewards have
             # infinite variance, so single-sample MSE produces unbounded gradients. Huber
             # gives the same E[r] minimum (when it exists) but is robust to outliers.
             mean_at_zero = mean_pred[:, 0]  # mean(x, a, ω=0)
-            mean_loss = jnp.mean(_huber(mean_at_zero - r_b, cfg.huber_kappa))
+            mean_loss = jnp.mean(_huber(mean_at_zero - target_samples, cfg.huber_kappa))
             return cf_loss + aux_w * mean_loss
 
         def loss_mog(params):
             pi, mu, sigma = mog.apply({"params": params}, x_b, a_oh)
             cf_pred = compose_mog_cf(omegas_pos, pi, mu, sigma, dtype=jnp.complex64)
-            cf_target = jnp.exp(
-                1j * omegas_pos.astype(jnp.complex64) * r_b[:, None].astype(jnp.complex64)
-            )
+            gamma_omega = gamma * omegas_pos
+
+            cf_r = jnp.exp(1j * omegas_pos.astype(jnp.complex64) * r_b[:, None].astype(jnp.complex64))
+
+            def _phi_one(a_i: jax.Array, w_i: jax.Array, x_i: jax.Array) -> jax.Array:
+                return jax.lax.switch(a_i, [d.phi for d in ACTION_DISTS], w_i.astype(jnp.float64), x_i.astype(jnp.float64))
+
+            cf_z_next = jax.vmap(_phi_one)(a_b, gamma_omega, x_b).astype(jnp.complex64)
+            cf_target = cf_r * cf_z_next
             d = cf_pred - cf_target
             cf_loss = 0.5 * jnp.mean(jnp.real(d) ** 2 + jnp.imag(d) ** 2)
             mean_pred = jnp.sum(pi * mu, axis=-1)
-            mean_loss = jnp.mean(_huber(mean_pred - r_b, cfg.huber_kappa))
+            mean_loss = jnp.mean(_huber(mean_pred - target_samples, cfg.huber_kappa))
             return cf_loss + aux_w * mean_loss
 
         li, gi = jax.value_and_grad(loss_iqn)(state_i.params)
@@ -789,7 +835,10 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNN
     """
     t_eval = jnp.linspace(-cfg.eval_t_max, cfg.eval_t_max, cfg.eval_num_t, dtype=jnp.float64)
     x_eval = jnp.linspace(cfg.eval_x_min, cfg.eval_x_max, cfg.eval_num_x, dtype=jnp.float64)
+    x_risk = jnp.linspace(cfg.risk_x_min, cfg.risk_x_max, cfg.risk_num_x, dtype=jnp.float64)
     t_pos = jnp.linspace(cfg.gp_t_delta, cfg.gp_t_max, cfg.gp_num_t, dtype=jnp.float64)
+    gamma64 = jnp.float64(cfg.gamma)
+    reward_std64 = jnp.float64(cfg.immediate_reward_std)
     taus_eval = jax.random.uniform(
         jax.random.PRNGKey(cfg.eval_iqn_seed),
         (cfg.num_taus_iqn_eval,),
@@ -805,6 +854,7 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNN
         q_samples = iqn.apply({"params": params_iqn}, x1, a1, taus_eval[None, :])[0].astype(jnp.float64)
         sorted_q = jnp.sort(q_samples)
         F_iqn = empirical_cdf(sorted_q, x_eval)
+        F_iqn_risk = empirical_cdf(sorted_q, x_risk)
         phi_iqn = empirical_cf_from_samples(
             q_samples.astype(jnp.complex128), t_eval.astype(jnp.complex128)
         )
@@ -818,16 +868,43 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNN
         mean_gp, scale_gp = cqn.apply({"params": params_cqn}, x1, a1, t_pos[None, :].astype(jnp.float32))
         phi_cqn_gp = compose_cf(t_pos, mean_gp[0], scale_gp[0])
         F_cqn = gil_pelaez_cdf(phi_cqn_gp, t_pos, x_eval)
+        F_cqn_risk = gil_pelaez_cdf(phi_cqn_gp, t_pos, x_risk)
+        # O(1) CQN moment extraction at omega=0.
+        mean_zero, scale_zero = cqn.apply(
+            {"params": params_cqn},
+            x1,
+            a1,
+            jnp.zeros((1, 1), dtype=jnp.float32),
+        )
+        mean_cqn = mean_zero[0, 0].astype(jnp.float64)
+        var_cqn = scale_zero[0, 0].astype(jnp.float64)
         # MoG-CQN: state-conditioned mixture with closed-form CF.
         pi_eval, mu_eval, sigma_eval = mog.apply({"params": params_mog}, x1, a1)
         phi_mog_cqn = compose_mog_cf(t_eval, pi_eval[0], mu_eval[0], sigma_eval[0])
         phi_mog_cqn_gp = compose_mog_cf(t_pos, pi_eval[0], mu_eval[0], sigma_eval[0])
         F_mog_cqn = gil_pelaez_cdf(phi_mog_cqn_gp, t_pos, x_eval)
+        F_mog_cqn_risk = gil_pelaez_cdf(phi_mog_cqn_gp, t_pos, x_risk)
 
-        # Ground truth from the registry (via lax.switch over k).
-        phi_true = jax.lax.switch(k, [d.phi for d in ACTION_DISTS], t_eval, x_state.astype(jnp.float64))
-        F_true = jax.lax.switch(k, [d.cdf for d in ACTION_DISTS], x_eval, x_state.astype(jnp.float64))
-        pdf_true = jax.lax.switch(k, [d.pdf for d in ACTION_DISTS], x_eval, x_state.astype(jnp.float64))
+        # Ground truth Bellman target:
+        # Z_target = R + gamma * Z_next, with R ~ N(0, immediate_reward_std^2).
+        # In frequency domain:
+        # phi_target(w) = phi_R(w) * phi_Z_next(gamma * w).
+        phi_r_eval = jnp.exp(-0.5 * (reward_std64 ** 2) * jnp.square(t_eval))
+        phi_z_eval = jax.lax.switch(
+            k, [d.phi for d in ACTION_DISTS], gamma64 * t_eval, x_state.astype(jnp.float64)
+        )
+        phi_true = phi_r_eval * phi_z_eval
+
+        phi_r_gp = jnp.exp(-0.5 * (reward_std64 ** 2) * jnp.square(t_pos))
+        phi_z_gp = jax.lax.switch(
+            k, [d.phi for d in ACTION_DISTS], gamma64 * t_pos, x_state.astype(jnp.float64)
+        )
+        phi_true_gp = phi_r_gp * phi_z_gp
+        F_true = gil_pelaez_cdf(phi_true_gp, t_pos, x_eval)
+        F_true_risk = gil_pelaez_cdf(phi_true_gp, t_pos, x_risk)
+        # Numeric derivative on the evaluation grid for panel overlays.
+        pdf_true = jnp.clip(jnp.gradient(F_true, x_eval), 0.0, None)
+        pdf_true_risk = jnp.clip(jnp.gradient(F_true_risk, x_risk), 0.0, None)
 
         # Distributional metrics (per-state scalars).
         phi_mse_iqn = cf_mse_vs_truth(phi_iqn, phi_true)
@@ -840,15 +917,34 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNN
         w1_cqn_v = w1_cdf(F_cqn, F_true, x_eval)
         w1_mog_cqn_v = w1_cdf(F_mog_cqn, F_true, x_eval)
 
-        # Risk metrics: identical procedure on each algo's CDF for apples-to-apples.
-        cvar_true = cvar_from_cdf(F_true, x_eval, cfg.cvar_alpha)
-        cvar_iqn = cvar_from_cdf(F_iqn, x_eval, cfg.cvar_alpha)
-        cvar_cqn = cvar_from_cdf(F_cqn, x_eval, cfg.cvar_alpha)
-        cvar_mog_cqn = cvar_from_cdf(F_mog_cqn, x_eval, cfg.cvar_alpha)
-        er_true = entropic_risk_from_cdf(F_true, x_eval, cfg.er_beta)
-        er_iqn = entropic_risk_from_cdf(F_iqn, x_eval, cfg.er_beta)
-        er_cqn = entropic_risk_from_cdf(F_cqn, x_eval, cfg.er_beta)
-        er_mog_cqn = entropic_risk_from_cdf(F_mog_cqn, x_eval, cfg.er_beta)
+        # Risk metrics live on the wide risk grid to avoid truncation masking.
+        cvar_true = cvar_from_cdf(F_true_risk, x_risk, cfg.cvar_alpha)
+        cvar_iqn = cvar_from_cdf(F_iqn_risk, x_risk, cfg.cvar_alpha)
+        cvar_cqn = cvar_from_cdf(F_cqn_risk, x_risk, cfg.cvar_alpha)
+        cvar_mog_cqn = cvar_from_cdf(F_mog_cqn_risk, x_risk, cfg.cvar_alpha)
+        er_true = entropic_risk_from_cdf(F_true_risk, x_risk, cfg.er_beta)
+        er_iqn = entropic_risk_from_cdf(F_iqn_risk, x_risk, cfg.er_beta)
+        er_cqn = entropic_risk_from_cdf(F_cqn_risk, x_risk, cfg.er_beta)
+        # !MoG-CQN admits an exact closed form for ER_beta from (pi, mu, sigma), no GP inversion.
+        # !er_mog_cqn = entropic_risk_mog_cqn(pi_eval[0], mu_eval[0], sigma_eval[0], cfg.er_beta)
+        er_mog_cqn = entropic_risk_from_cdf(F_mog_cqn_risk, x_risk, cfg.er_beta)
+
+        # Additional moments / mean-variance risk.
+        mean_true = jnp.trapezoid(x_risk * pdf_true_risk, x_risk)
+        var_true = jnp.trapezoid(jnp.square(x_risk - mean_true) * pdf_true_risk, x_risk)
+        mv_true = mean_true - cfg.mv_lambda * var_true
+
+        mean_iqn = jnp.mean(q_samples)
+        var_iqn = jnp.mean(jnp.square(q_samples - mean_iqn))
+        mv_iqn = mean_iqn - cfg.mv_lambda * var_iqn
+
+        mean_mog_cqn = jnp.sum(pi_eval[0] * mu_eval[0]).astype(jnp.float64)
+        second_mog_cqn = jnp.sum(
+            pi_eval[0] * (jnp.square(sigma_eval[0]) + jnp.square(mu_eval[0]))
+        ).astype(jnp.float64)
+        var_mog_cqn = second_mog_cqn - jnp.square(mean_mog_cqn)
+        mv_mog_cqn = mean_mog_cqn - cfg.mv_lambda * var_mog_cqn
+        mv_cqn = mean_cqn - cfg.mv_lambda * var_cqn
 
         return dict(
             phi_iqn=phi_iqn, phi_cqn=phi_cqn, phi_mog_cqn=phi_mog_cqn, phi_true=phi_true,
@@ -863,6 +959,15 @@ def make_eval_one_state(cfg: TrainConfig, iqn: IQNNet, cqn: CQNNet, mog: MoGCQNN
             er_err_iqn=jnp.abs(er_iqn - er_true),
             er_err_cqn=jnp.abs(er_cqn - er_true),
             er_err_mog_cqn=jnp.abs(er_mog_cqn - er_true),
+            mean_err_iqn=jnp.abs(mean_iqn - mean_true),
+            mean_err_cqn=jnp.abs(mean_cqn - mean_true),
+            mean_err_mog_cqn=jnp.abs(mean_mog_cqn - mean_true),
+            var_err_iqn=jnp.abs(var_iqn - var_true),
+            var_err_cqn=jnp.abs(var_cqn - var_true),
+            var_err_mog_cqn=jnp.abs(var_mog_cqn - var_true),
+            mv_err_iqn=jnp.abs(mv_iqn - mv_true),
+            mv_err_cqn=jnp.abs(mv_cqn - mv_true),
+            mv_err_mog_cqn=jnp.abs(mv_mog_cqn - mv_true),
         )
 
     @jax.jit
@@ -1025,13 +1130,16 @@ ALGO_TITLES = {
     "mog_cqn": "MoG-CQN (frequency)",
 }
 
-_METRIC_KEYS = ("phi_mse", "ks", "w1", "cvar_err", "er_err")
+_METRIC_KEYS = ("phi_mse", "ks", "w1", "cvar_err", "er_err", "mean_err", "var_err", "mv_err")
 _METRIC_ROW_LABELS = (
-    r"$\varphi$-MSE ($\downarrow$)",
-    r"KS distance ($\downarrow$)",
-    r"$W_1$ distance ($\downarrow$)",
-    rf"CVaR$_{{0.05}}$ error ($\downarrow$)",
-    r"Entropic-risk error ($\downarrow$)",
+    r"Frequency — $\varphi$-MSE ($\downarrow$)",
+    r"Spatial — KS distance ($\downarrow$)",
+    r"Spatial — $W_1$ distance ($\downarrow$)",
+    rf"Risk-grid — CVaR$_{{0.05}}$ error ($\downarrow$)",
+    r"Risk-grid — Entropic-risk error ($\downarrow$)",
+    r"Risk-grid — Mean error ($\downarrow$)",
+    r"Risk-grid — Variance error ($\downarrow$)",
+    r"Risk-grid — M-V risk error ($\downarrow$)",
 )
 _WIN_FACECOLOR = "#D2F4D9"  # soft green for the better cell (lower = better)
 
@@ -1104,9 +1212,84 @@ def plot_metrics_table_figure(per_state_metrics: dict, algo: str, out_path: str)
     plt.close(fig)
 
 
+def plot_metrics_table_figure_combined(per_state_metrics: dict, out_path: str) -> None:
+    """
+    Combined comparison figure with one table per algorithm stacked vertically.
+    Best value per (metric, action) across all algorithms is highlighted in green.
+    """
+    available_algos = _available_algos(per_state_metrics)
+    if not available_algos:
+        return
+
+    all_means = np.stack([_per_action_means(per_state_metrics, algo) for algo in available_algos], axis=0)
+    # (n_algos, n_metrics, n_actions) -> global argmin over algo axis
+    best_algo_idx = np.argmin(all_means, axis=0)
+
+    n_algos = len(available_algos)
+    fig_h = 2.2 * n_algos + 0.7
+    fig, axes = plt.subplots(n_algos, 1, figsize=(8.3, fig_h))
+    if n_algos == 1:
+        axes = [axes]
+    fig.subplots_adjust(top=0.93, bottom=0.06, hspace=0.34)
+
+    row_labels = list(_METRIC_ROW_LABELS)
+    col_labels = [d.name for d in ACTION_DISTS]
+
+    for i, (ax, algo) in enumerate(zip(axes, available_algos)):
+        ax.axis("off")
+        means = all_means[i]
+        cells = [[_fmt_metric(v) for v in row] for row in means]
+        tbl = ax.table(
+            cellText=cells, rowLabels=row_labels, colLabels=col_labels,
+            loc="center", cellLoc="center", colLoc="center", rowLoc="right",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        tbl.scale(1.05, 1.35)
+        for (row, col), cell in tbl.get_celld().items():
+            if row == 0 or col < 0:
+                cell.set_text_props(fontweight="bold")
+            cell.set_edgecolor("#CCCCCC")
+            cell.set_linewidth(0.6)
+            if row >= 1 and col >= 0 and best_algo_idx[row - 1, col] == i:
+                cell.set_facecolor(_WIN_FACECOLOR)
+                cell.set_text_props(fontweight="bold", color="#0A0A0A")
+
+        title = ALGO_TITLES.get(algo, algo)
+        ax.text(
+            0.5, 1.02,
+            f"{title}",
+            transform=ax.transAxes,
+            ha="center", va="bottom",
+            fontsize=9, color="#2E2E2E", fontweight="bold",
+        )
+
+    fig.suptitle(
+        "Per-action distributional & risk metrics (mean over test states)",
+        fontsize=11, y=0.985, color="#2E2E2E",
+    )
+    fig.text(
+        0.5, 0.02,
+        "Green cells: best across IQN / CQN / MoG-CQN for that (metric, action) pair (lower is better). "
+        "Plots use x in [-15, 15]; risk metrics use the dual-grid x in [-200, 200].",
+        ha="center", fontsize=7, color="#5A5A5A",
+    )
+    _save_figure_pdf_png(fig, out_path)
+    plt.close(fig)
+
+
 def save_metrics_csv(per_state_metrics: dict, algo: str, out_path: str) -> None:
     row_labels, col_labels, cells = _algo_metric_table(per_state_metrics, algo)
-    label_for_csv = ["phi_mse", "ks", "w1", "cvar_0p05_err", "entropic_risk_err"]
+    label_for_csv = [
+        "phi_mse",
+        "ks",
+        "w1",
+        "cvar_0p05_err",
+        "entropic_risk_err",
+        "mean_err",
+        "variance_err",
+        "mean_variance_risk_err",
+    ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["metric", *col_labels])
@@ -1118,13 +1301,19 @@ def save_metrics_csv(per_state_metrics: dict, algo: str, out_path: str) -> None:
 # Archive (NPZ + msgpack) and replot
 # ---------------------------------------------------------------------------
 def _build_panel_data(rng: jax.Array, panel_eval: dict, x_eval: np.ndarray,
-                      panel_state_x: np.ndarray) -> dict:
+                      panel_state_x: np.ndarray, cfg: TrainConfig) -> dict:
     """Re-sample a histogram per action for the panel (deterministic via rng)."""
     sub_keys = jax.random.split(rng, NUM_ACTIONS)
     hist = []
     for k, dist in enumerate(ACTION_DISTS):
         x_tile = jnp.broadcast_to(jnp.asarray(panel_state_x), (PANEL_HIST_SAMPLES, panel_state_x.shape[0]))
-        samples = dist.sample(sub_keys[k], x_tile)
+        rk_r, rk_z = jax.random.split(sub_keys[k])
+        z_next = dist.sample(rk_z, x_tile)
+        r_immediate = (
+            jax.random.normal(rk_r, (PANEL_HIST_SAMPLES,), dtype=z_next.dtype)
+            * jnp.asarray(cfg.immediate_reward_std, dtype=z_next.dtype)
+        )
+        samples = r_immediate + jnp.asarray(cfg.gamma, dtype=z_next.dtype) * z_next
         hist.append(np.asarray(samples))
 
     out = {
@@ -1166,6 +1355,15 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
         "er_err_iqn": np.asarray(eval_results["er_err_iqn"]),
         "er_err_cqn": np.asarray(eval_results["er_err_cqn"]),
         "er_err_mog_cqn": np.asarray(eval_results["er_err_mog_cqn"]),
+        "mean_err_iqn": np.asarray(eval_results["mean_err_iqn"]),
+        "mean_err_cqn": np.asarray(eval_results["mean_err_cqn"]),
+        "mean_err_mog_cqn": np.asarray(eval_results["mean_err_mog_cqn"]),
+        "var_err_iqn": np.asarray(eval_results["var_err_iqn"]),
+        "var_err_cqn": np.asarray(eval_results["var_err_cqn"]),
+        "var_err_mog_cqn": np.asarray(eval_results["var_err_mog_cqn"]),
+        "mv_err_iqn": np.asarray(eval_results["mv_err_iqn"]),
+        "mv_err_cqn": np.asarray(eval_results["mv_err_cqn"]),
+        "mv_err_mog_cqn": np.asarray(eval_results["mv_err_mog_cqn"]),
     }
 
     # Panel-state slice (one row over actions) from full eval results.
@@ -1183,8 +1381,13 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
             "F_mog_cqn",
         )
     }
-    panel_data = _build_panel_data(jax.random.PRNGKey(panel_rng_seed),
-                                   panel_eval, x_eval, panel_state_x)
+    panel_data = _build_panel_data(
+        jax.random.PRNGKey(panel_rng_seed),
+        panel_eval,
+        x_eval,
+        panel_state_x,
+        cfg,
+    )
 
     tag = cfg.figure_tag
 
@@ -1195,10 +1398,11 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
 
     for algo in _available_algos(per_state_metrics):
         csv_path = os.path.join(cfg.figures_dir, f"whitebox_bandit_metrics_{algo}{tag}.csv")
-        pdf_path = os.path.join(cfg.figures_dir, f"whitebox_bandit_metrics_{algo}{tag}.pdf")
         save_metrics_csv(per_state_metrics, algo, csv_path)
-        plot_metrics_table_figure(per_state_metrics, algo, pdf_path)
-        print(f"Saved {csv_path} and {pdf_path} (+ .png)")
+        print(f"Saved {csv_path}")
+    metrics_pdf_path = os.path.join(cfg.figures_dir, f"whitebox_bandit_metrics_combined{tag}.pdf")
+    plot_metrics_table_figure_combined(per_state_metrics, metrics_pdf_path)
+    print(f"Saved {metrics_pdf_path} (+ .png)")
 
     # NPZ archive (everything needed for --replot, no params)
     save_dict = {
@@ -1215,6 +1419,10 @@ def export_artifacts(cfg: TrainConfig, eval_results: dict, t_eval: np.ndarray, x
         "n_test": np.array(cfg.n_test, dtype=np.int64),
         "cvar_alpha": np.array(cfg.cvar_alpha),
         "er_beta": np.array(cfg.er_beta),
+        "mv_lambda": np.array(cfg.mv_lambda),
+        "risk_x_min": np.array(cfg.risk_x_min),
+        "risk_x_max": np.array(cfg.risk_x_max),
+        "risk_num_x": np.array(cfg.risk_num_x, dtype=np.int64),
     }
     for k, v in panel_data.items():
         save_dict[f"panel_{k}"] = v
@@ -1271,10 +1479,11 @@ def replot_from_npz(npz_path: str, cfg: TrainConfig | None = None,
 
     for algo in _available_algos(per_state_metrics):
         csv_path = os.path.join(c.figures_dir, f"whitebox_bandit_metrics_{algo}{c.figure_tag}.csv")
-        pdf_path = os.path.join(c.figures_dir, f"whitebox_bandit_metrics_{algo}{c.figure_tag}.pdf")
         save_metrics_csv(per_state_metrics, algo, csv_path)
-        plot_metrics_table_figure(per_state_metrics, algo, pdf_path)
-        print(f"Saved {csv_path} and {pdf_path} (+ .png)")
+        print(f"Saved {csv_path}")
+    metrics_pdf_path = os.path.join(c.figures_dir, f"whitebox_bandit_metrics_combined{c.figure_tag}.pdf")
+    plot_metrics_table_figure_combined(per_state_metrics, metrics_pdf_path)
+    print(f"Saved {metrics_pdf_path} (+ .png)")
     print(f"Replotted from {npz_path} -> {c.figures_dir}/")
 
 
