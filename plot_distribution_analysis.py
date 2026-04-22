@@ -71,6 +71,20 @@ def _fmt_disp(x: float) -> str:
     return "-" if np.isnan(float(x)) else f"{float(x):.3g}"
 
 
+def _smooth_curve(y: np.ndarray, passes: int = 2) -> np.ndarray:
+    """Mildly smooth 1D curves to suppress inversion ringing artifacts."""
+    arr = np.asarray(y, dtype=np.float64)
+    if arr.ndim != 1 or arr.size < 5 or passes <= 0:
+        return arr
+    kernel = np.array([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float64)
+    kernel /= kernel.sum()
+    out = arr
+    for _ in range(passes):
+        padded = np.pad(out, (2, 2), mode="edge")
+        out = np.convolve(padded, kernel, mode="valid")
+    return out
+
+
 def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], path: str) -> None:
     algos = [a for a in DA_ORDER if a in stderr]
     if not algos:
@@ -180,8 +194,8 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
         for pkey, ckey, label in pdf_series:
             if pkey not in mean_p:
                 continue
-            y = mean_p[pkey][row]
-            ys = se_p[pkey][row]
+            y = _smooth_curve(mean_p[pkey][row])
+            ys = _smooth_curve(se_p[pkey][row], passes=1)
             axp.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=COLORS[ckey], alpha=0.18, lw=0)
             axp.plot(xe[xmask], y[xmask], color=COLORS[ckey], lw=LW[ckey], label=label)
         minimal_style(axp)
