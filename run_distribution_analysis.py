@@ -359,7 +359,7 @@ class DAConfig:
     lr: float = 1e-3
     max_grad_norm: float = 10.0
     omega_clip: float = 15.0
-    omega_laplace_scale: float = 1.0
+    omega_laplace_scale: float = 0.8
     sigma_min: float = 1e-6
     sigma_max: float = 20.0
     aux_mean_loss_weight: float = 0.1
@@ -840,6 +840,7 @@ def parse_args(a=None):
     p.add_argument("--experiment-tag", default="DistAnalysis")
     p.add_argument("--total-steps", type=int)
     p.add_argument("--dataset-size", type=int)
+    p.add_argument("--omega-laplace-scale", type=float)
     p.add_argument("--no-wandb", action="store_true", help="Disable W&B logging.")
     return p.parse_args(a)
 
@@ -851,6 +852,8 @@ def main(a=None):
         cfg = replace(cfg, total_steps=args.total_steps)
     if args.dataset_size:
         cfg = replace(cfg, dataset_size=args.dataset_size)
+    if args.omega_laplace_scale is not None:
+        cfg = replace(cfg, omega_laplace_scale=args.omega_laplace_scale)
     use_wandb = not args.no_wandb
     tag = os.environ.get("WANDB_EXPERIMENT_TAG", args.experiment_tag)
     if use_wandb:

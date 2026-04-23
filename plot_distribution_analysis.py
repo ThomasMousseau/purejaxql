@@ -347,7 +347,7 @@ def plot_distribution_analysis(experiment_tag: str, *, project: str, entity: str
 
 def parse_args(args=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--experiment-tag", default="DistAnalysis_v1")
+    p.add_argument("--experiment-tag", default="DistAnalysis")
     p.add_argument("--project", default="Deep-CVI-Experiments")
     p.add_argument("--entity", default="fatty_data")
     p.add_argument("--figures-dir", default="figures/distribution_analysis")
