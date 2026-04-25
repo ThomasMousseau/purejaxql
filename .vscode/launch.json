@@ -41,6 +41,15 @@
         "--out",
         "figures/craftax_1b_rnn_compare.png"
       ]
+    },
+    {
+      "name": "Run: Distribution Analysis",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "program": "${workspaceFolder}/run_distribution_analysis.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
     }
   ]
 }

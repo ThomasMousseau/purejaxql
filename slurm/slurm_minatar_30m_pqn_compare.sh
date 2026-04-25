@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=minatar-100m-pqn
+#SBATCH --job-name=minatar-30m-pqn
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1
@@ -9,24 +9,19 @@
 #SBATCH --time=12:00:00
 
 ################################################################################
-# MinAtar 30M: 4 envs × 3 algos = 12 Slurm tasks (full grid: ``#SBATCH --array=0-11%12``).
-#
-# **Current array** ``0-11%12``: MoG only, one task per game (TID/3 = env, TID%3 = 0 → MoG).
+# MinAtar 30M: 4 envs × 3 algos (CTD, QTD, IQN only) = 12 Slurm tasks.
+# MoG-CQN, CQN, and PQN are omitted (assume those runs already exist).
 #
 # Each task: **NUM_SEEDS=5** (vmap) — one process, one W&B run per (env, algo).
 # Tag **multi_seed** + ``WANDB_LOG_ALL_SEEDS`` → logs ``seed_i/charts/episodic_return``.
 #
-# Algorithms:
-#   - mog_pqn_minatar (canonical MoG: CF + TD(λ) on ``q_mog_mean``, same shell as PQN)
-#   - cqn_minatar
-#   - pqn_minatar
+# Algorithms: ctd_minatar, qtd_minatar, iqn_minatar
 #
-# W&B: EXPERIMENT_TAG=MinAtar_30M_PQN, algo tags ``MoG``, ``CQN``, ``PQN`` (MoG = this trainer).
+# W&B: EXPERIMENT_TAG=MinAtar_30M_PQN, algo tags identify each baseline.
 #
-# TID → env_idx = TID/3, algo_idx = TID%3  (MoG: TID ∈ {0-11})
+# TID → env_idx = TID/3, algo_idx = TID%3
 #
-# Submit from repo root:  sbatch slurm/slurm_minatar_100m_pqn_compare.sh
-# (Edit ``--array`` above for full MoG+CQN+PQN: ``0-11``.)
+# Submit from repo root:  sbatch slurm/slurm_minatar_30m_pqn_compare.sh
 ################################################################################
 
 set -euo pipefail
@@ -40,7 +35,7 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="MinAtar_100M_PQN"
+EXPERIMENT_TAG="MinAtar_30M_PQN"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
 ENV_IDX=$((TID / 3))
@@ -54,19 +49,19 @@ ENV_IDS=(
 )
 
 PY_MODULES=(
-    "purejaxql.mog_pqn_minatar"
-    "purejaxql.cqn_minatar"
-    "purejaxql.pqn_minatar"
+    "purejaxql.ctd_minatar"
+    "purejaxql.qtd_minatar"
+    "purejaxql.iqn_minatar"
 )
 HYDRA_ALG=(
-    "mog_pqn_minatar"
-    "cqn_minatar"
-    "pqn_minatar"
+    "ctd_minatar"
+    "qtd_minatar"
+    "iqn_minatar"
 )
 WANDB_ALGO_TAGS=(
-    "MoG"
-    "CQN"
-    "PQN"
+    "CTD"
+    "QTD"
+    "IQN"
 )
 
 ENV_ID="${ENV_IDS[$ENV_IDX]}"
@@ -77,7 +72,7 @@ WANDB_TAG_ALGO="${WANDB_ALGO_TAGS[$ALGO_IDX]}"
 RUN_NAME="${ENV_ID}__${WANDB_TAG_ALGO}__x5"
 
 echo "=========================================="
-echo "MinAtar 10M PQN — 12 tasks (4 envs × 3 algos), NUM_SEEDS=5 vmap, W&B multi_seed"
+echo "MinAtar 30M — 12 tasks (4 envs × 3 algos: CTD/QTD/IQN), NUM_SEEDS=5 vmap, W&B multi_seed"
 echo "=========================================="
 echo "Task:     ${TID} (env ${ENV_IDX}, algo ${ALGO_IDX})"
 echo "Module:   ${PY_MODULE}"
@@ -93,12 +88,6 @@ echo "Start:    $(date)"
 echo "=========================================="
 
 ALGO_EXTRA=()
-if [[ "${ALGO_IDX}" -eq 1 ]]; then
-  ALGO_EXTRA+=(++alg.NUM_ENVS=128 ++alg.TEST_NUM_ENVS=128)
-fi
-if [[ "${ALGO_IDX}" -eq 2 ]]; then
-  ALGO_EXTRA+=(++alg.ALG_NAME=pqn)
-fi
 
 uv run --no-sync python -m "${PY_MODULE}" \
   --config-path "${HYDRA_CONFIG_DIR}" --config-name config \
@@ -110,8 +99,8 @@ uv run --no-sync python -m "${PY_MODULE}" \
   "+alg.EXPERIMENT_TAG=${EXPERIMENT_TAG}" \
   "+alg.WANDB_EXTRA_TAGS=[\"${WANDB_TAG_ALGO}\",\"multi_seed\"]" \
   "+alg.NAME=${RUN_NAME}" \
-  "alg.TOTAL_TIMESTEPS=100000000" \
-  "alg.TOTAL_TIMESTEPS_DECAY=100000000" \
+  "alg.TOTAL_TIMESTEPS=30_000_000" \
+  "alg.TOTAL_TIMESTEPS_DECAY=30_000_000" \
   "${ALGO_EXTRA[@]}"
 
 echo "Task ${TID} completed"
