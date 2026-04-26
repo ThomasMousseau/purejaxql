@@ -598,12 +598,38 @@ def make_train(config: dict):
                     interval = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
                     if int(m["update_steps"]) % interval != 0:
                         return
+
+                    def to_wandb_scalar_or_none(value):
+                        # Keep W&B logging scalar-only to avoid histogram
+                        # auto-conversion on vector metrics.
+                        try:
+                            arr = np.asarray(value)
+                        except Exception:
+                            return None
+                        if arr.ndim == 0:
+                            return arr.item() if np.isfinite(arr) else None
+                        if arr.size == 1:
+                            scalar = arr.reshape(()).item()
+                            return scalar if np.isfinite(scalar) else None
+                        return None
+
                     logged = dict(m)
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         logged = {
                             **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in logged.items()},
                             **logged,
                         }
+                    sanitized = {}
+                    for k, v in logged.items():
+                        scalar = to_wandb_scalar_or_none(v)
+                        if scalar is not None:
+                            sanitized[k] = scalar
+                    if "update_steps" not in sanitized:
+                        update_steps = to_wandb_scalar_or_none(m.get("update_steps"))
+                        if update_steps is None:
+                            return
+                        sanitized["update_steps"] = update_steps
+                    logged = sanitized
                     wandb.log(logged, step=logged["update_steps"])
 
                 jax.debug.callback(callback, metrics, seed_idx)

@@ -9,8 +9,8 @@ Plot Craftax **RNN** comparison across five algos (**MoG-PQN-RNN**, **PQN-RNN**,
   Override or extend via ``--algo-tags`` if needed.
 - X-axis: ``env_step`` (default) or ``update_steps`` — purejaxql RNN trainers log both.
 - Y-axis: ``returned_episode_returns`` (mean over parallel envs at episode end; same as other Craftax plots).
-- Curve: **mean across seeds**; shaded band: **std** or **SEM** (see ``--error-type``).
-- **Smoothing**: centered moving average on the mean (and on std/sem bands) via ``--smooth-window``.
+- Curve: **mean across seeds**; shaded band: **95% CI** (mean ± 1.96 * SEM).
+- **Smoothing**: centered moving average on the mean and CI band width via ``--smooth-window``.
 - **multi_seed** (optional): runs tagged ``multi_seed`` with ``seed_i/returned_episode_returns`` (``WANDB_LOG_ALL_SEEDS``)
   are expanded into multiple curves per run — same idea as :func:`old_cvi.plot_wandb_minatar.curves_from_wandb_run`.
 
@@ -23,16 +23,11 @@ Colors (shared defaults via ``plot_colors``):
 
 Requires: ``wandb``, ``matplotlib``, ``numpy``. Login: ``wandb login``
 
-Example::
-
-    uv run python plot_wandb_craftax_rnn_compare.py \\
-        --entity fatty_data --project Deep-CVI-Experiments \\
-        --experiment-tag Craftax_1B_RNN_3algo \\
-        --out figures/craftax_1b_rnn_compare.png
+In ``main()``, edit the active ``plot_craftax_rnn_compare(...)`` call directly
+to replot a previous experiment quickly (same style as ``plot_wandb_minatar.py``).
 """
 from __future__ import annotations
 
-import argparse
 import os
 from collections import defaultdict
 
@@ -94,11 +89,11 @@ def _algo_group(run, algo_tags: list[str]) -> str | None:
     )
 
 
-def _band(mean: np.ndarray, std: np.ndarray, n: int, error_type: str) -> tuple[np.ndarray, np.ndarray]:
-    if error_type == "sem" and n > 1:
-        e = std / np.sqrt(n)
-    else:
-        e = std
+def _band(mean: np.ndarray, std: np.ndarray, n_per_step: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # 95% normal-approx confidence interval: mean ± 1.96 * SEM.
+    sem = std / np.sqrt(np.maximum(n_per_step.astype(np.float64), 1.0))
+    sem[n_per_step < 2] = np.nan
+    e = 1.96 * sem
     return mean - e, mean + e
 
 
@@ -114,9 +109,7 @@ def plot_craftax_rnn_compare(
     grid_points: int,
     max_runs: int,
     smooth_window: int,
-    error_type: str,
     env_name_filter: str | None,
-    multi_seed_tag: str = "multi_seed",
 ) -> None:
     required = [experiment_tag]
     api = wandb.Api()
@@ -141,7 +134,7 @@ def plot_craftax_rnn_compare(
             run,
             metric=metric,
             step_metric=step_metric,
-            multi_seed_tag=multi_seed_tag,
+            multi_seed_tag="",
         ):
             by_algo[g].append(series)
 
@@ -169,7 +162,6 @@ def plot_craftax_rnn_compare(
         grid = np.linspace(s_min, s_max, grid_points)
         mat = _interp_on_grid(curves, grid)
         n_per_step = np.sum(np.isfinite(mat), axis=0)
-        n_seeds = float(len(curves))
         std_valid = n_per_step >= 2
         mean = np.nanmean(mat, axis=0)
         std = np.nanstd(mat, axis=0)
@@ -180,7 +172,7 @@ def plot_craftax_rnn_compare(
             std = _smooth_1d(std, smooth_window)
             std[~std_valid] = np.nan
 
-        lower, upper = _band(mean, std, int(n_seeds), error_type)
+        lower, upper = _band(mean, std, n_per_step)
         ymax_track = max(ymax_track, float(np.nanmax(upper)))
         ymin_track = min(ymin_track, float(np.nanmin(lower)))
 
@@ -192,9 +184,8 @@ def plot_craftax_rnn_compare(
 
     ax.set_xlabel(step_metric)
     ax.set_ylabel(metric)
-    err_name = "SEM" if error_type == "sem" else "std"
     ax.set_title(
-        f"{experiment_tag} — mean ± {err_name} over seeds (smoothing window={smooth_window})",
+        f"{experiment_tag} — mean ± 95% CI over seeds (smoothing window={smooth_window})",
         fontsize=11,
     )
     ax.legend(fontsize=9)
@@ -211,60 +202,35 @@ def plot_craftax_rnn_compare(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Plot Craftax RNN 5-algo comparison (MoG-PQN-RNN, PQN-RNN, IQN-RNN, QTD-RNN, CTD-RNN) from wandb."
-    )
-    p.add_argument("--project", default="Deep-CVI-Experiments")
-    p.add_argument("--entity", default=None)
-    p.add_argument(
-        "--experiment-tag",
-        default="Craftax_1B_RNN_3algo",
-        help="Must match W&B experiment tag (same as alg.EXPERIMENT_TAG / WANDB_EXPERIMENT_TAG in slurm).",
-    )
-    p.add_argument(
-        "--algo-tags",
-        nargs="+",
-        default=["MOG_PQN_RNN", "PQN_RNN", "IQN_RNN", "QTD_RNN", "CTD_RNN"],
-        help="W&B algo tags (one per run; ALG_NAME.upper() from trainers).",
-    )
-    p.add_argument("--metric", default="returned_episode_returns")
-    p.add_argument("--step-metric", default="env_step", help="e.g. env_step or update_steps")
-    p.add_argument("--out", default="figures/craftax_rnn_5algo_compare.png")
-    p.add_argument("--grid-points", type=int, default=800)
-    p.add_argument("--max-runs", type=int, default=5000)
-    p.add_argument("--smooth-window", type=int, default=51)
-    p.add_argument(
-        "--error-type",
-        choices=("std", "sem"),
-        default="std",
-        help="Shaded band: std across seeds, or SEM (std/sqrt(n)).",
-    )
-    p.add_argument(
-        "--env-name",
-        default=None,
-        help="If set, filter runs where config ENV_NAME matches (e.g. Craftax-Symbolic-v1).",
-    )
-    p.add_argument(
-        "--multi-seed-tag",
-        default="multi_seed",
-        help="If present on a run, load seed_i/metric series (see curves_from_wandb_run). Use '' to disable.",
-    )
-    args = p.parse_args()
+    
+    # !Craftax 1B RNN baseline compare.
+    # plot_craftax_rnn_compare(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     experiment_tag="Craftax-1B-checkpoint",
+    #     algo_tags=["MOG_PQN_RNN", "PQN_RNN"],
+    #     metric="returned_episode_returns",
+    #     step_metric="env_step",
+    #     out="figures/craftax_1b_rnn_5algo_compare.png",
+    #     grid_points=800,
+    #     max_runs=5000,
+    #     smooth_window=51,
+    #     env_name_filter=None,
+    # )
 
+    # !Craftax 1B RNN no TD-lambda ablation.
     plot_craftax_rnn_compare(
-        project=args.project,
-        entity=args.entity,
-        experiment_tag=args.experiment_tag,
-        algo_tags=list(args.algo_tags),
-        metric=args.metric,
-        step_metric=args.step_metric,
-        out=args.out,
-        grid_points=args.grid_points,
-        max_runs=args.max_runs,
-        smooth_window=args.smooth_window,
-        error_type=args.error_type,
-        env_name_filter=args.env_name,
-        multi_seed_tag=args.multi_seed_tag or "",
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        experiment_tag="Craftax-1B-5ALG",
+        algo_tags=["CTD_RNN", "QTD_RNN", "IQN_RNN", "MOG_PQN_RNN", "PQN_RNN"],
+        metric="returned_episode_returns",
+        step_metric="env_step",
+        out="figures/craftax_1b_rnn_5algo_compare.png",
+        grid_points=800,
+        max_runs=5000,
+        smooth_window=51,
+        env_name_filter=None,
     )
 
 

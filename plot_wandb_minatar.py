@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch Weights & Biases runs by tags and plot charts/episodic_return (mean ± std per algorithm).
+Fetch Weights & Biases runs by tags and plot charts/episodic_return (mean with 95% CI per algorithm).
 
 Requires: pip install wandb matplotlib numpy
 Login once: wandb login
@@ -23,7 +23,7 @@ plus :func:`plot_minatar_10m_all_algos_combined` for **all** benchmark + PQN cur
 
 **Vmap’d seeds (one W&B run):** tag runs with ``multi_seed`` and log ``seed_i/charts/episodic_return``
 (``WANDB_LOG_ALL_SEEDS`` in trainers). :func:`curves_from_wandb_run` expands those into
-multiple curves so mean ± std matches multi-run aggregation.
+multiple curves so mean ± 95% CI matches multi-run aggregation.
 """
 from __future__ import annotations
 
@@ -289,12 +289,8 @@ def _draw_algo_curves_on_ax(
     autoscale_y: bool = False,
     y_top_margin: float = 0.1,
     y_bottom: float | None = 0.0,
-    use_standard_error: bool = False,
 ) -> None:
-    """If ``autoscale_y``, set y-axis to ``[y_bottom, (max of mean+std) * (1 + y_top_margin)]`` per panel.
-
-    If ``use_standard_error``, shaded band is mean ± (sample std / sqrt(n)) per grid point.
-    """
+    """If ``autoscale_y``, set y-axis to ``[y_bottom, (max of mean+95% CI) * (1 + y_top_margin)]`` per panel."""
     ymax_track = -np.inf
     ymin_track = np.inf
 
@@ -313,11 +309,9 @@ def _draw_algo_curves_on_ax(
         mean = np.nanmean(mat, axis=0)
         std = np.nanstd(mat, axis=0)
         std[~std_valid] = np.nan
-        if use_standard_error:
-            spread = std / np.sqrt(np.maximum(n_per_step.astype(np.float64), 1.0))
-            spread[~std_valid] = np.nan
-        else:
-            spread = std
+        # 95% normal-approx confidence interval: mean ± 1.96 * SEM.
+        spread = 1.96 * (std / np.sqrt(np.maximum(n_per_step.astype(np.float64), 1.0)))
+        spread[~std_valid] = np.nan
         if smooth_window and smooth_window > 1:
             mean = _smooth_1d(mean, smooth_window)
             spread = _smooth_1d(spread, smooth_window)
@@ -345,8 +339,7 @@ def _draw_algo_curves_on_ax(
         }
         label = label_map.get(algo_tag, algo_tag)
         c = colors[idx % len(colors)]
-        band = "± SE" if use_standard_error else "± std"
-        ax.plot(grid, mean, color=c, linewidth=2.0, label=f"{label} (n={len(curves)}, {band})")
+        ax.plot(grid, mean, color=c, linewidth=2.0, label=f"{label} (n={len(curves)}, ±95% CI)")
         ax.fill_between(grid, lower, upper, color=c, alpha=0.2)
 
     ax.set_xlabel(step_metric)
@@ -365,6 +358,35 @@ def _draw_algo_curves_on_ax(
         else:
             bot = 0.0
         ax.set_ylim(bottom=bot, top=top)
+
+
+def _curve_mean_ci_on_grid(
+    curves: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    grid_points: int,
+    smooth_window: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Compute (grid, mean, lower, upper) from raw seed/run curves."""
+    if not curves:
+        return None
+    all_steps = np.concatenate([c[0] for c in curves])
+    s_min, s_max = np.nanmin(all_steps), np.nanmax(all_steps)
+    if not np.isfinite(s_min) or not np.isfinite(s_max) or s_max <= s_min:
+        return None
+    grid = np.linspace(s_min, s_max, grid_points)
+    mat = _interp_on_grid(curves, grid)
+    n_per_step = np.sum(np.isfinite(mat), axis=0)
+    std_valid = n_per_step >= 2
+    mean = np.nanmean(mat, axis=0)
+    std = np.nanstd(mat, axis=0)
+    std[~std_valid] = np.nan
+    spread = 1.96 * (std / np.sqrt(np.maximum(n_per_step.astype(np.float64), 1.0)))
+    spread[~std_valid] = np.nan
+    if smooth_window and smooth_window > 1:
+        mean = _smooth_1d(mean, smooth_window)
+        spread = _smooth_1d(spread, smooth_window)
+        spread[~std_valid] = np.nan
+    return grid, mean, mean - spread, mean + spread
 
 
 def plot_episodic_return(
@@ -386,20 +408,20 @@ def plot_episodic_return(
     multi_env_y_top_margin: float = 0.1,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
-    """Plot mean ± std episodic return from W&B.
+    """Plot mean ± 95% CI episodic return from W&B.
 
     - **Legacy (single panel):** leave ``env_ids`` as ``None``. Optionally set ``experiment_tag`` to filter runs.
     - **One env, filtered by id:** ``env_ids=[\"Breakout-MinAtar\"]`` and ``experiment_tag`` if needed.
     - **Five-env grid:** pass ``experiment_tag`` (e.g. ``\"MinAtar_10M\"``) and ``env_ids`` with 2+ entries;
       one subplot per env, **independent y-axes** (not shared). Each panel’s top is
-      ``(max of mean+std across algos) * (1 + multi_env_y_top_margin)`` (default 10 % headroom) so scales
+      ``(max of mean+95% CI across algos) * (1 + multi_env_y_top_margin)`` (default 10 % headroom) so scales
       match each game.
 
     If ``config.env_id`` is missing on older runs, set ``use_run_name_for_env=True`` (default) to recover
     env from ``run.name``.
 
     Runs tagged with ``multi_seed_tag`` (default ``"multi_seed"``) use :func:`curves_from_wandb_run`
-    to load ``seed_i/*`` metrics so one W&B run contributes multiple seed curves for mean ± std.
+    to load ``seed_i/*`` metrics so one W&B run contributes multiple seed curves for mean ± 95% CI.
     """
     if required_tag is None:
         required_tag = []
@@ -520,6 +542,221 @@ def plot_episodic_return(
     plt.tight_layout()
     plt.savefig(out, dpi=150)
     plt.close()
+    print(f"Wrote {out}")
+
+
+def plot_minatar_20m_td_lambda_aux_3exp(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_20M_Td_Lambda",
+    out: str = "figures/minatar_20m_td_lambda_aux_3exp.png",
+    env_ids: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 4000,
+    smooth_window: int = 41,
+    use_run_name_for_env: bool = True,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Plot a 4x3 grid (rows=envs, cols=experiments) with per-row shared x/y limits.
+
+    Experiments are selected by tags:
+    - ``LAMBDA-0.0`` + ``AUX_MEAN_LOSS_WEIGHT-0.0``
+    - ``LAMBDA-0.0`` + ``AUX_MEAN_LOSS_WEIGHT-1.0``
+    - ``LAMBDA-0.65`` + ``AUX_MEAN_LOSS_WEIGHT-1.0``
+    """
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+    if algo_tags is None:
+        algo_tags = ["MoG", "PQN", "CTD", "QTD", "IQN"]
+
+    exp_specs = [
+        {
+            "label": "Exp 1",
+            "tag_label": "LAMBDA-0.0 | AUX_MEAN_LOSS_WEIGHT-0.0",
+            "required_tags": [experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"],
+        },
+        {
+            "label": "Exp 2",
+            "tag_label": "LAMBDA-0.0 | AUX_MEAN_LOSS_WEIGHT-1.0",
+            "required_tags": [experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-1.0"],
+        },
+        {
+            "label": "Exp 3",
+            "tag_label": "LAMBDA-0.65 | AUX_MEAN_LOSS_WEIGHT-1.0",
+            "required_tags": [experiment_tag, "LAMBDA-0.65", "AUX_MEAN_LOSS_WEIGHT-1.0"],
+        },
+    ]
+    exp_keys = [spec["label"] for spec in exp_specs]
+
+    api = wandb.Api()
+    path = _wandb_path(entity, project)
+    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+
+    by_exp_env_algo: dict[str, dict[str, dict[str, list]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+
+    for run in runs:
+        algo = _algo_group(run, algo_tags)
+        if algo is None:
+            continue
+        env_id = _get_run_env_id(run, use_run_name=use_run_name_for_env)
+        if env_id is None or env_id not in env_ids:
+            continue
+
+        matched_exps: list[str] = []
+        for spec in exp_specs:
+            if _run_matches_required(run, list(spec["required_tags"])):
+                matched_exps.append(str(spec["label"]))
+
+        # Exp 2 reuses PQN from Exp 1:
+        # PQN does not use AUX_MEAN_LOSS_WEIGHT, so runs may only exist with AUX=0.0 tags.
+        if algo == "PQN" and _run_matches_required(run, [experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"]):
+            matched_exps.append("Exp 2")
+
+        matched_exps = _unique_ordered(matched_exps)
+        if not matched_exps:
+            continue
+
+        series_list = curves_from_wandb_run(
+            run,
+            metric=metric,
+            step_metric=step_metric,
+            multi_seed_tag=multi_seed_tag,
+        )
+        for matched_exp in matched_exps:
+            for series in series_list:
+                by_exp_env_algo[matched_exp][env_id][algo].append(series)
+
+    if not by_exp_env_algo:
+        raise RuntimeError(
+            "No runs matched for MinAtar 20M TD(lambda)+AUX plot. Check tags and env ids."
+        )
+
+    colors = _algo_colors(algo_tags)
+    label_map = {
+        "MoG": "MoG",
+        "PQN": "PQN",
+        "CTD": "CTD",
+        "QTD": "QTD",
+        "IQN": "IQN",
+    }
+
+    stats: dict[str, dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+    row_limits: dict[str, dict[str, float]] = {
+        env_id: {
+            "x_min": np.inf,
+            "x_max": -np.inf,
+            "y_min": np.inf,
+            "y_max": -np.inf,
+        }
+        for env_id in env_ids
+    }
+
+    for exp_key in exp_keys:
+        for env_id in env_ids:
+            for algo in algo_tags:
+                curves = by_exp_env_algo.get(exp_key, {}).get(env_id, {}).get(algo, [])
+                computed = _curve_mean_ci_on_grid(
+                    curves,
+                    grid_points=grid_points,
+                    smooth_window=smooth_window,
+                )
+                if computed is None:
+                    continue
+                stats[exp_key][env_id][algo] = computed
+                grid, _, lower, upper = computed
+                if np.isfinite(np.nanmin(grid)):
+                    row_limits[env_id]["x_min"] = min(row_limits[env_id]["x_min"], float(np.nanmin(grid)))
+                if np.isfinite(np.nanmax(grid)):
+                    row_limits[env_id]["x_max"] = max(row_limits[env_id]["x_max"], float(np.nanmax(grid)))
+                if np.isfinite(np.nanmin(lower)):
+                    row_limits[env_id]["y_min"] = min(row_limits[env_id]["y_min"], float(np.nanmin(lower)))
+                if np.isfinite(np.nanmax(upper)):
+                    row_limits[env_id]["y_max"] = max(row_limits[env_id]["y_max"], float(np.nanmax(upper)))
+
+    has_valid_limits = any(
+        np.isfinite(lims["x_min"])
+        and np.isfinite(lims["x_max"])
+        and np.isfinite(lims["y_min"])
+        and np.isfinite(lims["y_max"])
+        for lims in row_limits.values()
+    )
+    if not has_valid_limits:
+        raise RuntimeError("Matched runs did not contain valid metric series for plotting.")
+
+    n_rows = len(env_ids)
+    n_cols = len(exp_keys)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.8 * n_cols, 3.1 * n_rows),
+        squeeze=False,
+    )
+
+    for r, env_id in enumerate(env_ids):
+        for c, exp_key in enumerate(exp_keys):
+            ax = axes[r][c]
+            plotted_any = False
+            for idx, algo in enumerate(algo_tags):
+                computed = stats.get(exp_key, {}).get(env_id, {}).get(algo)
+                if computed is None:
+                    continue
+                grid, mean, lower, upper = computed
+                color = colors[idx % len(colors)]
+                n_curves = len(by_exp_env_algo.get(exp_key, {}).get(env_id, {}).get(algo, []))
+                ax.plot(
+                    grid,
+                    mean,
+                    color=color,
+                    linewidth=2.0,
+                    label=f"{label_map.get(algo, algo)} (n={n_curves})",
+                )
+                ax.fill_between(grid, lower, upper, color=color, alpha=0.2)
+                plotted_any = True
+
+            if not plotted_any:
+                ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
+
+            if r == 0:
+                tag_label = next(spec["tag_label"] for spec in exp_specs if spec["label"] == exp_key)
+                ax.set_title(f"{exp_key}\n{tag_label}", fontsize=10)
+            if c == 0:
+                ax.set_ylabel(_pretty_env_title(env_id))
+            if r == n_rows - 1:
+                ax.set_xlabel(step_metric)
+            row_lims = row_limits[env_id]
+            if np.isfinite(row_lims["x_min"]) and np.isfinite(row_lims["x_max"]):
+                ax.set_xlim(row_lims["x_min"], row_lims["x_max"])
+            if np.isfinite(row_lims["y_min"]) and np.isfinite(row_lims["y_max"]):
+                row_y_bottom = min(0.0, row_lims["y_min"])
+                row_y_top = row_lims["y_max"] * 1.05 if row_lims["y_max"] > 0 else row_lims["y_max"] + 1.0
+                ax.set_ylim(row_y_bottom, row_y_top)
+            ax.grid(True, alpha=0.3)
+            if r == 0 and c == n_cols - 1:
+                ax.legend(fontsize=7, loc="best")
+
+    metric_title = _pretty_metric_label(metric)
+    fig.suptitle(
+        f"{experiment_tag}: {metric_title} (shared x/y per environment row)",
+        fontsize=12,
+        y=1.01,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Wrote {out}")
 
 
@@ -874,33 +1111,26 @@ if __name__ == "__main__":
     #     smooth_window=41,
     # )
 
-    #(3a) MinAtar 10M PQN — MoG / CQN / PQN (``MoG``, ``CQN``, ``PQN`` tags)
+    # (3) MinAtar 10M PQN — MoG / PQN / CTD / QTD / IQN (``MoG``, ``PQN``, ``CTD``, ``QTD``, ``IQN`` tags)
     # plot_minatar_10m_mog_cqn_pqn(
     #     project="Deep-CVI-Experiments",
     #     entity="fatty_data",
     #     include_pong_misc=False,
     #     metric="charts/episodic_return",
     #     step_metric="global_step",
+    #     experiment_tag="MinAtar_10M_PQN",
+    #     out="figures/minatar_10m_episodic_return_pqn_ctd_qtd_iqn.png",
     # )
-
-    # (3b) Benchmark (MinAtar_10M) + legacy four-way PQN (MoG-PQN-stab / MoG-PQN / CQN / PQN)
-    # plot_minatar_10m_benchmark_and_pqn_compare(
+    
+    # plot_minatar_10m_mog_cqn_pqn(
     #     project="Deep-CVI-Experiments",
     #     entity="fatty_data",
     #     include_pong_misc=False,
     #     metric="charts/episodic_return",
     #     step_metric="global_step",
+    #     experiment_tag="MinAtar_30M_PQN",
+    #     out="figures/minatar_30m_episodic_return_pqn_ctd_qtd_iqn.png",
     # )
-    
-    plot_minatar_10m_mog_cqn_pqn(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        include_pong_misc=False,
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag="MinAtar_30M_PQN",
-        out="figures/minatar_30m_episodic_return_pqn_ctd_qtd_iqn.png",
-    )
     
     # plot_minatar_10m_mog_cqn_pqn(
     #     project="Deep-CVI-Experiments",
@@ -911,3 +1141,12 @@ if __name__ == "__main__":
     #     experiment_tag="MinAtar_100M_PQN",
     #     out="figures/minatar_100m_episodic_return_mog_cqn_pqn.png",
     # )
+    
+    plot_minatar_20m_td_lambda_aux_3exp(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag="MinAtar_20M_Td_Lambda",
+        out="figures/minatar_20m_td_lambda_aux_3exp.png",
+    )

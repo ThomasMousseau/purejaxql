@@ -14,7 +14,7 @@ batch_size: 1024
 
 num_tau: 51
 num_atoms: 51
-num_mog_components: 17
+num_mog_components: 51
 
 num_omega: 32
 gamma: 0.95

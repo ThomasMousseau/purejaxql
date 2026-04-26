@@ -994,20 +994,34 @@ def _save_parseval_training_plot(
     csv_path = stem.with_suffix(".csv")
 
     steps = np.asarray(history["step"], dtype=np.float64)
-    y_cr = np.nan_to_num(np.asarray(history["cramer_l2_mog_cqn"], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    y_cf = np.nan_to_num(np.asarray(history["cf_l2_w_mog_cqn"], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    y_cr = np.clip(y_cr, 0.0, None)
-    y_cf = np.clip(y_cf, 0.0, None)
+
+    def _as_seed_matrix(values: list[float] | list[list[float]]) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.ndim == 1:
+            return arr[None, :]
+        if arr.ndim == 2:
+            return arr
+        raise ValueError(f"Expected 1D or 2D parseval history, got shape {arr.shape}.")
+
+    cr_matrix = _as_seed_matrix(history["cramer_l2_mog_cqn"])
+    cf_matrix = _as_seed_matrix(history["cf_l2_w_mog_cqn"])
+    y_cr = np.clip(np.nan_to_num(np.nanmean(cr_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    y_cf = np.clip(np.nan_to_num(np.nanmean(cf_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    y_cr_std = np.nan_to_num(np.nanstd(cr_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
+    y_cf_std = np.nan_to_num(np.nanstd(cf_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
+    line_color = algo_color("mog_cqn")
 
     fig, ax = plt.subplots(1, 1, figsize=(7.2, 4.2))
-    ax.plot(steps, y_cr, color="#E41A1C", lw=2.0, label=r"Cramér $\ell_2^2$ (CDF)")
-    ax.plot(steps, y_cf, color="#d62728", lw=2.0, ls="--", label=r"CF $\ell_2^2/\omega^2$")
+    ax.fill_between(steps, np.clip(y_cr - y_cr_std, 0.0, None), y_cr + y_cr_std, color=line_color, alpha=0.18, lw=0)
+    ax.fill_between(steps, np.clip(y_cf - y_cf_std, 0.0, None), y_cf + y_cf_std, color=line_color, alpha=0.1, lw=0)
+    ax.plot(steps, y_cr, color=line_color, lw=2.0, label=r"Cramér $\ell_2^2$ (CDF)")
+    ax.plot(steps, y_cf, color=line_color, lw=2.0, ls="--", label=r"CF $\ell_2^2/\omega^2$")
     pos = np.concatenate([y_cr[np.isfinite(y_cr)], y_cf[np.isfinite(y_cf)]])
     pos = pos[pos > 0]
     if pos.size and float(np.nanmin(pos)) > 0:
         ax.set_yscale("log")
     ax.grid(True, linestyle="--", color="#D8D8D8", alpha=0.7)
-    ax.set_title("MoG-CQN — parseval anchor (mean over return distributions)")
+    ax.set_title("Empirical Parseval-Plancherel Theorem Validation")
     ax.set_xlabel("Training step")
     ax.set_ylabel("Loss")
     ax.legend(frameon=False, fontsize=9)
@@ -1017,7 +1031,13 @@ def _save_parseval_training_plot(
     fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
 
-    fieldnames = ("step", "cramer_l2_mog_cqn", "cf_l2_w_mog_cqn")
+    fieldnames = (
+        "step",
+        "cramer_l2_mog_cqn",
+        "cf_l2_w_mog_cqn",
+        "cramer_l2_mog_cqn_std",
+        "cf_l2_w_mog_cqn_std",
+    )
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -1025,8 +1045,10 @@ def _save_parseval_training_plot(
             writer.writerow(
                 {
                     "step": st,
-                    "cramer_l2_mog_cqn": history["cramer_l2_mog_cqn"][i],
-                    "cf_l2_w_mog_cqn": history["cf_l2_w_mog_cqn"][i],
+                    "cramer_l2_mog_cqn": y_cr[i],
+                    "cf_l2_w_mog_cqn": y_cf[i],
+                    "cramer_l2_mog_cqn_std": y_cr_std[i],
+                    "cf_l2_w_mog_cqn_std": y_cf_std[i],
                 }
             )
 
@@ -1578,7 +1600,7 @@ def parse_args(a=None):
         action="store_true",
         help="Skip training; download W&B runs by --experiment-tag and write aggregate figures.",
     )
-    p.add_argument("--config", type=Path, default=None, help="YAML overriding defaults (default: package config/analysis/distribution.yaml).")
+    p.add_argument("--config", type=Path, default=None, help="YAML overriding defaults (default: package config/analysis/distribution_quick_5seeds.yaml).")
     p.add_argument("--figures-dir", type=Path, default=None, help="Root for run output (default: <repo>/figures/distribution_analysis).")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--experiment-tag", default="DistAnalysis")
