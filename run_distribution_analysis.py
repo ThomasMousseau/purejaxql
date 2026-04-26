@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import train_state
+from plot_colors import algo_color
 jax.config.update("jax_enable_x64", True)
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -1067,12 +1068,12 @@ PLOT_ROW_LBL = {
 PLOT_WIN_BG = "#D2F4D9"
 PLOT_COLORS = {
     "truth": "#0A0A0A",
-    "iqn": "#56B4E9",
-    "qtd": "#009E73",
-    "ctd": "#B026FF",
-    "mog_cqn": "#E41A1C",
-    "qr_dqn": "#009E73",
-    "c51": "#B026FF",
+    "iqn": algo_color("iqn"),
+    "qtd": algo_color("qtd"),
+    "ctd": algo_color("ctd"),
+    "mog_cqn": algo_color("mog_cqn"),
+    "qr_dqn": algo_color("qr_dqn"),
+    "c51": algo_color("c51"),
 }
 PLOT_LW = {"truth": 2.15, "iqn": 1.05, "qtd": 1.08, "ctd": 1.12, "mog_cqn": 1.2, "qr_dqn": 1.08, "c51": 1.12}
 

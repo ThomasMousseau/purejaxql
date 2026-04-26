@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Plot Craftax **RNN** comparison (**PQN-RNN** vs **MoG-PQN-RNN**) from Weights & Biases.
+Plot Craftax **RNN** comparison across five algos (**MoG-PQN-RNN**, **PQN-RNN**, **IQN-RNN**, **QTD-RNN**, **CTD-RNN**) from Weights & Biases.
 
-- Filters runs by **experiment tag** (default: ``Craftax_1B_RNN_3algo`` — name is historical; matches
+- Filters runs by **experiment tag** (default: ``Craftax_1B_RNN_3algo``; matches
   ``WANDB_EXPERIMENT_TAG`` / ``alg.EXPERIMENT_TAG`` in ``slurm_craftax_1b_rnn_2algo.sh``) plus exactly
-  one **algo tag** per run: ``PQN_RNN`` or ``MOG_PQN_RNN`` (from ``ALG_NAME`` in the purejaxql trainers).
+  one **algo tag** per run: ``MOG_PQN_RNN``, ``PQN_RNN``, ``IQN_RNN``, ``QTD_RNN``, or ``CTD_RNN`` (from ``ALG_NAME`` in the
+  purejaxql trainers).
   Override or extend via ``--algo-tags`` if needed.
 - X-axis: ``env_step`` (default) or ``update_steps`` — purejaxql RNN trainers log both.
 - Y-axis: ``returned_episode_returns`` (mean over parallel envs at episode end; same as other Craftax plots).
@@ -13,9 +14,12 @@ Plot Craftax **RNN** comparison (**PQN-RNN** vs **MoG-PQN-RNN**) from Weights & 
 - **multi_seed** (optional): runs tagged ``multi_seed`` with ``seed_i/returned_episode_returns`` (``WANDB_LOG_ALL_SEEDS``)
   are expanded into multiple curves per run — same idea as :func:`old_cvi.plot_wandb_minatar.curves_from_wandb_run`.
 
-Colors (fixed):
-  - **MoG-PQN-RNN**: mid blue ``#2077b4``
-  - **PQN-RNN**: light green ``#7CCD7C``
+Colors (shared defaults via ``plot_colors``):
+  - **MoG-PQN-RNN**: dark blue ``#003a7d``
+  - **IQN-RNN**: medium blue ``#008dff``
+  - **CTD-RNN**: pink ``#ff73b6``
+  - **QTD-RNN**: purple ``#c701ff``
+  - **PQN-RNN**: green ``#4ecb8d`` (used as the 5th algo color)
 
 Requires: ``wandb``, ``matplotlib``, ``numpy``. Login: ``wandb login``
 
@@ -33,6 +37,7 @@ import os
 from collections import defaultdict
 
 import numpy as np
+from plot_colors import algo_color
 
 try:
     import matplotlib.pyplot as plt
@@ -52,19 +57,28 @@ from old_cvi.plot_wandb_minatar import (
     curves_from_wandb_run,
 )
 
-# Fills: MoG mid blue; PQN light green.
+# Defaults for 5-algo Craftax RNN compare.
 ALGO_FILL: dict[str, str] = {
-    "MOG_PQN_RNN": "#2077b4",
-    "PQN_RNN": "#7CCD7C",
+    "MOG_PQN_RNN": algo_color("MOG_PQN_RNN"),
+    "PQN_RNN": algo_color("PQN_RNN"),
+    "IQN_RNN": algo_color("IQN_RNN"),
+    "QTD_RNN": algo_color("QTD_RNN"),
+    "CTD_RNN": algo_color("CTD_RNN"),
 }
 ALGO_LINE: dict[str, str] = {
-    "MOG_PQN_RNN": "#2077b4",
-    "PQN_RNN": "#5CB85C",
+    "MOG_PQN_RNN": algo_color("MOG_PQN_RNN"),
+    "PQN_RNN": algo_color("PQN_RNN"),
+    "IQN_RNN": algo_color("IQN_RNN"),
+    "QTD_RNN": algo_color("QTD_RNN"),
+    "CTD_RNN": algo_color("CTD_RNN"),
 }
 
 ALGO_LABELS: dict[str, str] = {
     "MOG_PQN_RNN": "MoG-PQN-RNN",
     "PQN_RNN": "PQN-RNN",
+    "IQN_RNN": "IQN-RNN",
+    "QTD_RNN": "QTD-RNN",
+    "CTD_RNN": "CTD-RNN",
 }
 
 
@@ -197,7 +211,9 @@ def plot_craftax_rnn_compare(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Plot Craftax RNN PQN-RNN vs MoG-PQN-RNN comparison from wandb.")
+    p = argparse.ArgumentParser(
+        description="Plot Craftax RNN 5-algo comparison (MoG-PQN-RNN, PQN-RNN, IQN-RNN, QTD-RNN, CTD-RNN) from wandb."
+    )
     p.add_argument("--project", default="Deep-CVI-Experiments")
     p.add_argument("--entity", default=None)
     p.add_argument(
@@ -208,12 +224,12 @@ def main() -> None:
     p.add_argument(
         "--algo-tags",
         nargs="+",
-        default=["PQN_RNN", "MOG_PQN_RNN"],
-        help="W&B algo tags (one per run; ALG_NAME.upper() from trainers). Default: PQN-RNN then MoG-PQN-RNN.",
+        default=["MOG_PQN_RNN", "PQN_RNN", "IQN_RNN", "QTD_RNN", "CTD_RNN"],
+        help="W&B algo tags (one per run; ALG_NAME.upper() from trainers).",
     )
     p.add_argument("--metric", default="returned_episode_returns")
     p.add_argument("--step-metric", default="env_step", help="e.g. env_step or update_steps")
-    p.add_argument("--out", default="figures/craftax_rnn_2algo_compare.png")
+    p.add_argument("--out", default="figures/craftax_rnn_5algo_compare.png")
     p.add_argument("--grid-points", type=int, default=800)
     p.add_argument("--max-runs", type=int, default=5000)
     p.add_argument("--smooth-window", type=int, default=51)

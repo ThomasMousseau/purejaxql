@@ -25,6 +25,7 @@ import gymnax
 import hydra
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import wandb
 from flax import linen as nn
@@ -617,11 +618,19 @@ def make_train(config: dict):
                 metrics.update({f"grad_norm/{k}": v for k, v in layer_grad_norms.items()})
             done_infos = jax.tree_util.tree_map(
                 lambda x: jnp.nanmean(
-                    jnp.where(infos["returned_episode"], x, jnp.nan), axis=0
+                    jnp.where(infos["returned_episode"], x, jnp.nan)
                 ),
                 infos,
             )
             metrics.update(done_infos)
+            metrics["global_step"] = metrics["env_step"]
+            # Keep a scalar episodic return alias for plotting scripts that expect
+            # PQN-style MinAtar keys.
+            if "returned_episode_returns" in infos:
+                metrics["returned_episode_returns"] = jnp.nanmean(
+                    infos["returned_episode_returns"]
+                )
+                metrics["charts/episodic_return"] = metrics["returned_episode_returns"]
 
             if config.get("TEST_DURING_TRAINING", False):
                 rng, rng_test = jax.random.split(rng)
@@ -636,12 +645,36 @@ def make_train(config: dict):
 
             if config["WANDB_MODE"] != "disabled":
                 def callback(m, seed_idx_):
+                    interval = max(int(config.get("WANDB_LOG_INTERVAL", 100)), 1)
+                    if int(m["update_steps"]) % interval != 0:
+                        return
+
+                    def to_wandb_scalar_or_none(value):
+                        # Keep W&B logging scalar-only to avoid histogram auto-conversion
+                        # on vector metrics, which can fail for degenerate ranges.
+                        try:
+                            arr = np.asarray(value)
+                        except Exception:
+                            return None
+                        if arr.ndim == 0:
+                            return arr.item() if np.isfinite(arr) else None
+                        if arr.size == 1:
+                            scalar = arr.reshape(()).item()
+                            return scalar if np.isfinite(scalar) else None
+                        return None
+
                     logged = dict(m)
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         logged = {
                             **{f"seed_{int(seed_idx_) + 1}/{k}": v for k, v in logged.items()},
                             **logged,
                         }
+                    sanitized = {}
+                    for k, v in logged.items():
+                        scalar = to_wandb_scalar_or_none(v)
+                        if scalar is not None:
+                            sanitized[k] = scalar
+                    logged = sanitized
                     wandb.log(logged, step=logged["update_steps"])
 
                 jax.debug.callback(callback, metrics, seed_idx)

@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""
+Fetch Weights & Biases runs by tags and plot charts/episodic_return (mean ± std per algorithm).
+
+Requires: pip install wandb matplotlib numpy
+Login once: wandb login
+
+**Single environment** (e.g. Breakout only): pass ``env_name`` for the title; leave ``env_ids`` unset.
+
+**MinAtar 10M sweep**: pass ``experiment_tag="MinAtar_10M"`` and ``env_ids``. Runs are filtered by
+tags (experiment + one algo tag). Environment is taken from ``config.env_id`` when present; otherwise
+from the W&B **run name**, which is ``{env_id}__{exp_name}__{seed}__...`` (first segment = env).
+
+**MinAtar 10M — MoG / CQN / PQN** (``slurm/slurm_minatar_10m_pqn_compare.sh``): use
+``experiment_tag="MinAtar_10M_PQN"`` and algo tags ``MoG``, ``CQN``, ``PQN`` — the canonical
+MoG trainer — :func:`plot_minatar_10m_mog_cqn_pqn`. (Older MoG-only ablations may use ``MoG-PQN`` /
+``MoG-PQN-stab`` tags on other figures.)
+
+**Legacy four-way PQN compare** (MoG-PQN-stab / MoG-PQN / CQN / PQN): call
+:func:`plot_minatar_10m_benchmark_and_pqn_compare` (older Slurm layout),
+plus :func:`plot_minatar_10m_all_algos_combined` for **all** benchmark + PQN curves on **one** figure
+(four env panels; default output ``figures/minatar_10m_episodic_return_all_algos.png``).
+
+**Vmap’d seeds (one W&B run):** tag runs with ``multi_seed`` and log ``seed_i/charts/episodic_return``
+(``WANDB_LOG_ALL_SEEDS`` in trainers). :func:`curves_from_wandb_run` expands those into
+multiple curves so mean ± std matches multi-run aggregation.
+"""
+from __future__ import annotations
+
+import os
+from collections import defaultdict
+
+import numpy as np
+from plot_colors import algo_color
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    raise SystemExit("Please install matplotlib: pip install matplotlib") from e
+
+try:
+    import wandb
+except ImportError as e:
+    raise SystemExit("Please install wandb: pip install wandb") from e
+
+def _algo_colors(algo_tags: list[str]) -> list[str]:
+    # Normalize run tags/aliases to shared palette keys from plot_colors.py.
+    alias_map: dict[str, str] = {
+        "MoG": "mog",
+        "IQN": "iqn",
+        "CTD": "ctd",
+        "QTD": "qtd",
+        "PQN": "pqn",
+        "CQN": "mog_cqn",
+        "QR-DQN": "qr_dqn",
+        "C51": "c51",
+        "IQN_RNN": "iqn_rnn",
+        "QTD_RNN": "qtd_rnn",
+        "CTD_RNN": "ctd_rnn",
+        "PQN_RNN": "pqn_rnn",
+        "MOG_PQN_RNN": "mog_pqn_rnn",
+    }
+    return [algo_color(alias_map.get(tag, tag)) for tag in algo_tags]
+
+
+def _wandb_path(entity: str | None, project: str) -> str:
+    if entity:
+        return f"{entity}/{project}"
+    return project
+
+
+def _parse_env_id_from_run_name(name: str | None) -> str | None:
+    """Training uses ``wandb.init(..., name=f"{env_id}__{exp_name}__{seed}__{time}")`` — env is the first segment."""
+    if not name:
+        return None
+    s = str(name).strip()
+    if "__" not in s:
+        return None
+    return s.split("__", 1)[0].strip() or None
+
+
+def _get_run_env_id(run, *, use_run_name: bool = True) -> str | None:
+    """Prefer ``config.env_id``; if missing, parse from ``run.name`` (see ``_parse_env_id_from_run_name``)."""
+    cfg = getattr(run, "config", None)
+    if cfg is not None and hasattr(cfg, "get"):
+        v = cfg.get("env_id")
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    if use_run_name:
+        return _parse_env_id_from_run_name(getattr(run, "name", None))
+    return None
+
+
+def _run_matches_required(run, required: list[str]) -> bool:
+    tags = set(run.tags or [])
+    return all(t in tags for t in required)
+
+
+def _algo_group(run, algo_tags: list[str]) -> str | None:
+    tags = set(run.tags or [])
+    found = [a for a in algo_tags if a in tags]
+    if len(found) == 1:
+        return found[0]
+    if len(found) == 0:
+        return None
+    raise ValueError(f"Run {run.id} has multiple algo tags {found}; use unique algo tags per run.")
+
+
+def _load_series(run, metric: str, step_key: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Returns (steps, values) sorted by step; drops NaNs."""
+    df = None
+    try:
+        df = run.history(keys=[metric, step_key], pandas=True)
+    except Exception:
+        pass
+    if df is None or getattr(df, "empty", True):
+        try:
+            df = run.history(pandas=True)
+        except Exception:
+            return None
+    if df is None or df.empty or step_key not in df.columns or metric not in df.columns:
+        return None
+    work = df[[step_key, metric]].dropna()
+    if work.empty:
+        return None
+    steps = work[step_key].to_numpy(dtype=np.float64)
+    vals = work[metric].to_numpy(dtype=np.float64)
+    order = np.argsort(steps)
+    return steps[order], vals[order]
+
+
+def _unique_ordered(xs: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in xs:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _metric_candidates(metric: str) -> list[str]:
+    """Return ordered fallbacks for reward/return metrics."""
+    # For MinAtar plots we expect and require the exact metric key.
+    # Do not silently fall back when charts/episodic_return is requested.
+    if metric == "charts/episodic_return":
+        return [metric]
+    cands = [metric]
+    if metric == "returned_episode_returns":
+        cands.extend(["charts/episodic_return", "charts/episode_return", "episodic_return"])
+    return _unique_ordered(cands)
+
+
+def _step_candidates(step_metric: str) -> list[str]:
+    """Return ordered fallbacks for x-axis step metrics."""
+    cands = [step_metric]
+    if step_metric == "global_step":
+        cands.extend(["env_step", "update_steps", "_step"])
+    elif step_metric == "env_step":
+        cands.extend(["global_step", "update_steps", "_step"])
+    elif step_metric == "update_steps":
+        cands.extend(["env_step", "global_step", "_step"])
+    else:
+        cands.extend(["global_step", "env_step", "update_steps", "_step"])
+    return _unique_ordered(cands)
+
+
+def _load_series_any(
+    run, *, metric_candidates: list[str], step_candidates: list[str]
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Try metric/step combinations in order; return first available series."""
+    for m in metric_candidates:
+        for s in step_candidates:
+            series = _load_series(run, m, s)
+            if series is not None:
+                return series
+    return None
+
+
+def _num_seeds_from_run_config(run) -> int:
+    """Read ``NUM_SEEDS`` from flattened W&B config (purejaxql merges ``alg`` into top-level config)."""
+    cfg = getattr(run, "config", None)
+    if cfg is None:
+        return 5
+    if hasattr(cfg, "get"):
+        v = cfg.get("NUM_SEEDS")
+        if v is not None:
+            return max(1, int(v))
+        alg = cfg.get("alg")
+        if isinstance(alg, dict) and alg.get("NUM_SEEDS") is not None:
+            return max(1, int(alg["NUM_SEEDS"]))
+    return 5
+
+
+def curves_from_wandb_run(
+    run,
+    *,
+    metric: str,
+    step_metric: str,
+    multi_seed_tag: str = "multi_seed",
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return one (steps, values) series per seed, or one series for a normal run.
+
+    If the run is tagged with ``multi_seed_tag`` (e.g. ``multi_seed``), loads
+    ``seed_i/{metric}`` vs ``seed_i/{step_metric}`` for ``i = 1 .. NUM_SEEDS`` — the same
+    layout logged by purejaxql when ``WANDB_LOG_ALL_SEEDS`` is true and ``NUM_SEEDS`` > 1.
+
+    Otherwise loads a single ``metric`` / ``step_metric`` series (same as :func:`_load_series`).
+    """
+    tags = set(run.tags or [])
+    metric_cands = _metric_candidates(metric)
+    step_cands = _step_candidates(step_metric)
+    if multi_seed_tag not in tags:
+        s = _load_series_any(run, metric_candidates=metric_cands, step_candidates=step_cands)
+        return [s] if s is not None else []
+
+    n = _num_seeds_from_run_config(run)
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    for i in range(1, n + 1):
+        mkeys = [f"seed_{i}/{m}" for m in metric_cands]
+        skeys = [f"seed_{i}/{s}" for s in step_cands]
+        s = _load_series_any(run, metric_candidates=mkeys, step_candidates=skeys)
+        if s is not None:
+            out.append(s)
+    return out
+
+
+def _interp_on_grid(
+    curves: list[tuple[np.ndarray, np.ndarray]], grid: np.ndarray
+) -> np.ndarray:
+    """Each curve (s, v); returns array shape (n_curves, len(grid)) with linear interp and nan outside."""
+    out = np.full((len(curves), len(grid)), np.nan, dtype=np.float64)
+    for i, (s, v) in enumerate(curves):
+        if len(s) == 0:
+            continue
+        mask = np.isfinite(s) & np.isfinite(v)
+        s, v = s[mask], v[mask]
+        if len(s) < 2:
+            continue
+        out[i] = np.interp(grid, s, v, left=np.nan, right=np.nan)
+    return out
+
+
+def _smooth_1d(y: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average (edge-padded). ``window`` is coerced to an odd length ≤ ``len(y)``."""
+    y = np.asarray(y, dtype=np.float64)
+    n = len(y)
+    if window <= 1 or n < 2:
+        return y
+    w = max(3, int(window) | 1)
+    if w > n:
+        w = n if n % 2 == 1 else n - 1
+    if w < 3:
+        return y
+    bad = ~np.isfinite(y)
+    if np.any(bad) and np.any(~bad):
+        idx = np.arange(n)
+        y = y.copy()
+        y[bad] = np.interp(idx[bad], idx[~bad], y[~bad])
+    pad = w // 2
+    yp = np.pad(y, (pad, pad), mode="edge")
+    kernel = np.ones(w, dtype=np.float64) / w
+    return np.convolve(yp, kernel, mode="valid")
+
+
+def _pretty_metric_label(metric: str) -> str:
+    tail = metric.split("/")[-1]
+    return tail.replace("_", " ").strip().title()
+
+
+def _pretty_env_title(env_id: str) -> str:
+    if env_id.endswith("-MinAtar"):
+        return env_id.replace("-MinAtar", " MinAtar").replace("-", " ")
+    return env_id.replace("-", " ").replace("_", " ").title()
+
+
+def _draw_algo_curves_on_ax(
+    ax,
+    by_algo: dict[str, list],
+    algo_tags: list[str],
+    colors: list[str],
+    *,
+    grid_points: int,
+    smooth_window: int,
+    step_metric: str,
+    metric: str,
+    show_ylabel: bool,
+    autoscale_y: bool = False,
+    y_top_margin: float = 0.1,
+    y_bottom: float | None = 0.0,
+    use_standard_error: bool = False,
+) -> None:
+    """If ``autoscale_y``, set y-axis to ``[y_bottom, (max of mean+std) * (1 + y_top_margin)]`` per panel.
+
+    If ``use_standard_error``, shaded band is mean ± (sample std / sqrt(n)) per grid point.
+    """
+    ymax_track = -np.inf
+    ymin_track = np.inf
+
+    for idx, algo_tag in enumerate(algo_tags):
+        curves = by_algo.get(algo_tag, [])
+        if not curves:
+            continue
+        all_steps = np.concatenate([c[0] for c in curves])
+        s_min, s_max = np.nanmin(all_steps), np.nanmax(all_steps)
+        if not np.isfinite(s_min) or not np.isfinite(s_max) or s_max <= s_min:
+            continue
+        grid = np.linspace(s_min, s_max, grid_points)
+        mat = _interp_on_grid(curves, grid)
+        n_per_step = np.sum(np.isfinite(mat), axis=0)
+        std_valid = n_per_step >= 2
+        mean = np.nanmean(mat, axis=0)
+        std = np.nanstd(mat, axis=0)
+        std[~std_valid] = np.nan
+        if use_standard_error:
+            spread = std / np.sqrt(np.maximum(n_per_step.astype(np.float64), 1.0))
+            spread[~std_valid] = np.nan
+        else:
+            spread = std
+        if smooth_window and smooth_window > 1:
+            mean = _smooth_1d(mean, smooth_window)
+            spread = _smooth_1d(spread, smooth_window)
+            # Keep variance hidden where fewer than 2 runs contribute, even after smoothing.
+            spread[~std_valid] = np.nan
+        upper = mean + spread
+        lower = mean - spread
+        ymax_track = max(ymax_track, float(np.nanmax(upper)))
+        ymin_track = min(ymin_track, float(np.nanmin(lower)))
+
+        label_map = {
+            "dqn": "DQN",
+            "C51": "C51",
+            "MoG": "MoG",
+            "FFT": "FFT",
+            "QR-DQN": "QR-DQN",
+            "IQN": "IQN",
+            "FQF": "FQF",
+            "MoG-PQN-stab": "MoG-PQN (stab.)",
+            "MoG-PQN": "MoG-PQN",
+            "CQN": "CQN",
+            "PQN": "PQN",
+            "PQN_RNN": "PQN-RNN",
+            "MOG_PQN_RNN": "MoG-PQN-RNN",
+        }
+        label = label_map.get(algo_tag, algo_tag)
+        c = colors[idx % len(colors)]
+        band = "± SE" if use_standard_error else "± std"
+        ax.plot(grid, mean, color=c, linewidth=2.0, label=f"{label} (n={len(curves)}, {band})")
+        ax.fill_between(grid, lower, upper, color=c, alpha=0.2)
+
+    ax.set_xlabel(step_metric)
+    if show_ylabel:
+        ax.set_ylabel(metric)
+    leg_fs = 6 if len(algo_tags) > 6 else 8
+    ax.legend(fontsize=leg_fs, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    if autoscale_y and np.isfinite(ymax_track) and ymax_track > 0:
+        top = ymax_track * (1.0 + y_top_margin)
+        if y_bottom is not None:
+            bot = float(y_bottom)
+        elif np.isfinite(ymin_track) and ymin_track < 0:
+            bot = ymin_track * (1.0 + y_top_margin)
+        else:
+            bot = 0.0
+        ax.set_ylim(bottom=bot, top=top)
+
+
+def plot_episodic_return(
+    *,
+    project: str,
+    entity: str | None = None,
+    required_tag: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    out: str = "wandb_episodic_return.png",
+    grid_points: int = 800,
+    max_runs: int = 500,
+    smooth_window: int = 41,
+    env_name: str = "Breakout MinAtar",
+    experiment_tag: str | None = None,
+    env_ids: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Plot mean ± std episodic return from W&B.
+
+    - **Legacy (single panel):** leave ``env_ids`` as ``None``. Optionally set ``experiment_tag`` to filter runs.
+    - **One env, filtered by id:** ``env_ids=[\"Breakout-MinAtar\"]`` and ``experiment_tag`` if needed.
+    - **Five-env grid:** pass ``experiment_tag`` (e.g. ``\"MinAtar_10M\"``) and ``env_ids`` with 2+ entries;
+      one subplot per env, **independent y-axes** (not shared). Each panel’s top is
+      ``(max of mean+std across algos) * (1 + multi_env_y_top_margin)`` (default 10 % headroom) so scales
+      match each game.
+
+    If ``config.env_id`` is missing on older runs, set ``use_run_name_for_env=True`` (default) to recover
+    env from ``run.name``.
+
+    Runs tagged with ``multi_seed_tag`` (default ``"multi_seed"``) use :func:`curves_from_wandb_run`
+    to load ``seed_i/*`` metrics so one W&B run contributes multiple seed curves for mean ± std.
+    """
+    if required_tag is None:
+        required_tag = []
+    if algo_tags is None:
+        algo_tags = ["MoG", "dqn", "C51", "QR-DQN", "IQN", "FQF"]
+
+    required_effective = list(required_tag)
+    if experiment_tag:
+        required_effective.append(experiment_tag)
+
+    api = wandb.Api()
+    path = _wandb_path(entity, project)
+    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+
+    colors = _algo_colors(algo_tags)
+    metric_title = _pretty_metric_label(metric)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+
+    # ----- Multi-env grid (e.g. MinAtar_10M × 5 games) -----
+    if env_ids is not None and len(env_ids) > 1:
+        by_env_algo: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        for run in runs:
+            if not _run_matches_required(run, required_effective):
+                continue
+            eid = _get_run_env_id(run, use_run_name=use_run_name_for_env)
+            if eid is None or eid not in env_ids:
+                continue
+            g = _algo_group(run, algo_tags)
+            if g is None:
+                continue
+            for series in curves_from_wandb_run(
+                run,
+                metric=metric,
+                step_metric=step_metric,
+                multi_seed_tag=multi_seed_tag,
+            ):
+                by_env_algo[eid][g].append(series)
+
+        if not by_env_algo:
+            raise RuntimeError(
+                "No runs matched. Check experiment_tag, env_ids, algo tags, and env (config.env_id or run.name)."
+            )
+
+        n = len(env_ids)
+        fig_w = max(14, 3.2 * n)
+        fig, axes = plt.subplots(1, n, figsize=(fig_w, 4.2), sharey=False, squeeze=False)
+        ax_flat = axes[0]
+
+        for j, eid in enumerate(env_ids):
+            ax = ax_flat[j]
+            by_algo = by_env_algo.get(eid, {})
+            if not any(len(by_algo.get(t, [])) > 0 for t in algo_tags):
+                ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
+            else:
+                _draw_algo_curves_on_ax(
+                    ax,
+                    dict(by_algo),
+                    algo_tags,
+                    colors,
+                    grid_points=grid_points,
+                    smooth_window=smooth_window,
+                    step_metric=step_metric,
+                    metric=metric,
+                    show_ylabel=(j == 0),
+                    autoscale_y=True,
+                    y_top_margin=multi_env_y_top_margin,
+                    y_bottom=0.0,
+                )
+            ax.set_title(_pretty_env_title(eid), fontsize=10)
+
+        et = experiment_tag or ""
+        supt = f"{et} {metric_title}  "
+        fig.suptitle(supt, fontsize=12, y=1.03)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {out}")
+        return
+
+    # ----- Single panel -----
+    by_algo: dict[str, list] = defaultdict(list)
+    for run in runs:
+        if not _run_matches_required(run, required_effective):
+            continue
+        if env_ids is not None and len(env_ids) == 1:
+            if _get_run_env_id(run, use_run_name=use_run_name_for_env) != env_ids[0]:
+                continue
+        g = _algo_group(run, algo_tags)
+        if g is None:
+            continue
+        for series in curves_from_wandb_run(
+            run,
+            metric=metric,
+            step_metric=step_metric,
+            multi_seed_tag=multi_seed_tag,
+        ):
+            by_algo[g].append(series)
+
+    if not by_algo:
+        raise RuntimeError(
+            "No runs matched. Check entity, project, experiment_tag, required_tag, env_ids, and algo_tags."
+        )
+
+    plt.figure(figsize=(10, 6))
+    _draw_algo_curves_on_ax(
+        plt.gca(),
+        dict(by_algo),
+        algo_tags,
+        colors,
+        grid_points=grid_points,
+        smooth_window=smooth_window,
+        step_metric=step_metric,
+        metric=metric,
+        show_ylabel=True,
+    )
+    plt.title(f"{metric_title} in {env_name}", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Wrote {out}")
+
+
+def plot_minatar_10m_mog_cqn_pqn(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_10M_PQN",
+    out: str = "figures/minatar_10m_episodic_return_mog_cqn_pqn.png",
+    env_ids: list[str] | None = None,
+    include_pong_misc: bool = False,
+    use_run_name_for_env: bool = True,
+    algo_tags: list[str] | None = None,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 2000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Four panels (one per MinAtar game): **MoG**, **PQN**, **CTD**, **QTD**, **IQN** only.
+
+    Loads runs tagged ``experiment_tag`` (default ``MinAtar_10M_PQN``) plus exactly one of
+    ``MoG`` / ``PQN`` / ``CTD`` / ``QTD`` / ``IQN`` -- matching ``slurm/slurm_minatar_30m_pqn_compare.sh``.
+    """
+    if algo_tags is None:
+        algo_tags = ["MoG", "PQN", "CTD", "QTD", "IQN"]
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+        if include_pong_misc:
+            env_ids = [*env_ids, "Pong-misc"]
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        algo_tags=algo_tags,
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+    )
+
+
+# Back-compat alias (older name when the sweep was tagged ``mog_pqn_lambda``).
+plot_minatar_10m_mog_lambda_cqn_pqn = plot_minatar_10m_mog_cqn_pqn
+
+
+def plot_minatar_10m_benchmark_and_pqn_compare(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag_benchmark: str = "MinAtar_10M",
+    experiment_tag_pqn: str = "MinAtar_10M_PQN",
+    out_benchmark: str = "figures/minatar_10m_episodic_return_benchmark.png",
+    out_pqn: str = "figures/minatar_10m_episodic_return_pqn.png",
+    out_all_algos: str = "figures/minatar_10m_episodic_return_all_algos.png",
+    plot_all_algos_combined: bool = True,
+    env_ids: list[str] | None = None,
+    include_pong_misc: bool = False,
+    use_run_name_for_env: bool = True,
+    algo_tags_benchmark: list[str] | None = None,
+    algo_tags_pqn: list[str] | None = None,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 2000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Two or three multi-env figures from W&B.
+
+    **Panel A (benchmark):** original sweep tagged ``MinAtar_10M`` + one of
+    ``MoG`` / ``dqn`` / ``C51`` / ``QR-DQN`` / ``IQN`` (same as :func:`plot_minatar_10m_grid`).
+
+    **Panel B (legacy four-way PQN sweep):** ``MinAtar_10M_PQN`` plus one of
+    ``MoG-PQN-stab``, ``MoG-PQN``, ``CQN``, ``PQN``. For the canonical **MoG / CQN / PQN** sweep, use
+    :func:`plot_minatar_10m_mog_cqn_pqn` instead (tag ``MoG``).
+
+    **Panel C (optional, ``plot_all_algos_combined=True``):** benchmark + PQN curves **together**
+    (default **9** algorithms) in one figure, four env columns — :func:`plot_minatar_10m_all_algos_combined`.
+
+    All panels use the same ``metric`` / ``step_metric`` (purejaxql trainers log
+    ``charts/episodic_return`` and ``global_step`` for MinAtar).
+    """
+    if algo_tags_benchmark is None:
+        algo_tags_benchmark = ["MoG", "dqn", "C51", "QR-DQN", "IQN"]
+    if algo_tags_pqn is None:
+        algo_tags_pqn = ["MoG-PQN-stab", "MoG-PQN", "CQN", "PQN"]
+
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+        if include_pong_misc:
+            env_ids = [*env_ids, "Pong-misc"]
+
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        experiment_tag=experiment_tag_benchmark,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        algo_tags=algo_tags_benchmark,
+        metric=metric,
+        step_metric=step_metric,
+        out=out_benchmark,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+    )
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        experiment_tag=experiment_tag_pqn,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        algo_tags=algo_tags_pqn,
+        metric=metric,
+        step_metric=step_metric,
+        out=out_pqn,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+    )
+    if plot_all_algos_combined:
+        plot_minatar_10m_all_algos_combined(
+            project=project,
+            entity=entity,
+            experiment_tag_benchmark=experiment_tag_benchmark,
+            experiment_tag_pqn=experiment_tag_pqn,
+            out=out_all_algos,
+            env_ids=env_ids,
+            use_run_name_for_env=use_run_name_for_env,
+            algo_tags_benchmark=algo_tags_benchmark,
+            algo_tags_pqn=algo_tags_pqn,
+            metric=metric,
+            step_metric=step_metric,
+            grid_points=grid_points,
+            max_runs=max_runs,
+            smooth_window=smooth_window,
+            multi_env_y_top_margin=multi_env_y_top_margin,
+            multi_seed_tag=multi_seed_tag,
+        )
+
+
+def plot_minatar_10m_all_algos_combined(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag_benchmark: str = "MinAtar_10M",
+    experiment_tag_pqn: str = "MinAtar_10M_PQN",
+    out: str = "figures/minatar_10m_episodic_return_all_algos.png",
+    env_ids: list[str] | None = None,
+    include_pong_misc: bool = False,
+    use_run_name_for_env: bool = True,
+    algo_tags_benchmark: list[str] | None = None,
+    algo_tags_pqn: list[str] | None = None,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 2000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """One figure: **benchmark + PQN-sweep** algorithms together (default **5 + 4 = 9** curves per env).
+
+    Loads runs tagged ``MinAtar_10M`` for ``MoG`` / ``dqn`` / ``C51`` / ``QR-DQN`` / ``IQN`` and
+    runs tagged ``MinAtar_10M_PQN`` for ``MoG-PQN-stab`` / ``MoG-PQN`` / ``CQN`` / ``PQN``.
+    Four columns (one per MinAtar game), independent y-scales per panel.
+    """
+    if algo_tags_benchmark is None:
+        algo_tags_benchmark = ["MoG", "dqn", "C51", "QR-DQN", "IQN"]
+    if algo_tags_pqn is None:
+        algo_tags_pqn = ["MoG-PQN-stab", "MoG-PQN", "CQN", "PQN"]
+
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+        if include_pong_misc:
+            env_ids = [*env_ids, "Pong-misc"]
+
+    algo_tags_all = list(algo_tags_benchmark) + list(algo_tags_pqn)
+    exp_for_algo: dict[str, str] = {
+        **{t: experiment_tag_benchmark for t in algo_tags_benchmark},
+        **{t: experiment_tag_pqn for t in algo_tags_pqn},
+    }
+    colors = _algo_colors(algo_tags_all)
+    metric_title = _pretty_metric_label(metric)
+
+    api = wandb.Api()
+    path = _wandb_path(entity, project)
+    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+
+    by_env_algo: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for run in runs:
+        g = _algo_group(run, algo_tags_all)
+        if g is None:
+            continue
+        et = exp_for_algo[g]
+        if et not in set(run.tags or []):
+            continue
+        eid = _get_run_env_id(run, use_run_name=use_run_name_for_env)
+        if eid is None or eid not in env_ids:
+            continue
+        for series in curves_from_wandb_run(
+            run,
+            metric=metric,
+            step_metric=step_metric,
+            multi_seed_tag=multi_seed_tag,
+        ):
+            by_env_algo[eid][g].append(series)
+
+    if not by_env_algo:
+        raise RuntimeError(
+            "No runs matched for combined plot. Check experiment tags, env_ids, and algo tags on W&B."
+        )
+
+    n = len(env_ids)
+    fig_w = max(18, 3.5 * n)
+    fig, axes = plt.subplots(1, n, figsize=(fig_w, 4.8), sharey=False, squeeze=False)
+    ax_flat = axes[0]
+
+    for j, eid in enumerate(env_ids):
+        ax = ax_flat[j]
+        by_algo = by_env_algo.get(eid, {})
+        if not any(len(by_algo.get(t, [])) > 0 for t in algo_tags_all):
+            ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
+        else:
+            _draw_algo_curves_on_ax(
+                ax,
+                dict(by_algo),
+                algo_tags_all,
+                colors,
+                grid_points=grid_points,
+                smooth_window=smooth_window,
+                step_metric=step_metric,
+                metric=metric,
+                show_ylabel=(j == 0),
+                autoscale_y=True,
+                y_top_margin=multi_env_y_top_margin,
+                y_bottom=0.0,
+            )
+        ax.set_title(_pretty_env_title(eid), fontsize=10)
+
+    supt = f"{experiment_tag_benchmark} + {experiment_tag_pqn}  {metric_title}"
+    fig.suptitle(supt, fontsize=11, y=1.02)
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {out}")
+
+
+def plot_minatar_10m_grid(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    out: str = "figures/minatar_10m_episodic_return.png",
+    experiment_tag: str = "MinAtar_10M",
+    env_ids: list[str] | None = None,
+    include_pong_misc: bool = False,
+    use_run_name_for_env: bool = True,
+    **kwargs,
+) -> None:
+    """Convenience wrapper for the MinAtar 10M multi-env figure.
+
+    By default uses **four** MinAtar games (Asterix, Breakout, Freeway, Space Invaders). Set
+    ``include_pong_misc=True`` to add ``Pong-misc`` as a fifth panel (Slurm stand-in for Seaquest).
+    If ``env_ids`` is passed explicitly, ``include_pong_misc`` is ignored.
+    """
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+        if include_pong_misc:
+            env_ids = [*env_ids, "Pong-misc"]
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        out=out,
+        use_run_name_for_env=use_run_name_for_env,
+        **kwargs,
+    )
+
+
+if __name__ == "__main__":
+    # Comment out the experiment you are *not* plotting; leave exactly one ``plot_episodic_return`` call active.
+    # -------------------------------------------------------------------------
+
+    # (1) Breakout MinAtar — 3 algos (MoG / FFT / dqn), 3M-step sweep (no MinAtar_10M tag).
+    # plot_episodic_return(
+    #     project="Deep-CVI-Experiments",
+    #     entity=None,
+    #     required_tag=[],
+    #     algo_tags=["MoG", "FFT", "dqn"],
+    #     experiment_tag=None,
+    #     env_ids=["Breakout-MinAtar"],
+    #     use_run_name_for_env=True,
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     out="figures/breakout_3algo_3M_episodic_return.png",
+    #     grid_points=800,
+    #     max_runs=500,
+    #     smooth_window=41,
+    #     env_name="Breakout MinAtar",
+    # )
+
+    # (2) MinAtar 10M — one panel per game; tags: MinAtar_10M + MoG|dqn|C51|QR-DQN|IQN|FQF.
+    #     Set include_pong_misc=True to add the Pong-misc panel (5 columns); default is 4 MinAtar games only.
+    # plot_minatar_10m_grid(
+    #     project="Deep-CVI-Experiments",
+    #     entity=None,
+    #     experiment_tag="MinAtar_10M",
+    #     include_pong_misc=False,
+    #     use_run_name_for_env=True,
+    #     algo_tags=["MoG", "dqn", "C51", "QR-DQN", "IQN"],
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     out="figures/minatar_10m_episodic_return.png",
+    #     grid_points=800,
+    #     max_runs=2000,
+    #     smooth_window=41,
+    # )
+
+    #(3a) MinAtar 10M PQN — MoG / CQN / PQN (``MoG``, ``CQN``, ``PQN`` tags)
+    # plot_minatar_10m_mog_cqn_pqn(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     include_pong_misc=False,
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    # )
+
+    # (3b) Benchmark (MinAtar_10M) + legacy four-way PQN (MoG-PQN-stab / MoG-PQN / CQN / PQN)
+    # plot_minatar_10m_benchmark_and_pqn_compare(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     include_pong_misc=False,
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    # )
+    
+    plot_minatar_10m_mog_cqn_pqn(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        include_pong_misc=False,
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag="MinAtar_30M_PQN",
+        out="figures/minatar_30m_episodic_return_pqn_ctd_qtd_iqn.png",
+    )
+    
+    # plot_minatar_10m_mog_cqn_pqn(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     include_pong_misc=False,
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     experiment_tag="MinAtar_100M_PQN",
+    #     out="figures/minatar_100m_episodic_return_mog_cqn_pqn.png",
+    # )
