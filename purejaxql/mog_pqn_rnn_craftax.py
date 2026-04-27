@@ -163,8 +163,14 @@ def mog_cf_loss_single_network(
     dones: jnp.ndarray,
     omegas: jnp.ndarray,
     gamma: float,
+    is_divided_by_sigma_squared: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """One-step MoG CF loss; bootstrap from stop-gradient MoG at t+1 (same weights as PQN-RNN: no target net)."""
+    """One-step MoG CF loss; bootstrap from stop-gradient MoG at t+1 (same weights as PQN-RNN: no target net).
+
+    If ``is_divided_by_sigma_squared`` is true, the per-ω MSE is scaled by 1/ω² (with a small floor on
+    |ω|) to match a sample-based surrogate for ∫|φ(ω)−φ̂(ω)|²/ω² dω. The config key is
+    ``IS_DIVIDED_BY_SIGMA_SQUARED``; the weighting uses the CF frequency ω, not MoG component stds.
+    """
     sg = jax.lax.stop_gradient
     pi_tp1 = pi[1:]
     mu_tp1 = mu[1:]
@@ -206,8 +212,17 @@ def mog_cf_loss_single_network(
         online_phi, act[..., None, None], axis=-1
     ).squeeze(-1)
 
-    loss = jnp.mean(jnp.abs(online_phi_sel - td_target) ** 2)
-    cf_im = jnp.mean(jnp.abs(jnp.imag(online_phi_sel - td_target)))
+    err = online_phi_sel - td_target
+    err_squared = jnp.abs(err) ** 2
+    if is_divided_by_sigma_squared:
+        denominator_sigma_squared = 1.0 / jnp.maximum(omegas, 1e-8) ** 2
+        denominator_sigma_squared = denominator_sigma_squared[None, None, :]
+        err_squared = err_squared * denominator_sigma_squared
+    loss = jnp.mean(err_squared)
+    im = jnp.abs(jnp.imag(err))
+    if is_divided_by_sigma_squared:
+        im = im * denominator_sigma_squared
+    cf_im = jnp.mean(im)
     return loss, cf_im
 
 
@@ -473,6 +488,9 @@ def make_train(config: dict):
                             minibatch.done.astype(jnp.float32),
                             omegas,
                             float(config["GAMMA"]),
+                            bool(
+                                config.get("IS_DIVIDED_BY_SIGMA_SQUARED")
+                            ),
                         )
 
                         total_loss = cf_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 1.0) * lambda_loss

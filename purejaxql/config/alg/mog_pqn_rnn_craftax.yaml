@@ -32,6 +32,10 @@ LAMBDA: 0.5 # Q(λ) return mixing coefficient (same as pqn_rnn_craftax)
 # MoG-only — fused dual loss (see ``mog_pqn_rnn_craftax.py`` docstring)
 NUM_OMEGA_SAMPLES: 32
 OMEGA_MAX: 1.0
+
+# If true, CF MSE is weighted by 1/ω² (per sampled frequency ω), a sample-based
+# surrogate for ∫|φ(ω)−φ̂(ω)|²/ω² dω. (Name is historical; this is ω, not MoG σ.)
+IS_DIVIDED_BY_SIGMA_SQUARED: True
 NUM_COMPONENTS: 8
 AUX_MEAN_LOSS_WEIGHT: 1.0 # weight on TD(λ) loss relative to CF loss
 

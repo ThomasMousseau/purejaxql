@@ -277,7 +277,10 @@ def make_train(config: dict):
             bsz = s_obs.shape[0]
             bidx = jnp.arange(bsz)
             omegas = sample_frequencies(
-                omega_key, int(config["NUM_OMEGA_SAMPLES"]), float(config["OMEGA_MAX"])
+                omega_key,
+                int(config["NUM_OMEGA_SAMPLES"]),
+                float(config["OMEGA_MAX"]),
+                distribution=config.get("OMEGA_SAMPLING_DISTRIBUTION", "half_laplacian")
             )
 
             pi_n, mu_n, sig_n = network.apply(
