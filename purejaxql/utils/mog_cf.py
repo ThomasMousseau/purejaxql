@@ -10,6 +10,7 @@ follows this repo’s Flax + Hydra + vector-env layout.
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.special as jsp
 
 
 def build_mog_cf(pi, mu, sigma, omegas):
@@ -50,17 +51,57 @@ def mog_q_values(pi, mu):
     return jnp.sum(pi * mu, axis=-1)
 
 
-def sample_frequencies(key, num_samples, omega_max, scale=None):
-    """Sample ω from a truncated exponential (half-Laplacian) on (0, omega_max].
+def sample_frequencies(
+    key,
+    num_samples,
+    omega_max,
+    scale=None,
+    distribution="half_laplacian",
+    gaussian_mean=0.0,
+    gaussian_std=1.0,
+):
+    """Sample positive ω frequencies for CF losses.
 
-    Same sampling as the CleanRL CVI scripts: positive-only ω (conjugate symmetry)
-    and exponential weighting toward small ω (replaces explicit FFT frequency
-    weighting).
+    Supported distributions:
+      - ``half_laplacian``: truncated exponential on ``[0, omega_max]``.
+      - ``uniform``: uniform on ``[0, omega_max]``.
+      - ``half_gaussian``: absolute Gaussian ``|N(mean, std)|``, clipped to ``omega_max``.
+
+    Notes:
+      - ``half_laplacian`` remains the default for backward compatibility.
+      - Frequencies are always non-negative (conjugate symmetry in CF space).
     """
-    if scale is None:
-        scale = omega_max / 3.0
+    distribution = str(distribution).lower()
 
-    u = jax.random.uniform(key, shape=(num_samples,))
-    max_cdf = 1.0 - jnp.exp(-omega_max / scale)
-    omega = -scale * jnp.log(1.0 - u * max_cdf)
-    return omega
+    if distribution == "half_laplacian":
+        if scale is None:
+            scale = omega_max / 3.0
+        u = jax.random.uniform(key, shape=(num_samples,))
+        max_cdf = 1.0 - jnp.exp(-omega_max / scale)
+        return -scale * jnp.log(1.0 - u * max_cdf)
+
+    if distribution == "uniform":
+        return jax.random.uniform(
+            key, shape=(num_samples,), minval=0.0, maxval=omega_max
+        )
+
+    if distribution == "half_gaussian":
+        if gaussian_mean != 0.0:
+            raise ValueError(
+                "half_gaussian currently supports gaussian_mean=0.0 only."
+            )
+        if gaussian_std <= 0.0:
+            raise ValueError("gaussian_std must be > 0 for half_gaussian.")
+        # Truncated half-normal on [0, omega_max]:
+        # F(x) = erf(x / (sigma * sqrt(2))) for x >= 0.
+        # Inverse CDF sampling: x = sigma*sqrt(2)*erfinv(u * F(omega_max)).
+        u = jax.random.uniform(key, shape=(num_samples,))
+        cdf_max = jsp.erf(omega_max / (gaussian_std * jnp.sqrt(2.0)))
+        cdf_max = jnp.clip(cdf_max, 1e-8, 1.0 - 1e-8)
+        omega = gaussian_std * jnp.sqrt(2.0) * jsp.erfinv(u * cdf_max)
+        return jnp.clip(omega, 0.0, omega_max)
+
+    raise ValueError(
+        "Unknown distribution for sample_frequencies: "
+        f"{distribution}. Supported: half_laplacian, uniform, half_gaussian."
+    )

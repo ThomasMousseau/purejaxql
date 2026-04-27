@@ -59,6 +59,10 @@ def _algo_colors(algo_tags: list[str]) -> list[str]:
         "CTD_RNN": "ctd_rnn",
         "PQN_RNN": "pqn_rnn",
         "MOG_PQN_RNN": "mog_pqn_rnn",
+        # Sampling-distribution ablation tags (MoG-PQN MinAtar).
+        "HALF_LAPLACIAN": "mog",
+        "UNIFORM": "pqn",
+        "HALF_GAUSSIAN": "qtd",
     }
     return [algo_color(alias_map.get(tag, tag)) for tag in algo_tags]
 
@@ -336,6 +340,9 @@ def _draw_algo_curves_on_ax(
             "PQN": "PQN",
             "PQN_RNN": "PQN-RNN",
             "MOG_PQN_RNN": "MoG-PQN-RNN",
+            "HALF_LAPLACIAN": "Half-Laplacian",
+            "UNIFORM": "Uniform",
+            "HALF_GAUSSIAN": "Half-Gaussian",
         }
         label = label_map.get(algo_tag, algo_tag)
         c = colors[idx % len(colors)]
@@ -1072,6 +1079,56 @@ def plot_minatar_10m_grid(
     )
 
 
+def plot_minatar_sampling_distribution_ablation(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_MoG_Sampling_Distribution",
+    out: str = "figures/minatar_sampling_distribution_ablation.png",
+    env_ids: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 3000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Plot MinAtar MoG sampling-distribution ablation from W&B tags.
+
+    Expected run tags from ``slurm/slurm_minatar_sampling_distribution.sh``:
+    - ``MinAtar_MoG_Sampling_Distribution`` (experiment tag)
+    - one of ``HALF_LAPLACIAN``, ``UNIFORM``, ``HALF_GAUSSIAN``
+    - ``MoG`` and usually ``multi_seed``
+    """
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        required_tag=["MoG"],
+        algo_tags=["HALF_LAPLACIAN", "UNIFORM", "HALF_GAUSSIAN"],
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+    )
+
+
 if __name__ == "__main__":
     # Comment out the experiment you are *not* plotting; leave exactly one ``plot_episodic_return`` call active.
     # -------------------------------------------------------------------------
@@ -1121,6 +1178,16 @@ if __name__ == "__main__":
     #     experiment_tag="MinAtar_10M_PQN",
     #     out="figures/minatar_10m_episodic_return_pqn_ctd_qtd_iqn.png",
     # )
+
+
+    plot_minatar_sampling_distribution_ablation(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag="MinAtar_MoG_Sampling_Distribution",
+        out="figures/minatar_sampling_distribution_ablation.png",
+    )
     
     # plot_minatar_10m_mog_cqn_pqn(
     #     project="Deep-CVI-Experiments",
@@ -1142,11 +1209,11 @@ if __name__ == "__main__":
     #     out="figures/minatar_100m_episodic_return_mog_cqn_pqn.png",
     # )
     
-    plot_minatar_20m_td_lambda_aux_3exp(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag="MinAtar_20M_Td_Lambda",
-        out="figures/minatar_20m_td_lambda_aux_3exp.png",
-    )
+    # plot_minatar_20m_td_lambda_aux_3exp(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     experiment_tag="MinAtar_20M_Td_Lambda",
+    #     out="figures/minatar_20m_td_lambda_aux_3exp.png",
+    # )

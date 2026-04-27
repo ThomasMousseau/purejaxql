@@ -523,7 +523,7 @@ def make_panels_and_table(
                 zorder=st["zorder"],
                 label=MODEL_NAME[c],
             )
-        ax_phi.set_title("Re phi(t)" if i == 0 else "")
+        ax_phi.set_title("Re $\\varphi$" if i == 0 else "")
 
         ax_pdf.plot(
             x_np[mask],
@@ -585,7 +585,7 @@ def make_panels_and_table(
 
     handles, labels = axes[0, 3].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 0.01), frameon=False)
-    fig.suptitle("2-step MDP return fitting with CF loss: family-matched models win", y=0.995)
+    #fig.suptitle("2-step MDP return fitting with CF loss: family-matched models win", y=0.995)
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.28, hspace=0.35)
     fig.savefig(out_dir / "cauchy_mog_comparison_panels.pdf", bbox_inches="tight", pad_inches=0.1)
     fig.savefig(out_dir / "cauchy_mog_comparison_panels.png", dpi=300, bbox_inches="tight", pad_inches=0.1)

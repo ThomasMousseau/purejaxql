@@ -1025,7 +1025,7 @@ def _save_parseval_training_plot(
     ax.set_xlabel("Training step")
     ax.set_ylabel("Loss")
     ax.legend(frameon=False, fontsize=9)
-    fig.suptitle(f"Training ({tag})", y=1.02, fontsize=11)
+    # fig.suptitle(f"Training ({tag})", y=1.02, fontsize=11)
     fig.tight_layout()
     fig.savefig(png_path, dpi=300, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
