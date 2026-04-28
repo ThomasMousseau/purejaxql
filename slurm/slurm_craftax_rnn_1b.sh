@@ -84,10 +84,10 @@ HYDRA_COMMON=(
   "alg.ENV_NAME=${CRAFTAX_ENV_NAME}"
 )
 
-ALGO_EXTRA=("alg.LAMBDA=0.0")
+ALGO_EXTRA=("alg.LAMBDA=0.5")
 if [[ "${ALGO_IDX}" -le 3 ]]; then
   # Distributional variants only: CTD/QTD/IQN/MoG.
-  ALGO_EXTRA+=("alg.AUX_MEAN_LOSS_WEIGHT=0.0")
+  ALGO_EXTRA+=("alg.AUX_MEAN_LOSS_WEIGHT=1.0")
 fi
 
 case "${ALGO_IDX}" in

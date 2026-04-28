@@ -19,7 +19,5 @@ slurm/logs/
 
 checkpoints/
 
-figures/
-
 purejaxql/*.npz
 purejaxql/*.msgpack

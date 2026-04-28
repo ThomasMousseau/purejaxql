@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from itertools import islice
 
 import numpy as np
 from plot_colors import algo_color
@@ -173,7 +174,44 @@ def _step_candidates(step_metric: str) -> list[str]:
 def _load_series_any(
     run, *, metric_candidates: list[str], step_candidates: list[str]
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Try metric/step combinations in order; return first available series."""
+    """Try metric/step combinations in order; return first available series.
+
+    Performance note: fetch candidate columns once from W&B history instead of
+    issuing one API call per (metric, step) pair.
+    """
+    uniq_metrics = _unique_ordered(metric_candidates)
+    uniq_steps = _unique_ordered(step_candidates)
+    all_cols = _unique_ordered([*uniq_metrics, *uniq_steps])
+
+    df = None
+    try:
+        df = run.history(keys=all_cols, pandas=True)
+    except Exception:
+        df = None
+    if df is None or getattr(df, "empty", True):
+        try:
+            df = run.history(pandas=True)
+        except Exception:
+            df = None
+    if df is None or getattr(df, "empty", True):
+        return None
+
+    cols = set(df.columns)
+    for m in metric_candidates:
+        if m not in cols:
+            continue
+        for s in step_candidates:
+            if s not in cols:
+                continue
+            work = df[[s, m]].dropna()
+            if work.empty:
+                continue
+            steps = work[s].to_numpy(dtype=np.float64)
+            vals = work[m].to_numpy(dtype=np.float64)
+            order = np.argsort(steps)
+            return steps[order], vals[order]
+
+    # Keep old behavior as a fallback for edge cases.
     for m in metric_candidates:
         for s in step_candidates:
             series = _load_series(run, m, s)
@@ -441,7 +479,7 @@ def plot_episodic_return(
 
     api = wandb.Api()
     path = _wandb_path(entity, project)
-    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
 
     colors = _algo_colors(algo_tags)
     metric_title = _pretty_metric_label(metric)
@@ -1231,6 +1269,7 @@ if __name__ == "__main__":
     #     out="figures/minatar_100m_episodic_return_mog_cqn_pqn.png",
     # )
     
+    #! without the new mog weighted cf
     # plot_minatar_20m_td_lambda_aux_3exp(
     #     project="Deep-CVI-Experiments",
     #     entity="fatty_data",
@@ -1249,11 +1288,21 @@ if __name__ == "__main__":
     #     out="figures/minatar_sampling_distribution_ablation.png",
     # )
     
+    #! with the new mog weighted cf (takes a long time to run)
+    # plot_minatar_20m_td_lambda_aux_3exp(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+    #     out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog.png",
+    # )
+    
     plot_minatar_20m_td_lambda_aux_3exp(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        metric="charts/episodic_return",
+        metric="charts/grad_norm",
         step_metric="global_step",
         experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
-        out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog.png",
+        out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog_grad_norm.png",
     )
