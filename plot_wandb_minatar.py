@@ -556,7 +556,7 @@ def plot_minatar_20m_td_lambda_aux_3exp(
     *,
     project: str = "Deep-CVI-Experiments",
     entity: str | None = None,
-    experiment_tag: str = "MinAtar_20M_Td_Lambda",
+    experiment_tag: str | list[str] = "MinAtar_20M_Td_Lambda",
     out: str = "figures/minatar_20m_td_lambda_aux_3exp.png",
     env_ids: list[str] | None = None,
     algo_tags: list[str] | None = None,
@@ -575,6 +575,16 @@ def plot_minatar_20m_td_lambda_aux_3exp(
     - ``LAMBDA-0.0`` + ``AUX_MEAN_LOSS_WEIGHT-1.0``
     - ``LAMBDA-0.65`` + ``AUX_MEAN_LOSS_WEIGHT-1.0``
     """
+    if isinstance(experiment_tag, str):
+        experiment_tags = [experiment_tag]
+    else:
+        experiment_tags = [str(t) for t in experiment_tag if str(t).strip()]
+    if not experiment_tags:
+        raise ValueError("experiment_tag must contain at least one non-empty tag.")
+    primary_experiment_tag = experiment_tags[0]
+    weighted_cf_experiment_tag = next((t for t in experiment_tags[1:] if "WeightedCF" in t), None)
+    weighted_cf_algo_tag = "MoG-WeightedCF"
+
     if env_ids is None:
         env_ids = [
             "Asterix-MinAtar",
@@ -589,20 +599,23 @@ def plot_minatar_20m_td_lambda_aux_3exp(
         {
             "label": "Exp 1",
             "tag_label": "LAMBDA-0.0 | AUX_MEAN_LOSS_WEIGHT-0.0",
-            "required_tags": [experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"],
+            "required_tags": [primary_experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"],
         },
         {
             "label": "Exp 2",
             "tag_label": "LAMBDA-0.0 | AUX_MEAN_LOSS_WEIGHT-1.0",
-            "required_tags": [experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-1.0"],
+            "required_tags": [primary_experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-1.0"],
         },
         {
             "label": "Exp 3",
             "tag_label": "LAMBDA-0.65 | AUX_MEAN_LOSS_WEIGHT-1.0",
-            "required_tags": [experiment_tag, "LAMBDA-0.65", "AUX_MEAN_LOSS_WEIGHT-1.0"],
+            "required_tags": [primary_experiment_tag, "LAMBDA-0.65", "AUX_MEAN_LOSS_WEIGHT-1.0"],
         },
     ]
     exp_keys = [spec["label"] for spec in exp_specs]
+    algo_tags_plot = list(algo_tags)
+    if weighted_cf_experiment_tag and weighted_cf_algo_tag not in algo_tags_plot:
+        algo_tags_plot.append(weighted_cf_algo_tag)
 
     api = wandb.Api()
     path = _wandb_path(entity, project)
@@ -613,7 +626,11 @@ def plot_minatar_20m_td_lambda_aux_3exp(
     )
 
     for run in runs:
-        algo = _algo_group(run, algo_tags)
+        tags = set(run.tags or [])
+        if weighted_cf_experiment_tag and "MoG" in tags and weighted_cf_experiment_tag in tags:
+            algo = weighted_cf_algo_tag
+        else:
+            algo = _algo_group(run, algo_tags)
         if algo is None:
             continue
         env_id = _get_run_env_id(run, use_run_name=use_run_name_for_env)
@@ -627,8 +644,19 @@ def plot_minatar_20m_td_lambda_aux_3exp(
 
         # Exp 2 reuses PQN from Exp 1:
         # PQN does not use AUX_MEAN_LOSS_WEIGHT, so runs may only exist with AUX=0.0 tags.
-        if algo == "PQN" and _run_matches_required(run, [experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"]):
+        if algo == "PQN" and _run_matches_required(
+            run, [primary_experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"]
+        ):
             matched_exps.append("Exp 2")
+        if weighted_cf_experiment_tag and algo == weighted_cf_algo_tag:
+            matched_exps = []
+            for spec in exp_specs:
+                weighted_required = [
+                    weighted_cf_experiment_tag,
+                    *(t for t in spec["required_tags"] if t != primary_experiment_tag),
+                ]
+                if _run_matches_required(run, weighted_required):
+                    matched_exps.append(str(spec["label"]))
 
         matched_exps = _unique_ordered(matched_exps)
         if not matched_exps:
@@ -649,9 +677,12 @@ def plot_minatar_20m_td_lambda_aux_3exp(
             "No runs matched for MinAtar 20M TD(lambda)+AUX plot. Check tags and env ids."
         )
 
-    colors = _algo_colors(algo_tags)
+    colors = _algo_colors(algo_tags_plot)
+    if weighted_cf_experiment_tag and weighted_cf_algo_tag in algo_tags_plot:
+        colors[algo_tags_plot.index(weighted_cf_algo_tag)] = "#ff0000"
     label_map = {
-        "MoG": "MoG",
+        "MoG": "MoG-CQN",
+        weighted_cf_algo_tag: "MoG-CQN (Weighted CF)",
         "PQN": "PQN",
         "CTD": "CTD",
         "QTD": "QTD",
@@ -673,7 +704,7 @@ def plot_minatar_20m_td_lambda_aux_3exp(
 
     for exp_key in exp_keys:
         for env_id in env_ids:
-            for algo in algo_tags:
+            for algo in algo_tags_plot:
                 curves = by_exp_env_algo.get(exp_key, {}).get(env_id, {}).get(algo, [])
                 computed = _curve_mean_ci_on_grid(
                     curves,
@@ -716,7 +747,7 @@ def plot_minatar_20m_td_lambda_aux_3exp(
         for c, exp_key in enumerate(exp_keys):
             ax = axes[r][c]
             plotted_any = False
-            for idx, algo in enumerate(algo_tags):
+            for idx, algo in enumerate(algo_tags_plot):
                 computed = stats.get(exp_key, {}).get(env_id, {}).get(algo)
                 if computed is None:
                     continue
@@ -755,8 +786,9 @@ def plot_minatar_20m_td_lambda_aux_3exp(
                 ax.legend(fontsize=7, loc="best")
 
     metric_title = _pretty_metric_label(metric)
+    exp_title = ", ".join(experiment_tags)
     fig.suptitle(
-        f"{experiment_tag}: {metric_title} (shared x/y per environment row)",
+        f"{exp_title}: {metric_title} (shared x/y per environment row)",
         fontsize=12,
         y=1.01,
     )
@@ -1178,16 +1210,6 @@ if __name__ == "__main__":
     #     experiment_tag="MinAtar_10M_PQN",
     #     out="figures/minatar_10m_episodic_return_pqn_ctd_qtd_iqn.png",
     # )
-
-
-    plot_minatar_sampling_distribution_ablation(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag="MinAtar_MoG_Sampling_Distribution",
-        out="figures/minatar_sampling_distribution_ablation.png",
-    )
     
     # plot_minatar_10m_mog_cqn_pqn(
     #     project="Deep-CVI-Experiments",
@@ -1217,3 +1239,21 @@ if __name__ == "__main__":
     #     experiment_tag="MinAtar_20M_Td_Lambda",
     #     out="figures/minatar_20m_td_lambda_aux_3exp.png",
     # )
+    
+    # plot_minatar_sampling_distribution_ablation(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     experiment_tag="MinAtar_MoG_Sampling_Distribution",
+    #     out="figures/minatar_sampling_distribution_ablation.png",
+    # )
+    
+    plot_minatar_20m_td_lambda_aux_3exp(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+        out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog.png",
+    )

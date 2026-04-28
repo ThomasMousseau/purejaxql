@@ -3,6 +3,10 @@
 The rollout, LSTM trunk, BatchRenorm usage, optimizer, memory window, and
 TD(lambda) mean objective mirror ``pqn_rnn_craftax.py``. CTD/C51, QTD/QR-DQN,
 and IQN differ only in their distributional heads and Bellman losses.
+
+For CTD only, ``DIST_LOSS`` selects the distributional term: ``cross_entropy`` (C51 CE
+to the projected target) or ``weighted_cf`` (same target, MSE between characteristic
+functions with optional 1/ω² weighting; see ``purejaxql.utils.mog_cf``).
 """
 
 from __future__ import annotations
@@ -26,6 +30,11 @@ from omegaconf import OmegaConf
 
 from craftax.craftax_env import make_craftax_env_from_name
 from purejaxql.utils.batch_renorm import BatchRenorm
+from purejaxql.utils.mog_cf import (
+    categorical_cf_weighted_mse,
+    normalize_dist_loss_name,
+    sample_frequencies,
+)
 from purejaxql.utils.craftax_wrappers import (
     BatchEnvWrapper,
     LogWrapper,
@@ -423,6 +432,23 @@ def make_train(config: dict):
                 def _learn_phase(carry, minibatch):
                     train_state, rng = carry
                     rng, rng_tau = jax.random.split(rng)
+                    dist_kind = normalize_dist_loss_name(
+                        config.get("DIST_LOSS", "cross_entropy")
+                    )
+                    omega_block = None
+                    if config["ALG_VARIANT"] == "ctd" and dist_kind == "weighted_cf":
+                        rng, rng_omega = jax.random.split(rng)
+                        omega_block = sample_frequencies(
+                            rng_omega,
+                            int(config.get("NUM_OMEGA_SAMPLES", 32)),
+                            float(config.get("OMEGA_MAX", 1.0)),
+                            scale=config.get("OMEGA_SCALE"),
+                            distribution=str(
+                                config.get("FREQUENCY_DISTRIBUTION", "half_laplacian")
+                            ).lower(),
+                            gaussian_mean=float(config.get("GAUSSIAN_MEAN", 0.0)),
+                            gaussian_std=float(config.get("GAUSSIAN_STD", 1.0)),
+                        )
                     hs = jax.tree_util.tree_map(lambda x: x[0], minibatch.last_hs)
                     agent_in = (
                         minibatch.obs,
@@ -483,11 +509,21 @@ def make_train(config: dict):
                             chosen_logits = select_action_values(
                                 out["logits"][:-1], minibatch.action[:-1]
                             )
-                            dist_loss = -jnp.sum(
-                                jax.lax.stop_gradient(target_probs)
-                                * jax.nn.log_softmax(chosen_logits, axis=-1),
-                                axis=-1,
-                            ).mean()
+                            target_probs_sg = jax.lax.stop_gradient(target_probs)
+                            if dist_kind == "weighted_cf":
+                                dist_loss, _ = categorical_cf_weighted_mse(
+                                    chosen_logits,
+                                    target_probs_sg,
+                                    support,
+                                    omega_block,
+                                    bool(config.get("IS_DIVIDED_BY_SIGMA_SQUARED", True)),
+                                )
+                            else:
+                                dist_loss = -jnp.sum(
+                                    target_probs_sg
+                                    * jax.nn.log_softmax(chosen_logits, axis=-1),
+                                    axis=-1,
+                                ).mean()
                         else:
                             next_quantiles_all = jax.lax.stop_gradient(out["quantiles"][1:])
                             next_q = next_quantiles_all.mean(axis=-1)

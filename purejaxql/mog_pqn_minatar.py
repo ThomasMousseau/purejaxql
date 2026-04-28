@@ -321,9 +321,16 @@ def make_train(config: dict):
                 )
                 online_phi = build_mog_cf(online_pi, online_mu, online_sigma, omegas)
                 online_phi_sel = online_phi[bidx, :, s_actions]
-                cf_loss = jnp.mean(jnp.abs(online_phi_sel - td_target) ** 2)
                 residual = online_phi_sel - td_target
-                cf_im = jnp.mean(jnp.abs(jnp.imag(residual)))
+                err_squared = jnp.abs(residual) ** 2
+                imag_abs = jnp.abs(jnp.imag(residual))
+                if config.get("IS_DIVIDED_BY_OMEGA_SQUARED"):
+                    # CF Loss weighted by 1/ω², thus ∫|φ(ω)−φ̂(ω)|²/ω² dω.
+                    omega_weights = (1.0 / jnp.maximum(omegas, 1e-8) ** 2)[None, :]
+                    err_squared = err_squared * omega_weights
+                    imag_abs = imag_abs * omega_weights
+                cf_loss = jnp.mean(err_squared)
+                cf_im = jnp.mean(imag_abs)
                 q_all = mog_q_values(online_pi, online_mu)
                 chosen_action_qvals = jnp.take_along_axis(
                     q_all,

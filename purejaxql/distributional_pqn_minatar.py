@@ -10,6 +10,10 @@ swaps only the value head and distributional Bellman loss:
 All variants also optimize the PQN TD(lambda) mean loss, so greedy policy
 learning uses the same long-horizon scalar target as the PQN and MoG-PQN
 comparisons.
+
+For CTD only, ``DIST_LOSS`` is ``cross_entropy`` (default) or ``weighted_cf``
+(characteristic-function MSE vs the same projected Bellman target; optional 1/ω²
+weight). See ``purejaxql.utils.mog_cf``.
 """
 
 from __future__ import annotations
@@ -34,6 +38,12 @@ from flax.training.train_state import TrainState
 from flax.traverse_util import flatten_dict, unflatten_dict
 from gymnax.wrappers.purerl import LogWrapper
 from omegaconf import OmegaConf
+
+from purejaxql.utils.mog_cf import (
+    categorical_cf_weighted_mse,
+    normalize_dist_loss_name,
+    sample_frequencies,
+)
 
 
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
@@ -447,7 +457,25 @@ def make_train(config: dict):
                 def _learn_phase(carry, mb_and_target):
                     train_state, rng = carry
                     minibatch, lambda_target = mb_and_target
-                    rng, rng_tau, rng_target_tau = jax.random.split(rng, 3)
+                    rng, rng_tau = jax.random.split(rng)
+                    rng, rng_target_tau = jax.random.split(rng)
+                    dist_kind = normalize_dist_loss_name(
+                        config.get("DIST_LOSS", "cross_entropy")
+                    )
+                    omega_block = None
+                    if config["ALG_VARIANT"] == "ctd" and dist_kind == "weighted_cf":
+                        rng, rng_omega = jax.random.split(rng)
+                        omega_block = sample_frequencies(
+                            rng_omega,
+                            int(config.get("NUM_OMEGA_SAMPLES", 32)),
+                            float(config.get("OMEGA_MAX", 1.0)),
+                            scale=config.get("OMEGA_SCALE"),
+                            distribution=str(
+                                config.get("FREQUENCY_DISTRIBUTION", "half_laplacian")
+                            ).lower(),
+                            gaussian_mean=float(config.get("GAUSSIAN_MEAN", 0.0)),
+                            gaussian_std=float(config.get("GAUSSIAN_STD", 1.0)),
+                        )
 
                     def _loss_fn(params):
                         variables = {"params": params, "batch_stats": train_state.batch_stats}
@@ -501,10 +529,20 @@ def make_train(config: dict):
                                 )
                             )
                             chosen_logits = select_action_values(out["logits"], minibatch.action)
-                            dist_loss = -jnp.sum(
-                                target_probs * jax.nn.log_softmax(chosen_logits, axis=-1),
-                                axis=-1,
-                            ).mean()
+                            if dist_kind == "weighted_cf":
+                                dist_loss, _ = categorical_cf_weighted_mse(
+                                    chosen_logits,
+                                    target_probs,
+                                    support,
+                                    omega_block,
+                                    bool(config.get("IS_DIVIDED_BY_SIGMA_SQUARED", True)),
+                                )
+                            else:
+                                dist_loss = -jnp.sum(
+                                    target_probs
+                                    * jax.nn.log_softmax(chosen_logits, axis=-1),
+                                    axis=-1,
+                                ).mean()
                         else:
                             if variant == "iqn":
                                 bsz = minibatch.next_obs.shape[0]

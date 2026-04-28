@@ -1,5 +1,4 @@
-"""
-Mixture-of-Gaussians characteristic-function helpers (MoG–CF / “no-collapse” CVI).
+"""Characteristic-function helpers for MoG–CF / CVI and categorical (C51) CF losses.
 
 These are the same pure-JAX primitives used in the CleanRL single-file scripts
 (``old_cvi/cvi_utils_nocollapse_jax.py``): they are **environment-agnostic** and
@@ -11,6 +10,59 @@ follows this repo’s Flax + Hydra + vector-env layout.
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
+
+
+def normalize_dist_loss_name(name: str) -> str:
+    """Map YAML/config values for CTD ``DIST_LOSS`` to canonical strings."""
+    k = str(name).lower().replace("-", "_")
+    if k in ("ce",):
+        return "cross_entropy"
+    return k
+
+
+def build_categorical_cf(probs, support, omegas):
+    """Characteristic function of a categorical / discrete distribution on fixed atoms.
+
+    φ(ω) = Σ_a p_a · exp(i · ω · z_a) with atoms ``support[a] = z_a``.
+
+    Args:
+        probs:   (..., num_atoms) — typically softmax probabilities per row.
+        support: (num_atoms,) — atom locations (same convention as C51 ``support``).
+        omegas:  (num_omega,) — real frequencies (≥ 0).
+
+    Returns:
+        Complex array (..., num_omega).
+    """
+    phase = omegas[:, None] * support[None, :]
+    kernels = jnp.exp(1j * phase)
+    return jnp.einsum("...a,na->...n", probs, kernels, optimize=True)
+
+
+def categorical_cf_weighted_mse(
+    logits: jnp.ndarray,
+    target_probs: jnp.ndarray,
+    support: jnp.ndarray,
+    omegas: jnp.ndarray,
+    is_divided_by_sigma_squared: bool,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Mismatch of categorical CFs in MSE, optionally weighted by 1/ω² (cf. MoG CF loss).
+
+    ``target_probs`` should already be stop-gradient Bellman targets when used in RL.
+    """
+    pred_probs = jax.nn.softmax(logits, axis=-1)
+    sg = jax.lax.stop_gradient
+    phi_pred = build_categorical_cf(pred_probs, support, omegas)
+    phi_targ = build_categorical_cf(sg(target_probs), support, omegas)
+    err = phi_pred - phi_targ
+    err_squared = jnp.abs(err) ** 2
+    im = jnp.abs(jnp.imag(err))
+    if is_divided_by_sigma_squared:
+        w = (1.0 / jnp.maximum(omegas, 1e-8) ** 2).reshape(
+            (1,) * (err_squared.ndim - 1) + (omegas.shape[0],)
+        )
+        err_squared = err_squared * w
+        im = im * w
+    return jnp.mean(err_squared), jnp.mean(im)
 
 
 def build_mog_cf(pi, mu, sigma, omegas):

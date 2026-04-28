@@ -163,13 +163,13 @@ def mog_cf_loss_single_network(
     dones: jnp.ndarray,
     omegas: jnp.ndarray,
     gamma: float,
-    is_divided_by_sigma_squared: bool,
+    is_divided_by_omega_squared: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """One-step MoG CF loss; bootstrap from stop-gradient MoG at t+1 (same weights as PQN-RNN: no target net).
 
-    If ``is_divided_by_sigma_squared`` is true, the per-ω MSE is scaled by 1/ω² (with a small floor on
+    If ``is_divided_by_omega_squared`` is true, the per-ω MSE is scaled by 1/ω² (with a small floor on
     |ω|) to match a sample-based surrogate for ∫|φ(ω)−φ̂(ω)|²/ω² dω. The config key is
-    ``IS_DIVIDED_BY_SIGMA_SQUARED``; the weighting uses the CF frequency ω, not MoG component stds.
+    ``IS_DIVIDED_BY_OMEGA_SQUARED``; the weighting uses the CF frequency ω, not MoG component stds.
     """
     sg = jax.lax.stop_gradient
     pi_tp1 = pi[1:]
@@ -214,14 +214,15 @@ def mog_cf_loss_single_network(
 
     err = online_phi_sel - td_target
     err_squared = jnp.abs(err) ** 2
-    if is_divided_by_sigma_squared:
-        denominator_sigma_squared = 1.0 / jnp.maximum(omegas, 1e-8) ** 2
-        denominator_sigma_squared = denominator_sigma_squared[None, None, :]
-        err_squared = err_squared * denominator_sigma_squared
-    loss = jnp.mean(err_squared)
+    omega_weights = (1.0 / jnp.maximum(omegas, 1e-8) ** 2)[None, None, :]
+    if is_divided_by_omega_squared:
+        # CF Loss weighted by 1/ω², thus ∫|φ(ω)−φ̂(ω)|²/ω² dω.
+        err_squared = err_squared * omega_weights # (T, B, N_omega) * (1, 1, N_omega) -> (T, B, N_omega)
+    loss = jnp.mean(err_squared) # (T, B, N_omega) -> scalar
     im = jnp.abs(jnp.imag(err))
-    if is_divided_by_sigma_squared:
-        im = im * denominator_sigma_squared
+    if is_divided_by_omega_squared:
+        # CF Loss weighted by 1/ω², thus ∫|φ(ω)−φ̂(ω)|²/ω² dω.
+        im = im * omega_weights # (T, B, N_omega) * (1, 1, N_omega) -> (T, B, N_omega)
     cf_im = jnp.mean(im)
     return loss, cf_im
 
@@ -489,7 +490,7 @@ def make_train(config: dict):
                             omegas,
                             float(config["GAMMA"]),
                             bool(
-                                config.get("IS_DIVIDED_BY_SIGMA_SQUARED")
+                                config["IS_DIVIDED_BY_OMEGA_SQUARED"]
                             ),
                         )
 
