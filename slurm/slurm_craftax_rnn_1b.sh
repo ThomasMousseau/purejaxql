@@ -3,24 +3,22 @@
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks=1
-#SBATCH --array=0-14%15
+#SBATCH --array=0-8%9
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
 
 
 ################################################################################
-# Craftax 1B env steps: **CTD / QTD / IQN / MoG-PQN / PQN RNN** × **3 seeds** = **15 tasks**
-# CQN-RNN is omitted (assume those runs already exist).
+# Craftax 1B env steps: active subset **CTD / QTD / IQN** × **3 seeds** = **9 tasks**
+# Full 5-algorithm setup is preserved below; only ACTIVE_ALGO_INDICES controls launches.
 #
 # W&B: Craftax_1B_RNN_6algo + algorithm tags from purejaxql trainers.
 #
-# Mapping: TID 0–14 → ALGO_IDX = TID/3, SEED_IDX = TID%3
+# Mapping: TID 0–8 → ACTIVE_IDX = TID/3, SEED_IDX = TID%3
 #   TID 0,1,2   → CTD-RNN   seeds 0,1,2
 #   TID 3,4,5   → QTD-RNN   seeds 0,1,2
 #   TID 6,7,8   → IQN-RNN   seeds 0,1,2
-#   TID 9,10,11 → MoG-RNN   seeds 0,1,2
-#   TID 12,13,14 → PQN-RNN   seeds 0,1,2
 
 # Submit: sbatch slurm/slurm_craftax_rnn_1b.sh
 
@@ -37,12 +35,16 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-5ALG}"
+EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-checkpoint}"
 CRAFTAX_ENV_NAME="${CRAFTAX_ENV_NAME:-Craftax-Symbolic-v1}"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
-ALGO_IDX=$((TID / 3))
+ACTIVE_IDX=$((TID / 3))
 SEED_IDX=$((TID % 3))
+
+# Keep the full algorithm lists below; select which ones to launch here.
+ACTIVE_ALGO_INDICES=(0 1 2) # CTD, QTD, IQN
+ALGO_IDX="${ACTIVE_ALGO_INDICES[$ACTIVE_IDX]}"
 
 SEEDS=(0 1 2)
 SEED="${SEEDS[$SEED_IDX]}"
@@ -50,7 +52,7 @@ SEED="${SEEDS[$SEED_IDX]}"
 echo "=========================================="
 echo "Craftax 1B — CTD/QTD/IQN/MoG/PQN RNN (3 seeds each)"
 echo "=========================================="
-echo "Task:       ${TID} (algo_idx ${ALGO_IDX}, seed_idx ${SEED_IDX})"
+echo "Task:       ${TID} (active_idx ${ACTIVE_IDX}, algo_idx ${ALGO_IDX}, seed_idx ${SEED_IDX})"
 echo "Seed:       ${SEED}"
 echo "Env:        ${CRAFTAX_ENV_NAME}"
 echo "W&B tag:    ${EXPERIMENT_TAG}"
