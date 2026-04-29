@@ -1,24 +1,23 @@
 #!/bin/bash
-#SBATCH --job-name=craftax-1b-rnn-ctd-qtd-iqn-mog-pqn
+#SBATCH --job-name=craftax-1b-rnn-ctd-qtd
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks=1
-#SBATCH --array=0-8%9
+#SBATCH --array=0-3%4
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
 
 
 ################################################################################
-# Craftax 1B env steps: active subset **CTD / QTD / IQN** × **3 seeds** = **9 tasks**
+# Craftax 1B env steps: active subset **CTD / QTD** × **2 seeds** = **4 tasks**
 # Full 5-algorithm setup is preserved below; only ACTIVE_ALGO_INDICES controls launches.
 #
-# W&B: Craftax_1B_RNN_6algo + algorithm tags from purejaxql trainers.
+# W&B: Craftax_1B_RNN_4algo + algorithm tags from purejaxql trainers.
 #
-# Mapping: TID 0–8 → ACTIVE_IDX = TID/3, SEED_IDX = TID%3
-#   TID 0,1,2   → CTD-RNN   seeds 0,1,2
-#   TID 3,4,5   → QTD-RNN   seeds 0,1,2
-#   TID 6,7,8   → IQN-RNN   seeds 0,1,2
+# Mapping: TID 0–3 → ACTIVE_IDX = TID/2, SEED_IDX = TID%2
+#   TID 0,1   → CTD-RNN   seeds 3,4
+#   TID 2,3   → QTD-RNN   seeds 3,4
 
 # Submit: sbatch slurm/slurm_craftax_rnn_1b.sh
 
@@ -43,14 +42,14 @@ ACTIVE_IDX=$((TID / 3))
 SEED_IDX=$((TID % 3))
 
 # Keep the full algorithm lists below; select which ones to launch here.
-ACTIVE_ALGO_INDICES=(0 1 2) # CTD, QTD, IQN
+ACTIVE_ALGO_INDICES=(0 1) # CTD, QTD
 ALGO_IDX="${ACTIVE_ALGO_INDICES[$ACTIVE_IDX]}"
 
-SEEDS=(0 1 2)
+SEEDS=(3 4) # 0 1 2 3 4
 SEED="${SEEDS[$SEED_IDX]}"
 
 echo "=========================================="
-echo "Craftax 1B — CTD/QTD/IQN/MoG/PQN RNN (3 seeds each)"
+echo "Craftax 1B — CTD/QTD RNN (2 seeds each: 3 and 4)"
 echo "=========================================="
 echo "Task:       ${TID} (active_idx ${ACTIVE_IDX}, algo_idx ${ALGO_IDX}, seed_idx ${SEED_IDX})"
 echo "Seed:       ${SEED}"

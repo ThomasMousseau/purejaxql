@@ -432,6 +432,7 @@ def main() -> None:
     )
 
     #! Craftax 1B (using lambda=0.0 and aux mean loss weight=0.0)
+    #TODO: I will need to combine 3 seeds from Craftax-RNN-CTD-MoG-WeightedCF and 2 seeds from Craftax-1B-5ALG for MoG-CQN-RNN
     plot_craftax_rnn_compare_multi_source(
         project="Deep-CVI-Experiments",
         entity="fatty_data",

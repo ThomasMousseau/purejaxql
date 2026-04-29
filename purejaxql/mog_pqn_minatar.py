@@ -324,7 +324,7 @@ def make_train(config: dict):
                 residual = online_phi_sel - td_target
                 err_squared = jnp.abs(residual) ** 2
                 imag_abs = jnp.abs(jnp.imag(residual))
-                if config.get("IS_DIVIDED_BY_OMEGA_SQUARED"):
+                if config.get("IS_DIVIDED_BY_OMEGA_SQUARED", True):
                     # CF Loss weighted by 1/ω², thus ∫|φ(ω)−φ̂(ω)|²/ω² dω.
                     omega_weights = (1.0 / jnp.maximum(omegas, 1e-8) ** 2)[None, :]
                     err_squared = err_squared * omega_weights
