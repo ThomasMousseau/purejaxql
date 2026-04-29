@@ -990,7 +990,6 @@ def _save_parseval_training_plot(
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = output_dir / f"distribution_analysis_parseval_training_mog_cqn_seed{cfg.seed}"
     png_path = stem.with_suffix(".png")
-    pdf_path = stem.with_suffix(".pdf")
     csv_path = stem.with_suffix(".csv")
 
     steps = np.asarray(history["step"], dtype=np.float64)
@@ -1028,7 +1027,6 @@ def _save_parseval_training_plot(
     # fig.suptitle(f"Training ({tag})", y=1.02, fontsize=11)
     fig.tight_layout()
     fig.savefig(png_path, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
 
     fieldnames = (
@@ -1052,7 +1050,7 @@ def _save_parseval_training_plot(
                 }
             )
 
-    return {"png": str(png_path), "pdf": str(pdf_path), "csv": str(csv_path)}
+    return {"png": str(png_path), "csv": str(csv_path)}
 
 
 def save_msgpack(cfg: DAConfig, *params):
@@ -1075,6 +1073,7 @@ def save_msgpack(cfg: DAConfig, *params):
 
 # --- Figures (merged from plot_distribution_analysis.py) ---------------------------------
 PLOT_DA_TITLES = {"iqn": "IQN", "qtd": "QTD", "ctd": "CTD", "mog_cqn": "MoG-CQN"}
+PLOT_VISIBLE_ALGOS = ("qtd", "ctd", "mog_cqn")
 PLOT_ROW_LBL = {
     "phi_mse": r"$\varphi$-MSE $\downarrow$",
     "ks": r"KS $\downarrow$",
@@ -1107,9 +1106,8 @@ def _plot_minimal_style(ax) -> None:
     ax.set_axisbelow(True)
 
 
-def _plot_save_fig(fig, pdf_path: str, *, png_dpi: int = 300) -> None:
-    stem = os.path.splitext(pdf_path)[0]
-    fig.savefig(f"{stem}.pdf", format="pdf", bbox_inches="tight", pad_inches=0.12)
+def _plot_save_fig(fig, path: str, *, png_dpi: int = 300) -> None:
+    stem = os.path.splitext(path)[0]
     fig.savefig(f"{stem}.png", format="png", bbox_inches="tight", pad_inches=0.08, dpi=png_dpi)
 
 
@@ -1168,7 +1166,7 @@ def _plot_resolve_panel_key(data: dict[str, np.ndarray], candidates: tuple[str, 
 def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], row_keys: tuple[str, ...], path: str) -> None:
     import matplotlib.pyplot as plt
 
-    algos = [a for a in DA_ORDER if a in stderr]
+    algos = [a for a in PLOT_VISIBLE_ALGOS if a in stderr]
     if not algos:
         raise ValueError("No metric data found for plotting.")
     means = np.stack([stderr[a][0] for a in algos])
@@ -1221,21 +1219,18 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
 
     cf_series = (
         (("panel_phi_true",), "truth", "Truth"),
-        (("panel_phi_iqn",), "iqn", "IQN"),
         (("panel_phi_qtd", "panel_phi_qr_dqn"), "qtd", "QTD"),
         (("panel_phi_ctd", "panel_phi_c51"), "ctd", "CTD"),
         (("panel_phi_mog_cqn",), "mog_cqn", "MoG-CQN"),
     )
     pdf_series = (
         (("panel_pdf_true",), "truth", "Truth"),
-        (("panel_pdf_iqn",), "iqn", "IQN"),
         (("panel_pdf_qtd", "panel_pdf_qr_dqn"), "qtd", "QTD"),
         (("panel_pdf_ctd", "panel_pdf_c51"), "ctd", "CTD"),
         (("panel_pdf_mog_cqn",), "mog_cqn", "MoG-CQN"),
     )
     cdf_series = (
         (("panel_F_true",), "truth", "Truth"),
-        (("panel_F_iqn",), "iqn", "IQN"),
         (("panel_F_qtd", "panel_F_qr_dqn"), "qtd", "QTD"),
         (("panel_F_ctd", "panel_F_c51"), "ctd", "CTD"),
         (("panel_F_mog_cqn",), "mog_cqn", "MoG-CQN"),
@@ -1246,17 +1241,6 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
     for row, dist in enumerate(ACTION_DISTS):
         axd, axcf, axp, axc = axes[row]
         xmask = (xe >= dist.plot_x_min) & (xe <= dist.plot_x_max)
-        hist = mean_p.get("panel_hist_samples")
-        if hist is not None:
-            axd.hist(
-                hist[row],
-                bins=72,
-                range=(dist.plot_x_min, dist.plot_x_max),
-                density=True,
-                color="#E8E8E8",
-                edgecolor="#CCC",
-                lw=0.2,
-            )
         if "panel_pdf_true" in mean_p:
             y_truth = np.asarray(mean_p["panel_pdf_true"][row], dtype=np.float64)
             axd.plot(xe[xmask], y_truth[xmask], color=PLOT_COLORS["truth"], lw=PLOT_LW["truth"])
@@ -1314,10 +1298,104 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             legend = axc.get_legend_handles_labels()
 
     if legend:
-        fig.legend(*legend, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=5, frameon=False, fontsize=8)
+        fig.legend(*legend, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=4, frameon=False, fontsize=8)
     fig.suptitle("Distribution panels", y=0.995)
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.3, hspace=0.42)
     _plot_save_fig(fig, path)
+    plt.close(fig)
+
+
+def _plot_density_cdf_only_panels(
+    mean_p: dict[str, np.ndarray],
+    se_p: dict[str, np.ndarray],
+    xe: np.ndarray,
+    path_2x4: str,
+    path_4x2: str,
+) -> None:
+    def _title_case_name(name: str) -> str:
+        titled = name.title()
+        return titled.replace("Mog", "MoG")
+
+    import matplotlib.pyplot as plt
+
+    cdf_series = (
+        (("panel_F_true",), "truth", "Truth"),
+        (("panel_F_qtd", "panel_F_qr_dqn"), "qtd", "QTD"),
+        (("panel_F_ctd", "panel_F_c51"), "ctd", "CTD"),
+        (("panel_F_mog_cqn",), "mog_cqn", "MoG-CQN"),
+    )
+
+    # Layout A: 2x4 (top row Density, bottom row CDF)
+    fig, axes = plt.subplots(2, len(ACTION_DISTS), figsize=(13.2, 5.2))
+    density_truth_key = _plot_resolve_panel_key(mean_p, ("panel_pdf_true",))
+    if density_truth_key is None:
+        raise ValueError("Missing panel_pdf_true in payload; cannot draw Ground Truth density column.")
+    for col, dist in enumerate(ACTION_DISTS):
+        axd = axes[0, col]
+        axc = axes[1, col]
+        xmask = (xe >= dist.plot_x_min) & (xe <= dist.plot_x_max)
+
+        y_truth = np.asarray(mean_p[density_truth_key][col], dtype=np.float64)
+        axd.plot(xe[xmask], y_truth[xmask], color=PLOT_COLORS["truth"], lw=PLOT_LW["truth"], label="Truth")
+        _plot_minimal_style(axd)
+        axd.set_xlim(dist.plot_x_min, dist.plot_x_max)
+        axd.set_title(_title_case_name(dist.name), fontsize=9, fontweight="bold")
+
+        for candidates, ckey, label in cdf_series:
+            pkey = _plot_resolve_panel_key(mean_p, candidates)
+            if pkey is None:
+                continue
+            y = mean_p[pkey][col]
+            ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[col]
+            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
+            axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+        _plot_minimal_style(axc)
+        axc.set_xlim(dist.plot_x_min, dist.plot_x_max)
+
+    axes[0, 0].set_ylabel("Density", fontweight="bold")
+    axes[1, 0].set_ylabel("CDF", fontweight="bold")
+    axes[1, 0].legend(loc="lower right", frameon=False, fontsize=7, ncol=1)
+    fig.subplots_adjust(left=0.06, right=0.995, top=0.92, bottom=0.10, wspace=0.24, hspace=0.22)
+    _plot_save_fig(fig, path_2x4)
+    plt.close(fig)
+
+    # Layout B: 4x2 (rows by action, columns Density/CDF)
+    fig, axes = plt.subplots(len(ACTION_DISTS), 2, figsize=(7.4, 9.4))
+    axes[0, 0].set_title("Density", fontweight="bold")
+    axes[0, 1].set_title("CDF", fontweight="bold")
+    for row, dist in enumerate(ACTION_DISTS):
+        axd, axc = axes[row]
+        xmask = (xe >= dist.plot_x_min) & (xe <= dist.plot_x_max)
+
+        y_truth = np.asarray(mean_p[density_truth_key][row], dtype=np.float64)
+        axd.plot(xe[xmask], y_truth[xmask], color=PLOT_COLORS["truth"], lw=PLOT_LW["truth"], label="Truth")
+        _plot_minimal_style(axd)
+        axd.set_xlim(dist.plot_x_min, dist.plot_x_max)
+
+        for candidates, ckey, label in cdf_series:
+            pkey = _plot_resolve_panel_key(mean_p, candidates)
+            if pkey is None:
+                continue
+            y = mean_p[pkey][row]
+            ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
+            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
+            axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+        _plot_minimal_style(axc)
+        axc.set_xlim(dist.plot_x_min, dist.plot_x_max)
+
+        axd.text(
+            -0.34,
+            0.5,
+            _title_case_name(dist.name),
+            transform=axd.transAxes,
+            rotation=90,
+            ha="center",
+            va="center",
+            fontweight="bold",
+        )
+    axes[0, 1].legend(loc="lower right", frameon=False, fontsize=7, ncol=1)
+    fig.subplots_adjust(left=0.14, right=0.99, top=0.97, bottom=0.07, wspace=0.18, hspace=0.32)
+    _plot_save_fig(fig, path_4x2)
     plt.close(fig)
 
 
@@ -1420,19 +1498,28 @@ def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> 
     row_keys = _plot_resolve_row_keys(payloads)
     metric_stats, panel_mean, panel_se, t_eval, x_eval, omega_max = _plot_aggregate_payloads(payloads, row_keys)
 
-    metrics_pdf = str(output_dir / "distribution_analysis_metrics_combined.pdf")
-    panels_pdf = str(output_dir / "distribution_analysis_panels.pdf")
+    metrics_png_base = str(output_dir / "distribution_analysis_metrics_combined.png")
+    panels_png_base = str(output_dir / "distribution_analysis_panels.png")
+    panels_density_cdf_2x4_base = str(output_dir / "distribution_analysis_panels_density_cdf_2x4.png")
+    panels_density_cdf_4x2_base = str(output_dir / "distribution_analysis_panels_density_cdf_4x2.png")
     metrics_csv = str(output_dir / "distribution_analysis_metrics_combined.csv")
 
-    _plot_metric_tables(metric_stats, row_keys, metrics_pdf)
-    _plot_panels(panel_mean, panel_se, t_eval, x_eval, omega_max, panels_pdf)
+    _plot_metric_tables(metric_stats, row_keys, metrics_png_base)
+    _plot_panels(panel_mean, panel_se, t_eval, x_eval, omega_max, panels_png_base)
+    _plot_density_cdf_only_panels(
+        panel_mean,
+        panel_se,
+        x_eval,
+        panels_density_cdf_2x4_base,
+        panels_density_cdf_4x2_base,
+    )
     _plot_write_metrics_csv(metrics_csv, metric_stats, row_keys)
 
     return {
-        "metrics_pdf": metrics_pdf,
-        "metrics_png": os.path.splitext(metrics_pdf)[0] + ".png",
-        "panels_pdf": panels_pdf,
-        "panels_png": os.path.splitext(panels_pdf)[0] + ".png",
+        "metrics_png": os.path.splitext(metrics_png_base)[0] + ".png",
+        "panels_png": os.path.splitext(panels_png_base)[0] + ".png",
+        "panels_density_cdf_2x4_png": os.path.splitext(panels_density_cdf_2x4_base)[0] + ".png",
+        "panels_density_cdf_4x2_png": os.path.splitext(panels_density_cdf_4x2_base)[0] + ".png",
         "metrics_csv": metrics_csv,
     }
 
@@ -1584,7 +1671,6 @@ def train_and_export(
             for p in parseval_plot_paths.values():
                 wandb_mod.save(p, policy="now")
             wandb_mod.summary["parseval_train_plot_png"] = parseval_plot_paths["png"]
-            wandb_mod.summary["parseval_train_plot_pdf"] = parseval_plot_paths["pdf"]
             wandb_mod.summary["parseval_train_metrics_csv"] = parseval_plot_paths["csv"]
         _wandb_log_eval_metrics(pm, tag, step=cfg.total_steps)
         _save_eval_payload_to_wandb(payload)
@@ -1635,7 +1721,7 @@ def main(a=None):
         out = plot_distribution_analysis_from_wandb(tag, project=project, entity=entity, figures_dir=str(figures_root))
         print(f"Runs aggregated: {out['num_runs']}")
         print(f"Output folder: {out['output_dir']}")
-        for k in ("metrics_pdf", "metrics_png", "panels_pdf", "panels_png", "metrics_csv"):
+        for k in ("metrics_png", "panels_png", "metrics_csv"):
             if k in out:
                 print(f"  {k}: {out[k]}")
         return
@@ -1683,5 +1769,32 @@ def main(a=None):
                 wandb.finish()
 
 
+def replot(figures_dir: Path | None = None) -> None:
+    """Re-generate plots from the most recent local payload without retraining."""
+    figures_root = figures_dir if figures_dir is not None else (_REPO_ROOT / "figures" / "distribution_analysis")
+    run_dirs = sorted([p for p in figures_root.iterdir() if p.is_dir()], key=lambda p: p.name)
+    if not run_dirs:
+        raise FileNotFoundError(f"No run directories found under: {figures_root}")
+
+    latest_with_payload = None
+    for run_dir in reversed(run_dirs):
+        payload_path = run_dir / "distribution_analysis_payload.json"
+        if payload_path.exists():
+            latest_with_payload = (run_dir, payload_path)
+            break
+    if latest_with_payload is None:
+        raise FileNotFoundError(f"No distribution_analysis_payload.json found under: {figures_root}")
+
+    run_dir, payload_path = latest_with_payload
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    out = plot_distribution_analysis_local([payload], run_dir)
+    print(f"Replotted from payload: {payload_path}")
+    print(f"Output folder: {run_dir}")
+    for k in ("metrics_png", "panels_png", "metrics_csv"):
+        if k in out:
+            print(f"  {k}: {out[k]}")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    # main(sys.argv[1:])
+    replot()

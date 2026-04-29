@@ -473,7 +473,6 @@ def make_panels_and_table(
             fontweight="bold",
         )
     fig_tbl.suptitle("Per-action metrics (rows) across model families (columns)")
-    fig_tbl.savefig(out_dir / "cauchy_mog_comparison_metrics.pdf", bbox_inches="tight", pad_inches=0.1)
     fig_tbl.savefig(out_dir / "cauchy_mog_comparison_metrics.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig_tbl)
 
@@ -485,8 +484,6 @@ def make_panels_and_table(
         rng = TARGETS[r]["plot_range"]
         mask = (x_np >= rng[0]) & (x_np <= rng[1])
         ax_hist, ax_phi, ax_pdf, ax_cdf = axes[i]
-        samples = np.asarray(truth_data[r]["samples_panel"])
-        ax_hist.hist(samples, bins=80, range=rng, density=True, color="#efefef", edgecolor="#d0d0d0", lw=0.25)
         st_truth = MODEL_STYLE["truth"]
         ax_hist.plot(
             x_np[mask],
@@ -587,7 +584,6 @@ def make_panels_and_table(
     fig.legend(handles, labels, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 0.01), frameon=False)
     #fig.suptitle("2-step MDP return fitting with CF loss: family-matched models win", y=0.995)
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.28, hspace=0.35)
-    fig.savefig(out_dir / "cauchy_mog_comparison_panels.pdf", bbox_inches="tight", pad_inches=0.1)
     fig.savefig(out_dir / "cauchy_mog_comparison_panels.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
 
@@ -621,7 +617,6 @@ def make_panels_and_table(
     axes_curve[-1].legend(frameon=False, loc="upper right")
     fig_curve.suptitle("CF training curves")
     fig_curve.tight_layout()
-    fig_curve.savefig(out_dir / "cauchy_mog_comparison_training_curves.pdf", bbox_inches="tight", pad_inches=0.1)
     fig_curve.savefig(out_dir / "cauchy_mog_comparison_training_curves.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig_curve)
 
