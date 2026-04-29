@@ -13,7 +13,7 @@
 # all with **LAMBDA=0** and **AUX_MEAN_LOSS_WEIGHT=0** (pure distributional / CF term only for CTD and QTD; MoG and PQN use only CF loss when aux weight is 0).
 #
 # 4 algorithms × 2 seeds = **8 tasks**
-# Mapping: TID 0–7 → ALGO_IDX = TID/4, SEED_IDX = TID%2
+# Mapping: TID 0–7 → ALGO_IDX = TID/2, SEED_IDX = TID%2
 #   TID 0,1   → CTD-RNN (`+alg=ctd_rnn_craftax`)
 #   TID 2,3   → QTD-RNN (`+alg=qtd_rnn_craftax`)
 #   TID 4,5   → MoG-RNN (`+alg=mog_pqn_rnn_craftax`)
@@ -87,13 +87,13 @@ HYDRA_COMMON=(
 )
 
 case "${ALGO_IDX}" in
-  0|1)
+  0|1|2|3)
     srun uv run --no-sync python -m "${PY_MODULE[$ALGO_IDX]}" \
       "${HYDRA_COMMON[@]}" \
       "+alg=${HYDRA_ALG[$ALGO_IDX]}"
     ;;
   *)
-    echo "Invalid ALGO_IDX=${ALGO_IDX} (expected 0..1)" >&2
+    echo "Invalid ALGO_IDX=${ALGO_IDX} (expected 0..3)" >&2
     exit 1
     ;;
 esac

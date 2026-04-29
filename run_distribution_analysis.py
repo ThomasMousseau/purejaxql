@@ -71,7 +71,8 @@ def cf_l2_sq_over_omega2(phi_hat: jax.Array, phi_t: jax.Array, omega_grid: jax.A
     d = phi_hat - phi_t
     num = jnp.real(d) ** 2 + jnp.imag(d) ** 2
     den = jnp.maximum(jnp.square(jnp.abs(omega_grid)), jnp.float64(omega_eps**2))
-    return jnp.trapezoid(num / den, omega_grid)
+    # Parseval-Plancherel normalization for CDF L2: (1 / 2π) ∫ |Δφ(ω)|² / ω² dω.
+    return jnp.trapezoid(num / den, omega_grid) / (2.0 * jnp.pi)
 
 
 def ks_on_grid(f_hat: jax.Array, f_true: jax.Array) -> jax.Array:
@@ -1008,13 +1009,15 @@ def _save_parseval_training_plot(
     y_cf = np.clip(np.nan_to_num(np.nanmean(cf_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
     y_cr_std = np.nan_to_num(np.nanstd(cr_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
     y_cf_std = np.nan_to_num(np.nanstd(cf_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
-    line_color = algo_color("mog_cqn")
+    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10, "pdf.fonttype": 42, "ps.fonttype": 42})
+    cr_color = "#5E2B97"
+    cf_color = "#A06CD5"
 
-    fig, ax = plt.subplots(1, 1, figsize=(7.2, 4.2))
-    ax.fill_between(steps, np.clip(y_cr - y_cr_std, 0.0, None), y_cr + y_cr_std, color=line_color, alpha=0.18, lw=0)
-    ax.fill_between(steps, np.clip(y_cf - y_cf_std, 0.0, None), y_cf + y_cf_std, color=line_color, alpha=0.1, lw=0)
-    ax.plot(steps, y_cr, color=line_color, lw=2.0, label=r"Cramér $\ell_2^2$ (CDF)")
-    ax.plot(steps, y_cf, color=line_color, lw=2.0, ls="--", label=r"CF $\ell_2^2/\omega^2$")
+    fig, ax = plt.subplots(1, 1, figsize=(6.1, 3.5))
+    ax.fill_between(steps, np.clip(y_cr - y_cr_std, 0.0, None), y_cr + y_cr_std, color=cr_color, alpha=0.18, lw=0)
+    ax.fill_between(steps, np.clip(y_cf - y_cf_std, 0.0, None), y_cf + y_cf_std, color=cf_color, alpha=0.14, lw=0)
+    ax.plot(steps, y_cr, color=cr_color, lw=2.0, label=r"Cramer $L_2^2$ (CDF)")
+    ax.plot(steps, y_cf, color=cf_color, lw=2.0, ls="--", label=r"CF $L_2^2/\omega^2$")
     pos = np.concatenate([y_cr[np.isfinite(y_cr)], y_cf[np.isfinite(y_cf)]])
     pos = pos[pos > 0]
     if pos.size and float(np.nanmin(pos)) > 0:
@@ -1023,7 +1026,7 @@ def _save_parseval_training_plot(
     ax.set_title("Empirical Parseval-Plancherel Theorem Validation")
     ax.set_xlabel("Training step")
     ax.set_ylabel("Loss")
-    ax.legend(frameon=False, fontsize=9)
+    ax.legend(frameon=False, fontsize=8.5)
     # fig.suptitle(f"Training ({tag})", y=1.02, fontsize=11)
     fig.tight_layout()
     fig.savefig(png_path, dpi=300, bbox_inches="tight")

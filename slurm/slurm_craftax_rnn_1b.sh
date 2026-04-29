@@ -38,14 +38,22 @@ EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-checkpoint}"
 CRAFTAX_ENV_NAME="${CRAFTAX_ENV_NAME:-Craftax-Symbolic-v1}"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
-ACTIVE_IDX=$((TID / 3))
-SEED_IDX=$((TID % 3))
+ACTIVE_IDX=$((TID / 2))
+SEED_IDX=$((TID % 2))
 
 # Keep the full algorithm lists below; select which ones to launch here.
 ACTIVE_ALGO_INDICES=(0 1) # CTD, QTD
+if (( ACTIVE_IDX < 0 || ACTIVE_IDX >= ${#ACTIVE_ALGO_INDICES[@]} )); then
+  echo "Invalid ACTIVE_IDX=${ACTIVE_IDX} for TID=${TID} (expected 0..$((${#ACTIVE_ALGO_INDICES[@]} - 1)))" >&2
+  exit 1
+fi
 ALGO_IDX="${ACTIVE_ALGO_INDICES[$ACTIVE_IDX]}"
 
 SEEDS=(3 4) # 0 1 2 3 4
+if (( SEED_IDX < 0 || SEED_IDX >= ${#SEEDS[@]} )); then
+  echo "Invalid SEED_IDX=${SEED_IDX} for TID=${TID} (expected 0..$((${#SEEDS[@]} - 1)))" >&2
+  exit 1
+fi
 SEED="${SEEDS[$SEED_IDX]}"
 
 echo "=========================================="
