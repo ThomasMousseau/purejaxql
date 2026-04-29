@@ -12,4 +12,4 @@ x_max: 20.0
 num_x: 1200
 truth_samples: 300000
 panel_samples: 12000
-artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/cauchy_mog_comparison/2026-04-27_10:28:02"
+artifacts_dir: "/Users/thomasmousseau/Mila/purejaxql/figures/cauchy_mog_comparison/2026-04-29_12:13:04"

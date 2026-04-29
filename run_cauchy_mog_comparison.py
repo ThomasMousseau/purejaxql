@@ -283,8 +283,8 @@ MODEL_NAME = {"mog": "MoG", "moc": "MoCauchy", "mogamma": "MoGamma"}
 MODEL_COLOR = {"truth": "#222222", "mog": "#4ecb8d", "moc": "#ff8c00", "mogamma": "#f1c40f"}
 MODEL_STYLE = {
     "truth": {"lw": 3.2, "ls": "-", "alpha": 0.95, "zorder": 1},
-    "mog": {"lw": 2.5, "ls": "-", "alpha": 0.95, "zorder": 2},
-    "moc": {"lw": 2.0, "ls": "-", "alpha": 0.95, "zorder": 3},
+    "mog": {"lw": 1.55, "ls": "-", "alpha": 0.95, "zorder": 2},
+    "moc": {"lw": 1.45, "ls": "-", "alpha": 0.95, "zorder": 3},
     "mogamma": {"lw": 1.5, "ls": "-", "alpha": 0.95, "zorder": 4},
 }
 METRIC_ORDER = ("w1", "cramer_l2", "cf_l2_w")
@@ -419,6 +419,18 @@ def make_panels_and_table(
     truth_data: dict,
     fit_data: dict,
 ) -> None:
+    def _smooth_curve_np(y: np.ndarray, passes: int = 2) -> np.ndarray:
+        arr = np.asarray(y, dtype=np.float64)
+        if arr.ndim != 1 or arr.size < 5 or passes <= 0:
+            return arr
+        kernel = np.array([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float64)
+        kernel /= kernel.sum()
+        out = arr
+        for _ in range(passes):
+            padded = np.pad(out, (2, 2), mode="edge")
+            out = np.convolve(padded, kernel, mode="valid")
+        return out
+
     rows = list(TARGETS.keys())
     cols = list(MODEL_ORDER)
 
@@ -484,10 +496,16 @@ def make_panels_and_table(
         rng = TARGETS[r]["plot_range"]
         mask = (x_np >= rng[0]) & (x_np <= rng[1])
         ax_hist, ax_phi, ax_pdf, ax_cdf = axes[i]
+        top_model = {
+            "gaussian_action": "mog",
+            "cauchy_action": "moc",
+            "gamma_action": "mogamma",
+        }[r]
+        draw_order = [c for c in cols if c != top_model] + [top_model]
         st_truth = MODEL_STYLE["truth"]
         ax_hist.plot(
             x_np[mask],
-            np.asarray(truth_data[r]["pdf"])[mask],
+            _smooth_curve_np(np.asarray(truth_data[r]["pdf"]))[mask],
             color=MODEL_COLOR["truth"],
             lw=st_truth["lw"],
             ls=st_truth["ls"],
@@ -508,7 +526,7 @@ def make_panels_and_table(
             zorder=st_truth["zorder"],
             label="Truth",
         )
-        for c in cols:
+        for c in draw_order:
             st = MODEL_STYLE[c]
             ax_phi.plot(
                 t_np,
@@ -517,14 +535,14 @@ def make_panels_and_table(
                 lw=st["lw"],
                 ls=st["ls"],
                 alpha=st["alpha"],
-                zorder=st["zorder"],
+                zorder=6 if c == top_model else st["zorder"],
                 label=MODEL_NAME[c],
             )
         ax_phi.set_title("Re $\\varphi$" if i == 0 else "")
 
         ax_pdf.plot(
             x_np[mask],
-            np.asarray(truth_data[r]["pdf"])[mask],
+            _smooth_curve_np(np.asarray(truth_data[r]["pdf"]))[mask],
             color=MODEL_COLOR["truth"],
             lw=st_truth["lw"],
             ls=st_truth["ls"],
@@ -532,11 +550,11 @@ def make_panels_and_table(
             zorder=st_truth["zorder"],
             label="Truth",
         )
-        for c in cols:
+        for c in draw_order:
             st = MODEL_STYLE[c]
             ax_pdf.plot(
                 x_np[mask],
-                np.asarray(fit_data[r][c]["pdf"])[mask],
+                _smooth_curve_np(np.asarray(fit_data[r][c]["pdf"]))[mask],
                 color=MODEL_COLOR[c],
                 lw=st["lw"],
                 ls=st["ls"],
@@ -557,7 +575,7 @@ def make_panels_and_table(
             zorder=st_truth["zorder"],
             label="Truth",
         )
-        for c in cols:
+        for c in draw_order:
             st = MODEL_STYLE[c]
             ax_cdf.plot(
                 x_np[mask],
@@ -586,6 +604,147 @@ def make_panels_and_table(
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.28, hspace=0.35)
     fig.savefig(out_dir / "cauchy_mog_comparison_panels.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
+
+    # Extra compact panels: Density + Re phi only (2x4 and 4x2).
+    fig_2x4, axes_2x4 = plt.subplots(2, len(rows), figsize=(12.8, 5.1))
+    for col_i, r in enumerate(rows):
+        rng = TARGETS[r]["plot_range"]
+        mask = (x_np >= rng[0]) & (x_np <= rng[1])
+        ax_density = axes_2x4[0, col_i]
+        ax_phi = axes_2x4[1, col_i]
+        top_model = {
+            "gaussian_action": "mog",
+            "cauchy_action": "moc",
+            "gamma_action": "mogamma",
+        }[r]
+        draw_order = [c for c in cols if c != top_model] + [top_model]
+        st_truth = MODEL_STYLE["truth"]
+
+        ax_density.plot(
+            x_np[mask],
+            _smooth_curve_np(np.asarray(truth_data[r]["pdf"]))[mask],
+            color=MODEL_COLOR["truth"],
+            lw=st_truth["lw"],
+            ls=st_truth["ls"],
+            alpha=st_truth["alpha"],
+            zorder=st_truth["zorder"],
+            label="Truth",
+        )
+        ax_density.set_title(r.replace("_action", "").replace("_", " ").title(), fontsize=9, fontweight="bold")
+        ax_density.set_xlim(*rng)
+        ax_density.spines["top"].set_visible(False)
+        ax_density.spines["right"].set_visible(False)
+        ax_density.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
+        ax_density.set_axisbelow(True)
+
+        ax_phi.plot(
+            t_np,
+            np.real(np.asarray(truth_data[r]["phi"])),
+            color=MODEL_COLOR["truth"],
+            lw=st_truth["lw"],
+            ls=st_truth["ls"],
+            alpha=st_truth["alpha"],
+            zorder=st_truth["zorder"],
+            label="Truth",
+        )
+        for c in draw_order:
+            st = MODEL_STYLE[c]
+            ax_phi.plot(
+                t_np,
+                np.real(np.asarray(fit_data[r][c]["phi"])),
+                color=MODEL_COLOR[c],
+                lw=st["lw"],
+                ls=st["ls"],
+                alpha=st["alpha"],
+                zorder=6 if c == top_model else st["zorder"],
+                label=MODEL_NAME[c],
+            )
+        ax_phi.set_xlim(t_np.min(), t_np.max())
+        ax_phi.spines["top"].set_visible(False)
+        ax_phi.spines["right"].set_visible(False)
+        ax_phi.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
+        ax_phi.set_axisbelow(True)
+
+    axes_2x4[0, 0].set_ylabel("Density", fontweight="bold")
+    axes_2x4[1, 0].set_ylabel(r"Re $\varphi$", fontweight="bold")
+    axes_2x4[1, 0].legend(loc="lower right", frameon=False, fontsize=7, ncol=1)
+    fig_2x4.subplots_adjust(left=0.07, right=0.995, top=0.92, bottom=0.10, wspace=0.22, hspace=0.23)
+    fig_2x4.savefig(out_dir / "cauchy_mog_comparison_panels_density_rephi_2x4.png", dpi=300, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig_2x4)
+
+    fig_4x2, axes_4x2 = plt.subplots(len(rows), 2, figsize=(7.5, 8.4))
+    axes_4x2[0, 0].set_title("Density", fontweight="bold")
+    axes_4x2[0, 1].set_title(r"Re $\varphi$", fontweight="bold")
+    for row_i, r in enumerate(rows):
+        rng = TARGETS[r]["plot_range"]
+        mask = (x_np >= rng[0]) & (x_np <= rng[1])
+        ax_density, ax_phi = axes_4x2[row_i]
+        top_model = {
+            "gaussian_action": "mog",
+            "cauchy_action": "moc",
+            "gamma_action": "mogamma",
+        }[r]
+        draw_order = [c for c in cols if c != top_model] + [top_model]
+        st_truth = MODEL_STYLE["truth"]
+
+        ax_density.plot(
+            x_np[mask],
+            _smooth_curve_np(np.asarray(truth_data[r]["pdf"]))[mask],
+            color=MODEL_COLOR["truth"],
+            lw=st_truth["lw"],
+            ls=st_truth["ls"],
+            alpha=st_truth["alpha"],
+            zorder=st_truth["zorder"],
+            label="Truth",
+        )
+        ax_density.set_xlim(*rng)
+        ax_density.spines["top"].set_visible(False)
+        ax_density.spines["right"].set_visible(False)
+        ax_density.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
+        ax_density.set_axisbelow(True)
+
+        ax_phi.plot(
+            t_np,
+            np.real(np.asarray(truth_data[r]["phi"])),
+            color=MODEL_COLOR["truth"],
+            lw=st_truth["lw"],
+            ls=st_truth["ls"],
+            alpha=st_truth["alpha"],
+            zorder=st_truth["zorder"],
+            label="Truth",
+        )
+        for c in draw_order:
+            st = MODEL_STYLE[c]
+            ax_phi.plot(
+                t_np,
+                np.real(np.asarray(fit_data[r][c]["phi"])),
+                color=MODEL_COLOR[c],
+                lw=st["lw"],
+                ls=st["ls"],
+                alpha=st["alpha"],
+                zorder=6 if c == top_model else st["zorder"],
+                label=MODEL_NAME[c],
+            )
+        ax_phi.set_xlim(t_np.min(), t_np.max())
+        ax_phi.spines["top"].set_visible(False)
+        ax_phi.spines["right"].set_visible(False)
+        ax_phi.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
+        ax_phi.set_axisbelow(True)
+        ax_density.text(
+            -0.34,
+            0.5,
+            r.replace("_action", "").replace("_", " ").title(),
+            transform=ax_density.transAxes,
+            rotation=90,
+            ha="center",
+            va="center",
+            fontweight="bold",
+        )
+
+    axes_4x2[0, 1].legend(loc="lower right", frameon=False, fontsize=7, ncol=1)
+    fig_4x2.subplots_adjust(left=0.15, right=0.99, top=0.96, bottom=0.08, wspace=0.18, hspace=0.28)
+    fig_4x2.savefig(out_dir / "cauchy_mog_comparison_panels_density_rephi_4x2.png", dpi=300, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig_4x2)
 
     fig_curve, axes_curve = plt.subplots(1, len(rows), figsize=(4.4 * len(rows), 3.3))
     if len(rows) == 1:
