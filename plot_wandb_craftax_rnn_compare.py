@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from itertools import islice
+from pathlib import Path
 
 import numpy as np
 from plot_colors import algo_color
@@ -44,7 +46,7 @@ try:
 except ImportError as e:
     raise SystemExit("Please install wandb: pip install wandb") from e
 
-from old_cvi.plot_wandb_minatar import (
+from plot_wandb_minatar import (
     _interp_on_grid,
     _run_matches_required,
     _smooth_1d,
@@ -69,12 +71,39 @@ ALGO_LINE: dict[str, str] = {
 }
 
 ALGO_LABELS: dict[str, str] = {
-    "MOG_PQN_RNN": "MOG-CQN-RNN",
+    "MOG_PQN_RNN": "MoG-CQN-RNN",
     "PQN_RNN": "PQN-RNN",
     "IQN_RNN": "IQN-RNN",
     "QTD_RNN": "QTD-RNN",
     "CTD_RNN": "CTD-RNN",
 }
+
+
+def _pretty_metric_label(metric: str) -> str:
+    metric_label_map: dict[str, str] = {
+        "charts/episodic_return": "Episodic Return",
+        "charts/episode_return": "Episode Return",
+        "episodic_return": "Episodic Return",
+        "returned_episode_returns": "Episodic Return",
+        "charts/grad_norm": "Gradient Norm",
+        "grad_norm": "Gradient Norm",
+    }
+    if metric in metric_label_map:
+        return metric_label_map[metric]
+    tail = metric.split("/")[-1]
+    return tail.replace("_", " ").strip().title()
+
+
+def _pretty_step_label(step_metric: str) -> str:
+    step_label_map: dict[str, str] = {
+        "global_step": "Environment Steps",
+        "env_step": "Environment Steps",
+        "update_steps": "Update Steps",
+        "_step": "Logging Step",
+    }
+    if step_metric in step_label_map:
+        return step_label_map[step_metric]
+    return step_metric.replace("_", " ").strip().title()
 
 
 def _algo_group(run, algo_tags: list[str]) -> str | None:
@@ -110,11 +139,12 @@ def plot_craftax_rnn_compare(
     max_runs: int,
     smooth_window: int,
     env_name_filter: str | None,
+    display_titles: bool = True,
 ) -> None:
     required = [experiment_tag]
     api = wandb.Api()
     path = _wandb_path(entity, project)
-    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
 
     by_algo: dict[str, list] = defaultdict(list)
     for run in runs:
@@ -147,58 +177,82 @@ def plot_craftax_rnn_compare(
     if missing:
         print(f"Warning: no runs for algo tags: {missing}")
 
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5.0))
-    ymax_track = -np.inf
-    ymin_track = np.inf
+    def _title_variant_path(path: str) -> str:
+        p = Path(path)
+        return str(p.with_name(f"{p.stem}_with_titles{p.suffix}"))
 
-    for algo_tag in algo_tags:
-        curves = by_algo.get(algo_tag, [])
-        if not curves:
-            continue
-        all_steps = np.concatenate([c[0] for c in curves])
-        s_min, s_max = np.nanmin(all_steps), np.nanmax(all_steps)
-        if not np.isfinite(s_min) or not np.isfinite(s_max) or s_max <= s_min:
-            continue
-        grid = np.linspace(s_min, s_max, grid_points)
-        mat = _interp_on_grid(curves, grid)
-        n_per_step = np.sum(np.isfinite(mat), axis=0)
-        std_valid = n_per_step >= 2
-        mean = np.nanmean(mat, axis=0)
-        std = np.nanstd(mat, axis=0)
-        std[~std_valid] = np.nan
+    def _seed_summary_text() -> str:
+        parts: list[str] = []
+        for algo_tag in algo_tags:
+            curves = by_algo.get(algo_tag, [])
+            if not curves:
+                continue
+            parts.append(f"{ALGO_LABELS.get(algo_tag, algo_tag)}: n={len(curves)}")
+        return "; ".join(parts)
 
-        if smooth_window and smooth_window > 1:
-            mean = _smooth_1d(mean, smooth_window)
-            std = _smooth_1d(std, smooth_window)
+    def _render_single(output_path: str, *, include_titles: bool) -> None:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 5.0))
+        ymax_track = -np.inf
+        ymin_track = np.inf
+
+        for algo_tag in algo_tags:
+            curves = by_algo.get(algo_tag, [])
+            if not curves:
+                continue
+            all_steps = np.concatenate([c[0] for c in curves])
+            s_min, s_max = np.nanmin(all_steps), np.nanmax(all_steps)
+            if not np.isfinite(s_min) or not np.isfinite(s_max) or s_max <= s_min:
+                continue
+            grid = np.linspace(s_min, s_max, grid_points)
+            mat = _interp_on_grid(curves, grid)
+            n_per_step = np.sum(np.isfinite(mat), axis=0)
+            std_valid = n_per_step >= 2
+            mean = np.nanmean(mat, axis=0)
+            std = np.nanstd(mat, axis=0)
             std[~std_valid] = np.nan
 
-        lower, upper = _band(mean, std, n_per_step)
-        ymax_track = max(ymax_track, float(np.nanmax(upper)))
-        ymin_track = min(ymin_track, float(np.nanmin(lower)))
+            if smooth_window and smooth_window > 1:
+                mean = _smooth_1d(mean, smooth_window)
+                std = _smooth_1d(std, smooth_window)
+                std[~std_valid] = np.nan
 
-        fill_c = ALGO_FILL.get(algo_tag, "#444444")
-        line_c = ALGO_LINE.get(algo_tag, fill_c)
-        label = ALGO_LABELS.get(algo_tag, algo_tag)
-        ax.plot(grid, mean, color=line_c, linewidth=2.0, label=f"{label} (n={len(curves)})")
-        ax.fill_between(grid, lower, upper, color=fill_c, alpha=0.28)
+            lower, upper = _band(mean, std, n_per_step)
+            ymax_track = max(ymax_track, float(np.nanmax(upper)))
+            ymin_track = min(ymin_track, float(np.nanmin(lower)))
 
-    ax.set_xlabel(step_metric)
-    ax.set_ylabel(metric)
-    ax.set_title(
-        f"{experiment_tag} — mean ± 95% CI over seeds (smoothing window={smooth_window})",
-        fontsize=11,
-    )
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    if np.isfinite(ymax_track) and np.isfinite(ymin_track):
-        pad = 0.08 * max(ymax_track - ymin_track, 1e-6)
-        ax.set_ylim(bottom=max(0.0, ymin_track - pad), top=ymax_track + pad)
+            fill_c = ALGO_FILL.get(algo_tag, "#444444")
+            line_c = ALGO_LINE.get(algo_tag, fill_c)
+            label = ALGO_LABELS.get(algo_tag, algo_tag)
+            ax.plot(grid, mean, color=line_c, linewidth=2.0, label=label)
+            ax.fill_between(grid, lower, upper, color=fill_c, alpha=0.28)
 
-    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Wrote {out}")
+        ax.set_xlabel(_pretty_step_label(step_metric))
+        ax.set_ylabel(_pretty_metric_label(metric))
+        if include_titles:
+            metric_title = _pretty_metric_label(metric)
+            seed_summary = _seed_summary_text() or "no matched runs"
+            env_txt = env_name_filter if env_name_filter else "all environments"
+            ax.set_title(
+                f"{experiment_tag} | env={env_txt} | metric={metric_title} | shaded=95% CI | {seed_summary}",
+                fontsize=10,
+            )
+        else:
+            ax.set_title("Craftax 1B", fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        if np.isfinite(ymax_track) and np.isfinite(ymin_track):
+            pad = 0.08 * max(ymax_track - ymin_track, 1e-6)
+            ax.set_ylim(bottom=max(0.0, ymin_track - pad), top=ymax_track + pad)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {output_path}")
+
+    _render_single(out, include_titles=display_titles)
+    if not display_titles:
+        _render_single(_title_variant_path(out), include_titles=True)
 
 
 def plot_craftax_rnn_compare_multi_source(
@@ -213,6 +267,7 @@ def plot_craftax_rnn_compare_multi_source(
     max_runs: int,
     smooth_window: int,
     env_name_filter: str | None,
+    display_titles: bool = True,
 ) -> None:
     """
     Plot compare curves when the same algo tag should appear multiple times
@@ -228,7 +283,7 @@ def plot_craftax_rnn_compare_multi_source(
     """
     api = wandb.Api()
     path = _wandb_path(entity, project)
-    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
 
     by_name: dict[str, list] = defaultdict(list)
     for group in groups:
@@ -265,136 +320,143 @@ def plot_craftax_rnn_compare_multi_source(
     if missing:
         print(f"Warning: no runs for groups: {missing}")
 
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5.0))
-    ymax_track = -np.inf
-    ymin_track = np.inf
+    def _title_variant_path(path: str) -> str:
+        p = Path(path)
+        return str(p.with_name(f"{p.stem}_with_titles{p.suffix}"))
 
-    for group in groups:
-        name = group["name"]
-        algo_tag = group["algo_tag"]
-        curves = by_name.get(name, [])
-        if not curves:
-            continue
-        all_steps = np.concatenate([c[0] for c in curves])
-        s_min, s_max = np.nanmin(all_steps), np.nanmax(all_steps)
-        if not np.isfinite(s_min) or not np.isfinite(s_max) or s_max <= s_min:
-            continue
-        grid = np.linspace(s_min, s_max, grid_points)
-        mat = _interp_on_grid(curves, grid)
-        n_per_step = np.sum(np.isfinite(mat), axis=0)
-        std_valid = n_per_step >= 2
-        mean = np.nanmean(mat, axis=0)
-        std = np.nanstd(mat, axis=0)
-        std[~std_valid] = np.nan
+    def _group_seed_summary_text() -> str:
+        parts: list[str] = []
+        for group in groups:
+            name = group["name"]
+            algo_tag = group["algo_tag"]
+            default_label = ALGO_LABELS.get(algo_tag, algo_tag)
+            label = group.get("label", default_label)
+            n = len(by_name.get(name, []))
+            if n > 0:
+                parts.append(f"{label}: n={n}")
+        return "; ".join(parts)
 
-        if smooth_window and smooth_window > 1:
-            mean = _smooth_1d(mean, smooth_window)
-            std = _smooth_1d(std, smooth_window)
+    def _render_single(output_path: str, *, include_titles: bool) -> None:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 5.0))
+        ymax_track = -np.inf
+        ymin_track = np.inf
+
+        for group in groups:
+            name = group["name"]
+            algo_tag = group["algo_tag"]
+            curves = by_name.get(name, [])
+            if not curves:
+                continue
+            all_steps = np.concatenate([c[0] for c in curves])
+            s_min, s_max = np.nanmin(all_steps), np.nanmax(all_steps)
+            if not np.isfinite(s_min) or not np.isfinite(s_max) or s_max <= s_min:
+                continue
+            grid = np.linspace(s_min, s_max, grid_points)
+            mat = _interp_on_grid(curves, grid)
+            n_per_step = np.sum(np.isfinite(mat), axis=0)
+            std_valid = n_per_step >= 2
+            mean = np.nanmean(mat, axis=0)
+            std = np.nanstd(mat, axis=0)
             std[~std_valid] = np.nan
 
-        lower, upper = _band(mean, std, n_per_step)
-        ymax_track = max(ymax_track, float(np.nanmax(upper)))
-        ymin_track = min(ymin_track, float(np.nanmin(lower)))
+            if smooth_window and smooth_window > 1:
+                mean = _smooth_1d(mean, smooth_window)
+                std = _smooth_1d(std, smooth_window)
+                std[~std_valid] = np.nan
 
-        fill_c = ALGO_FILL.get(algo_tag, "#444444")
-        line_c = ALGO_LINE.get(algo_tag, fill_c)
-        default_label = ALGO_LABELS.get(algo_tag, algo_tag)
-        label = group.get("label", default_label)
-        linestyle = group.get("linestyle", "-")
-        ax.plot(
-            grid,
-            mean,
-            color=line_c,
-            linewidth=2.0,
-            linestyle=linestyle,
-            label=f"{label} (n={len(curves)})",
-        )
-        ax.fill_between(grid, lower, upper, color=fill_c, alpha=0.22)
+            lower, upper = _band(mean, std, n_per_step)
+            ymax_track = max(ymax_track, float(np.nanmax(upper)))
+            ymin_track = min(ymin_track, float(np.nanmin(lower)))
 
-    ax.set_xlabel(step_metric)
-    ax.set_ylabel(metric)
-    ax.set_title(
-        f"Craftax RNN compare (2 experiment tags) — mean +/- 95% CI (smoothing window={smooth_window})",
-        fontsize=11,
-    )
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    if np.isfinite(ymax_track) and np.isfinite(ymin_track):
-        pad = 0.08 * max(ymax_track - ymin_track, 1e-6)
-        ax.set_ylim(bottom=max(0.0, ymin_track - pad), top=ymax_track + pad)
+            fill_c = ALGO_FILL.get(algo_tag, "#444444")
+            line_c = ALGO_LINE.get(algo_tag, fill_c)
+            default_label = ALGO_LABELS.get(algo_tag, algo_tag)
+            label = group.get("label", default_label)
+            linestyle = group.get("linestyle", "-")
+            ax.plot(
+                grid,
+                mean,
+                color=line_c,
+                linewidth=2.0,
+                linestyle=linestyle,
+                label=label,
+            )
+            ax.fill_between(grid, lower, upper, color=fill_c, alpha=0.22)
 
-    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Wrote {out}")
+        ax.set_xlabel(_pretty_step_label(step_metric))
+        ax.set_ylabel(_pretty_metric_label(metric))
+        if include_titles:
+            metric_title = _pretty_metric_label(metric)
+            seed_summary = _group_seed_summary_text() or "no matched runs"
+            tags = ", ".join(sorted({g["experiment_tag"] for g in groups}))
+            env_txt = env_name_filter if env_name_filter else "all environments"
+            ax.set_title(
+                f"{tags} | env={env_txt} | metric={metric_title} | shaded=95% CI | {seed_summary}",
+                fontsize=10,
+            )
+        else:
+            ax.set_title("Craftax 1B", fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        if np.isfinite(ymax_track) and np.isfinite(ymin_track):
+            pad = 0.08 * max(ymax_track - ymin_track, 1e-6)
+            ax.set_ylim(bottom=max(0.0, ymin_track - pad), top=ymax_track + pad)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {output_path}")
+
+    _render_single(out, include_titles=display_titles)
+    if not display_titles:
+        _render_single(_title_variant_path(out), include_titles=True)
 
 
 def main() -> None:
     
-    # !Craftax 1B RNN baseline compare.
-    # plot_craftax_rnn_compare(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     experiment_tag="Craftax-1B-checkpoint",
-    #     algo_tags=["MOG_PQN_RNN", "PQN_RNN"],
-    #     metric="returned_episode_returns",
-    #     step_metric="env_step",
-    #     out="figures/craftax_1b_rnn_5algo_compare.png",
-    #     grid_points=800,
-    #     max_runs=5000,
-    #     smooth_window=51,
-    #     env_name_filter=None,
-    # )
-
-    # !Craftax 1B RNN no TD-lambda ablation.
-    plot_craftax_rnn_compare_multi_source(
+    #! Craftax 1B (using lambda=0.5 and aux mean loss weight=1.0)
+    plot_craftax_rnn_compare(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        groups=[
-            {"name": "ctd_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "CTD_RNN", "label": "CTD-RNN (5ALG)"},
-            {"name": "qtd_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "QTD_RNN"},
-            {"name": "iqn_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "IQN_RNN"},
-            {"name": "mog_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "MOG_PQN_RNN", "label": "MOG-CQN-RNN (5ALG)"},
-            {"name": "pqn_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "PQN_RNN"},
-            {
-                "name": "ctd_weightedcf",
-                "experiment_tag": "Craftax-RNN-CTD-MoG-WeightedCF",
-                "algo_tag": "CTD_RNN",
-                "label": "CTD-RNN (WeightedCF)",
-                "linestyle": "--",
-            },
-            {
-                "name": "mog_weightedcf",
-                "experiment_tag": "Craftax-RNN-CTD-MoG-WeightedCF",
-                "algo_tag": "MOG_PQN_RNN",
-                "label": "MOG-CQN-RNN (WeightedCF)",
-                "linestyle": "--",
-            },
-        ],
+        experiment_tag="Craftax-1B-checkpoint",
+        algo_tags=["MOG_PQN_RNN", "PQN_RNN", "QTD_RNN", "CTD_RNN"], #IQN-RNN
         metric="returned_episode_returns",
         step_metric="env_step",
-        out="figures/craftax_1b_rnn_7algo_2tag_compare.png",
+        out="figures/craftax_1b_rnn_lambda0.5_auxmeanlossweight1.0_compare.png",
         grid_points=800,
         max_runs=5000,
         smooth_window=51,
         env_name_filter=None,
+        display_titles=False,
     )
-    
-    # !Craftax 1B RNN no TD-lambda ablation.
-    # plot_craftax_rnn_compare(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     experiment_tag="Craftax-1B-5ALG",
-    #     algo_tags=["CTD_RNN", "QTD_RNN", "IQN_RNN", "MOG_PQN_RNN", "PQN_RNN"],
-    #     metric="returned_episode_returns",
-    #     step_metric="env_step",
-    #     out="figures/craftax_1b_rnn_5algo_compare.png",
-    #     grid_points=800,
-    #     max_runs=5000,
-    #     smooth_window=51,
-    #     env_name_filter=None,
-    # )
+
+    #! Craftax 1B (using lambda=0.0 and aux mean loss weight=0.0)
+    plot_craftax_rnn_compare_multi_source(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        groups=[
+            {"name": "ctd_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "CTD_RNN"},
+            {"name": "qtd_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "QTD_RNN"},
+            # {"name": "mog_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "MOG_PQN_RNN", "label": "MOG-CQN-RNN (5ALG)"},
+            {"name": "pqn_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "PQN_RNN"},
+            {
+                "name": "mog_weightedcf",
+                "experiment_tag": "Craftax-RNN-CTD-MoG-WeightedCF",
+                "algo_tag": "MOG_PQN_RNN",
+                "label": "MoG-CQN-RNN",
+            },
+        ],
+        metric="returned_episode_returns",
+        step_metric="env_step",
+        out="figures/craftax_1b_rnn_lambda0.0_auxmeanlossweight0.0_compare.png",
+        grid_points=800,
+        max_runs=5000,
+        smooth_window=51,
+        env_name_filter=None,
+        display_titles=False,
+    )
+
 
 
 if __name__ == "__main__":

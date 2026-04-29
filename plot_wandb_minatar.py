@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
+from pathlib import Path
 
 import numpy as np
 from plot_colors import algo_color
@@ -115,12 +117,14 @@ def _load_series(run, metric: str, step_key: str) -> tuple[np.ndarray, np.ndarra
     """Returns (steps, values) sorted by step; drops NaNs."""
     df = None
     try:
-        df = run.history(keys=[metric, step_key], pandas=True)
+        # Downsample on the server side to keep WANDB reads bounded.
+        df = run.history(keys=[metric, step_key], pandas=True, samples=1200)
     except Exception:
-        pass
+        df = None
     if df is None or getattr(df, "empty", True):
         try:
-            df = run.history(pandas=True)
+            # Fallback still sampled to avoid expensive full-history pulls.
+            df = run.history(pandas=True, samples=1200)
         except Exception:
             return None
     if df is None or df.empty or step_key not in df.columns or metric not in df.columns:
@@ -152,6 +156,9 @@ def _metric_candidates(metric: str) -> list[str]:
     if metric == "charts/episodic_return":
         return [metric]
     cands = [metric]
+    if metric.startswith("charts/") and len(metric) > len("charts/"):
+        # Some runs log metrics without the charts/ prefix (e.g., grad_norm).
+        cands.append(metric.split("/", 1)[1])
     if metric == "returned_episode_returns":
         cands.extend(["charts/episodic_return", "charts/episode_return", "episodic_return"])
     return _unique_ordered(cands)
@@ -185,12 +192,14 @@ def _load_series_any(
 
     df = None
     try:
-        df = run.history(keys=all_cols, pandas=True)
+        # Single targeted request per run/seed, sampled for responsiveness.
+        df = run.history(keys=all_cols, pandas=True, samples=1200)
     except Exception:
         df = None
     if df is None or getattr(df, "empty", True):
         try:
-            df = run.history(pandas=True)
+            # Keep compatibility with runs where keys(...) misses sparse columns.
+            df = run.history(pandas=True, samples=1200)
         except Exception:
             df = None
     if df is None or getattr(df, "empty", True):
@@ -211,12 +220,6 @@ def _load_series_any(
             order = np.argsort(steps)
             return steps[order], vals[order]
 
-    # Keep old behavior as a fallback for edge cases.
-    for m in metric_candidates:
-        for s in step_candidates:
-            series = _load_series(run, m, s)
-            if series is not None:
-                return series
     return None
 
 
@@ -307,8 +310,30 @@ def _smooth_1d(y: np.ndarray, window: int) -> np.ndarray:
 
 
 def _pretty_metric_label(metric: str) -> str:
+    metric_label_map: dict[str, str] = {
+        "charts/episodic_return": "Episodic Return",
+        "charts/episode_return": "Episode Return",
+        "episodic_return": "Episodic Return",
+        "returned_episode_returns": "Episodic Return",
+        "charts/grad_norm": "Gradient Norm",
+        "grad_norm": "Gradient Norm",
+    }
+    if metric in metric_label_map:
+        return metric_label_map[metric]
     tail = metric.split("/")[-1]
     return tail.replace("_", " ").strip().title()
+
+
+def _pretty_step_label(step_metric: str) -> str:
+    step_label_map: dict[str, str] = {
+        "global_step": "Environment Steps",
+        "env_step": "Environment Steps",
+        "update_steps": "Update Steps",
+        "_step": "Logging Step",
+    }
+    if step_metric in step_label_map:
+        return step_label_map[step_metric]
+    return step_metric.replace("_", " ").strip().title()
 
 
 def _pretty_env_title(env_id: str) -> str:
@@ -384,12 +409,12 @@ def _draw_algo_curves_on_ax(
         }
         label = label_map.get(algo_tag, algo_tag)
         c = colors[idx % len(colors)]
-        ax.plot(grid, mean, color=c, linewidth=2.0, label=f"{label} (n={len(curves)}, ±95% CI)")
+        ax.plot(grid, mean, color=c, linewidth=2.0, label=label)
         ax.fill_between(grid, lower, upper, color=c, alpha=0.2)
 
-    ax.set_xlabel(step_metric)
+    ax.set_xlabel(_pretty_step_label(step_metric))
     if show_ylabel:
-        ax.set_ylabel(metric)
+        ax.set_ylabel(_pretty_metric_label(metric))
     leg_fs = 6 if len(algo_tags) > 6 else 8
     ax.legend(fontsize=leg_fs, loc="best")
     ax.grid(True, alpha=0.3)
@@ -601,10 +626,16 @@ def plot_minatar_20m_td_lambda_aux_3exp(
     metric: str = "charts/episodic_return",
     step_metric: str = "global_step",
     grid_points: int = 800,
-    max_runs: int = 4000,
+    max_runs: int = 600,
+    max_runs_per_group: int = 2,
     smooth_window: int = 41,
     use_run_name_for_env: bool = True,
     multi_seed_tag: str = "multi_seed",
+    weighted_cf_as_true_mog: bool = False,
+    showing_exp: list[int] | None = None,
+    showing_env: list[int] | None = None,
+    display_titles: bool = True,
+    panel_layout: str = "horizontal",
 ) -> None:
     """Plot a 4x3 grid (rows=envs, cols=experiments) with per-row shared x/y limits.
 
@@ -631,7 +662,7 @@ def plot_minatar_20m_td_lambda_aux_3exp(
             "SpaceInvaders-MinAtar",
         ]
     if algo_tags is None:
-        algo_tags = ["MoG", "PQN", "CTD", "QTD", "IQN"]
+        algo_tags = ["MoG", "PQN", "QTD", "CTD"]  #IQN
 
     exp_specs = [
         {
@@ -650,26 +681,40 @@ def plot_minatar_20m_td_lambda_aux_3exp(
             "required_tags": [primary_experiment_tag, "LAMBDA-0.65", "AUX_MEAN_LOSS_WEIGHT-1.0"],
         },
     ]
+    if showing_exp is not None:
+        exp_specs = [exp_specs[i] for i in showing_exp]
+    if showing_env is not None:
+        env_ids = [env_ids[i] for i in showing_env]
     exp_keys = [spec["label"] for spec in exp_specs]
     algo_tags_plot = list(algo_tags)
-    if weighted_cf_experiment_tag and weighted_cf_algo_tag not in algo_tags_plot:
+    if weighted_cf_experiment_tag and not weighted_cf_as_true_mog and weighted_cf_algo_tag not in algo_tags_plot:
         algo_tags_plot.append(weighted_cf_algo_tag)
 
     api = wandb.Api()
     path = _wandb_path(entity, project)
-    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
 
     by_exp_env_algo: dict[str, dict[str, dict[str, list]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(list))
     )
 
+    run_jobs: list[tuple] = []
+    group_counts: dict[tuple[str, str, str], int] = defaultdict(int)
     for run in runs:
         tags = set(run.tags or [])
         if weighted_cf_experiment_tag and "MoG" in tags and weighted_cf_experiment_tag in tags:
-            algo = weighted_cf_algo_tag
+            algo = "MoG" if weighted_cf_as_true_mog else weighted_cf_algo_tag
         else:
             algo = _algo_group(run, algo_tags)
         if algo is None:
+            continue
+        if (
+            weighted_cf_as_true_mog
+            and weighted_cf_experiment_tag
+            and algo == "MoG"
+            and weighted_cf_experiment_tag not in tags
+        ):
+            # In "weighted as true MoG" mode, avoid mixing base MoG and weighted-MoG runs.
             continue
         env_id = _get_run_env_id(run, use_run_name=use_run_name_for_env)
         if env_id is None or env_id not in env_ids:
@@ -686,7 +731,10 @@ def plot_minatar_20m_td_lambda_aux_3exp(
             run, [primary_experiment_tag, "LAMBDA-0.0", "AUX_MEAN_LOSS_WEIGHT-0.0"]
         ):
             matched_exps.append("Exp 2")
-        if weighted_cf_experiment_tag and algo == weighted_cf_algo_tag:
+        if weighted_cf_experiment_tag and (
+            (not weighted_cf_as_true_mog and algo == weighted_cf_algo_tag)
+            or (weighted_cf_as_true_mog and algo == "MoG" and weighted_cf_experiment_tag in tags)
+        ):
             matched_exps = []
             for spec in exp_specs:
                 weighted_required = [
@@ -700,15 +748,41 @@ def plot_minatar_20m_td_lambda_aux_3exp(
         if not matched_exps:
             continue
 
-        series_list = curves_from_wandb_run(
-            run,
-            metric=metric,
-            step_metric=step_metric,
-            multi_seed_tag=multi_seed_tag,
-        )
-        for matched_exp in matched_exps:
-            for series in series_list:
-                by_exp_env_algo[matched_exp][env_id][algo].append(series)
+        accepted_exps: list[str] = []
+        for exp in matched_exps:
+            key = (exp, env_id, algo)
+            if group_counts[key] >= max_runs_per_group:
+                continue
+            group_counts[key] += 1
+            accepted_exps.append(exp)
+        if not accepted_exps:
+            continue
+
+        run_jobs.append((run, env_id, algo, accepted_exps))
+
+    if run_jobs:
+        # Moderate parallelism helps hide WANDB latency while avoiding heavy throttling.
+        workers = min(12, len(run_jobs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    curves_from_wandb_run,
+                    run,
+                    metric=metric,
+                    step_metric=step_metric,
+                    multi_seed_tag=multi_seed_tag,
+                ): (env_id, algo, matched_exps)
+                for run, env_id, algo, matched_exps in run_jobs
+            }
+            for fut in as_completed(futures):
+                env_id, algo, matched_exps = futures[fut]
+                try:
+                    series_list = fut.result()
+                except Exception:
+                    continue
+                for matched_exp in matched_exps:
+                    for series in series_list:
+                        by_exp_env_algo[matched_exp][env_id][algo].append(series)
 
     if not by_exp_env_algo:
         raise RuntimeError(
@@ -772,18 +846,63 @@ def plot_minatar_20m_td_lambda_aux_3exp(
     if not has_valid_limits:
         raise RuntimeError("Matched runs did not contain valid metric series for plotting.")
 
-    n_rows = len(env_ids)
-    n_cols = len(exp_keys)
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(4.8 * n_cols, 3.1 * n_rows),
-        squeeze=False,
-    )
+    def _title_variant_path(path: str) -> str:
+        p = Path(path)
+        return str(p.with_name(f"{p.stem}_with_titles{p.suffix}"))
 
-    for r, env_id in enumerate(env_ids):
-        for c, exp_key in enumerate(exp_keys):
-            ax = axes[r][c]
+    def _layout_dims(nr: int, nc: int, layout: str) -> tuple[int, int]:
+        total = nr * nc
+        if total < 2 or total > 4:
+            return nr, nc
+        mode = layout.strip().lower()
+        if mode not in {"horizontal", "vertical"}:
+            raise ValueError("panel_layout must be 'horizontal' or 'vertical'.")
+        if mode == "horizontal":
+            return 1, total
+        return total, 1
+
+    def _seed_summary_text() -> str:
+        parts: list[str] = []
+        for algo in algo_tags_plot:
+            counts: list[int] = []
+            for exp_key in exp_keys:
+                for env_id in env_ids:
+                    n_curves = len(by_exp_env_algo.get(exp_key, {}).get(env_id, {}).get(algo, []))
+                    if n_curves > 0:
+                        counts.append(n_curves)
+            if not counts:
+                continue
+            lo = min(counts)
+            hi = max(counts)
+            label = label_map.get(algo, algo)
+            if lo == hi:
+                parts.append(f"{label}: n={lo}")
+            else:
+                parts.append(f"{label}: n={lo}-{hi}")
+        return "; ".join(parts)
+
+    def _render_single(output_path: str, *, include_titles: bool) -> None:
+        base_rows = len(env_ids)
+        base_cols = len(exp_keys)
+        n_rows, n_cols = _layout_dims(base_rows, base_cols, panel_layout)
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(4.8 * n_cols, 3.1 * n_rows),
+            squeeze=False,
+        )
+
+        flat_positions = [(r, c) for r in range(base_rows) for c in range(base_cols)]
+        for panel_i, (r, c) in enumerate(flat_positions):
+            if n_rows == base_rows and n_cols == base_cols:
+                ax = axes[r][c]
+            elif n_rows == 1:
+                ax = axes[0][panel_i]
+            else:
+                ax = axes[panel_i][0]
+            env_id = env_ids[r]
+            exp_key = exp_keys[c]
+
             plotted_any = False
             for idx, algo in enumerate(algo_tags_plot):
                 computed = stats.get(exp_key, {}).get(env_id, {}).get(algo)
@@ -791,13 +910,12 @@ def plot_minatar_20m_td_lambda_aux_3exp(
                     continue
                 grid, mean, lower, upper = computed
                 color = colors[idx % len(colors)]
-                n_curves = len(by_exp_env_algo.get(exp_key, {}).get(env_id, {}).get(algo, []))
                 ax.plot(
                     grid,
                     mean,
                     color=color,
                     linewidth=2.0,
-                    label=f"{label_map.get(algo, algo)} (n={n_curves})",
+                    label=label_map.get(algo, algo),
                 )
                 ax.fill_between(grid, lower, upper, color=color, alpha=0.2)
                 plotted_any = True
@@ -805,13 +923,15 @@ def plot_minatar_20m_td_lambda_aux_3exp(
             if not plotted_any:
                 ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
 
-            if r == 0:
+            if include_titles:
                 tag_label = next(spec["tag_label"] for spec in exp_specs if spec["label"] == exp_key)
-                ax.set_title(f"{exp_key}\n{tag_label}", fontsize=10)
-            if c == 0:
-                ax.set_ylabel(_pretty_env_title(env_id))
-            if r == n_rows - 1:
-                ax.set_xlabel(step_metric)
+                ax.set_title(f"{_pretty_env_title(env_id)} | {exp_key}\n{tag_label}", fontsize=9)
+            else:
+                ax.set_title(_pretty_env_title(env_id), fontsize=9)
+            if c == 0 or n_cols == 1:
+                ax.set_ylabel(_pretty_metric_label(metric))
+            if r == base_rows - 1 or n_rows == 1:
+                ax.set_xlabel(_pretty_step_label(step_metric))
             row_lims = row_limits[env_id]
             if np.isfinite(row_lims["x_min"]) and np.isfinite(row_lims["x_max"]):
                 ax.set_xlim(row_lims["x_min"], row_lims["x_max"])
@@ -820,21 +940,27 @@ def plot_minatar_20m_td_lambda_aux_3exp(
                 row_y_top = row_lims["y_max"] * 1.05 if row_lims["y_max"] > 0 else row_lims["y_max"] + 1.0
                 ax.set_ylim(row_y_bottom, row_y_top)
             ax.grid(True, alpha=0.3)
-            if r == 0 and c == n_cols - 1:
+            if panel_i == len(flat_positions) - 1:
                 ax.legend(fontsize=7, loc="best")
 
-    metric_title = _pretty_metric_label(metric)
-    exp_title = ", ".join(experiment_tags)
-    fig.suptitle(
-        f"{exp_title}: {metric_title} (shared x/y per environment row)",
-        fontsize=12,
-        y=1.01,
-    )
-    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Wrote {out}")
+        if include_titles:
+            metric_title = _pretty_metric_label(metric)
+            exp_title = ", ".join(experiment_tags)
+            seed_summary = _seed_summary_text() or "no matched runs"
+            fig.suptitle(
+                f"{exp_title} | metric={metric_title} | shaded=95% CI | seeds per algo: {seed_summary}",
+                fontsize=10,
+                y=1.01,
+            )
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        fig.tight_layout(rect=[0, 0, 1, 0.98])
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {output_path}")
+
+    _render_single(out, include_titles=display_titles)
+    if not display_titles:
+        _render_single(_title_variant_path(out), include_titles=True)
 
 
 def plot_minatar_10m_mog_cqn_pqn(
@@ -1050,7 +1176,7 @@ def plot_minatar_10m_all_algos_combined(
 
     api = wandb.Api()
     path = _wandb_path(entity, project)
-    runs = list(api.runs(path, order="-created_at"))[:max_runs]
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
 
     by_env_algo: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for run in runs:
@@ -1298,11 +1424,50 @@ if __name__ == "__main__":
     #     out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog.png",
     # )
     
+    #! 4 envs, 3 experiments, 6 algos
     plot_minatar_20m_td_lambda_aux_3exp(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        metric="charts/grad_norm",
+        metric="charts/episodic_return",
         step_metric="global_step",
         experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
-        out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog_grad_norm.png",
+        max_runs=300,
+        max_runs_per_group=5,
+        weighted_cf_as_true_mog=True,
+        out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog_episodic_return.png",
+        display_titles=False,
+    )
+
+    #! 4 envs, exp 1 only (weighted CF MoG replaces MoG)
+    plot_minatar_20m_td_lambda_aux_3exp(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+        max_runs=300,
+        max_runs_per_group=5,
+        weighted_cf_as_true_mog=True,
+        showing_exp=[0],
+        showing_env=[0, 1, 2, 3],
+        out="figures/minatar_20m_td_lambda_aux_exp1_weighted_cf_mog_episodic_return.png",
+        display_titles=False,
+        panel_layout="horizontal",
+    )
+
+    #! exp 3, envs: Asterix + Breakout (weighted CF MoG replaces MoG)
+    plot_minatar_20m_td_lambda_aux_3exp(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+        max_runs=300,
+        max_runs_per_group=5,
+        weighted_cf_as_true_mog=True,
+        showing_exp=[2],
+        showing_env=[0, 1],
+        out="figures/minatar_20m_td_lambda_aux_exp3_asterix_breakout_weighted_cf_mog_episodic_return.png",
+        display_titles=False,
+        panel_layout="vertical",
     )
