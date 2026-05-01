@@ -46,6 +46,47 @@ from purejaxql.utils.mog_cf import (
 )
 
 
+def centered_cramer_categorical(
+    probs_old: jnp.ndarray,
+    support: jnp.ndarray,
+    probs_new: jnp.ndarray,
+    *,
+    grid_size: int = 1000,
+) -> jnp.ndarray:
+    mean_old = jnp.sum(probs_old * support[None, :], axis=-1, keepdims=True)
+    mean_new = jnp.sum(probs_new * support[None, :], axis=-1, keepdims=True)
+    z_old = support[None, :] - mean_old
+    z_new = support[None, :] - mean_new
+    radius = jnp.maximum(
+        1.0,
+        jnp.maximum(jnp.max(jnp.abs(z_old), axis=-1), jnp.max(jnp.abs(z_new), axis=-1)),
+    )
+    x = radius[:, None] * jnp.linspace(-1.0, 1.0, grid_size, dtype=probs_old.dtype)[None, :]
+    dx = jnp.maximum(1e-6, (2.0 * radius) / jnp.maximum(grid_size - 1, 1))
+    cdf_old = jnp.sum(probs_old[:, None, :] * (x[:, :, None] >= z_old[:, None, :]), axis=-1)
+    cdf_new = jnp.sum(probs_new[:, None, :] * (x[:, :, None] >= z_new[:, None, :]), axis=-1)
+    return jnp.mean(jnp.sum(jnp.square(cdf_old - cdf_new), axis=-1) * dx)
+
+
+def centered_cramer_quantile(
+    quantiles_old: jnp.ndarray,
+    quantiles_new: jnp.ndarray,
+    *,
+    grid_size: int = 500,
+) -> jnp.ndarray:
+    q_old = quantiles_old - quantiles_old.mean(axis=-1, keepdims=True)
+    q_new = quantiles_new - quantiles_new.mean(axis=-1, keepdims=True)
+    radius = jnp.maximum(
+        1.0,
+        jnp.maximum(jnp.max(jnp.abs(q_old), axis=-1), jnp.max(jnp.abs(q_new), axis=-1)),
+    )
+    x = radius[:, None] * jnp.linspace(-1.0, 1.0, grid_size, dtype=quantiles_old.dtype)[None, :]
+    dx = jnp.maximum(1e-6, (2.0 * radius) / jnp.maximum(grid_size - 1, 1))
+    cdf_old = jnp.mean((x[:, :, None] >= q_old[:, None, :]).astype(quantiles_old.dtype), axis=-1)
+    cdf_new = jnp.mean((x[:, :, None] >= q_new[:, None, :]).astype(quantiles_new.dtype), axis=-1)
+    return jnp.mean(jnp.sum(jnp.square(cdf_old - cdf_new), axis=-1) * dx)
+
+
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
     if norm_type == "layer_norm":
         return nn.LayerNorm()(x)
@@ -100,7 +141,8 @@ class DistributionalMinAtarNetwork(nn.Module):
     mlp_hidden_dim: int = 128
     cosine_embed_dim: int = 64
 
-    def _encode(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
+    @nn.compact
+    def encode(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train, name="input_norm")(x)
         else:
@@ -132,10 +174,13 @@ class DistributionalMinAtarNetwork(nn.Module):
         return x
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool, taus: jnp.ndarray | None = None):
-        latent = self._encode(x, train)
+    def decode(self, latent: jnp.ndarray, taus: jnp.ndarray | None = None):
         if self.variant == "ctd":
-            logits = nn.Dense(self.action_dim * self.num_atoms, kernel_init=nn.initializers.zeros)(
+            logits = nn.Dense(
+                self.action_dim * self.num_atoms,
+                kernel_init=nn.initializers.zeros,
+                name="head_ctd_logits",
+            )(
                 latent
             )
             return {"logits": logits.reshape(latent.shape[0], self.action_dim, self.num_atoms)}
@@ -144,6 +189,7 @@ class DistributionalMinAtarNetwork(nn.Module):
             quantiles = nn.Dense(
                 self.action_dim * self.num_quantiles,
                 kernel_init=nn.initializers.zeros,
+                name="head_qtd_quantiles",
             )(latent)
             return {
                 "quantiles": quantiles.reshape(
@@ -157,10 +203,17 @@ class DistributionalMinAtarNetwork(nn.Module):
             ) / self.policy_num_quantiles
             taus = jnp.broadcast_to(taus[None, :], (latent.shape[0], taus.shape[0]))
         tau_embed = CosineEmbedding(self.cosine_embed_dim)(taus)
-        tau_embed = nn.Dense(self.mlp_hidden_dim)(tau_embed)
+        tau_embed = nn.Dense(self.mlp_hidden_dim, name="head_iqn_tau_proj")(tau_embed)
         hidden = latent[:, None, :] * tau_embed
-        quantiles = nn.Dense(self.action_dim, kernel_init=nn.initializers.zeros)(hidden)
+        quantiles = nn.Dense(
+            self.action_dim, kernel_init=nn.initializers.zeros, name="head_iqn_quantiles"
+        )(hidden)
         return {"quantiles": jnp.swapaxes(quantiles, -1, -2), "taus": taus}
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool, taus: jnp.ndarray | None = None):
+        latent = self.encode(x, train)
+        return self.decode(latent, taus=taus)
 
     def q_values(
         self,
@@ -459,6 +512,11 @@ def make_train(config: dict):
                     minibatch, lambda_target = mb_and_target
                     rng, rng_tau = jax.random.split(rng)
                     rng, rng_target_tau = jax.random.split(rng)
+                    probe_taus = None
+                    if config["ALG_VARIANT"] == "iqn":
+                        probe_taus = jax.random.uniform(
+                            rng_tau, (minibatch.obs.shape[0], int(config.get("NUM_QUANTILES", 32)))
+                        )
                     dist_kind = normalize_dist_loss_name(
                         config.get("DIST_LOSS", "cross_entropy")
                     )
@@ -594,9 +652,242 @@ def make_train(config: dict):
                         loss = dist_loss + config.get("AUX_MEAN_LOSS_WEIGHT", 1.0) * mean_loss
                         return loss, (updates, dist_loss, mean_loss, chosen_q)
 
+                    def _probe_alignment_and_volatility(params):
+                        variables = {"params": params, "batch_stats": train_state.batch_stats}
+                        variant = config["ALG_VARIANT"]
+                        latent = network.apply(
+                            variables, minibatch.obs, train=False, method=DistributionalMinAtarNetwork.encode
+                        )
+                        out_probe = network.apply(
+                            variables, latent, taus=probe_taus if variant == "iqn" else None, method=DistributionalMinAtarNetwork.decode
+                        )
+                        if variant == "ctd":
+                            probs_probe = jax.nn.softmax(out_probe["logits"], axis=-1)
+                            q_probe = jnp.sum(probs_probe * support, axis=-1)
+                        else:
+                            q_probe = out_probe["quantiles"].mean(axis=-1)
+                        chosen_q_probe = select_action_values(q_probe, minibatch.action)
+                        td_only = 0.5 * jnp.square(chosen_q_probe - lambda_target).mean()
+
+                        if variant == "ctd":
+                            next_out_probe = network.apply(variables, minibatch.next_obs, train=False)
+                            next_probs_all_probe = jax.nn.softmax(next_out_probe["logits"], axis=-1)
+                            next_q_probe = jnp.sum(next_probs_all_probe * support, axis=-1)
+                            next_actions_probe = jnp.argmax(next_q_probe, axis=-1)
+                            next_probs_probe = select_action_values(next_probs_all_probe, next_actions_probe)
+                            target_probs_probe = jax.lax.stop_gradient(
+                                project_categorical(
+                                    next_probs_probe,
+                                    minibatch.reward,
+                                    minibatch.done.astype(jnp.float32),
+                                    support,
+                                    float(config["GAMMA"]),
+                                    float(config.get("V_MIN", -10.0)),
+                                    float(config.get("V_MAX", 10.0)),
+                                )
+                            )
+                            chosen_logits_probe = select_action_values(out_probe["logits"], minibatch.action)
+                            if dist_kind == "weighted_cf":
+                                dist_only, _ = categorical_cf_weighted_mse(
+                                    chosen_logits_probe,
+                                    target_probs_probe,
+                                    support,
+                                    omega_block,
+                                    bool(config.get("IS_DIVIDED_BY_SIGMA_SQUARED", True)),
+                                )
+                            else:
+                                dist_only = -jnp.sum(
+                                    target_probs_probe * jax.nn.log_softmax(chosen_logits_probe, axis=-1), axis=-1
+                                ).mean()
+                        else:
+                            if variant == "iqn":
+                                bsz = minibatch.next_obs.shape[0]
+                                target_taus_probe = jax.random.uniform(
+                                    rng_target_tau,
+                                    (bsz, int(config.get("NUM_TARGET_QUANTILES", 32))),
+                                )
+                                next_out_probe = network.apply(
+                                    variables, minibatch.next_obs, train=False, taus=target_taus_probe
+                                )
+                                tau_values_probe = taus
+                            else:
+                                next_out_probe = network.apply(variables, minibatch.next_obs, train=False)
+                                tau_values_probe = (
+                                    jnp.arange(out_probe["quantiles"].shape[-1], dtype=jnp.float32) + 0.5
+                                ) / out_probe["quantiles"].shape[-1]
+                                tau_values_probe = jnp.broadcast_to(
+                                    tau_values_probe[None, :],
+                                    (minibatch.obs.shape[0], tau_values_probe.shape[0]),
+                                )
+                            next_quantiles_probe = select_action_values(
+                                next_out_probe["quantiles"],
+                                jnp.argmax(next_out_probe["quantiles"].mean(axis=-1), axis=-1),
+                            )
+                            target_quantiles_probe = jax.lax.stop_gradient(
+                                minibatch.reward[:, None]
+                                + config["GAMMA"]
+                                * (1.0 - minibatch.done.astype(jnp.float32)[:, None])
+                                * next_quantiles_probe
+                            )
+                            pred_quantiles_probe = select_action_values(
+                                out_probe["quantiles"], minibatch.action
+                            )
+                            dist_only = quantile_huber_loss(
+                                pred_quantiles_probe,
+                                target_quantiles_probe,
+                                tau_values_probe,
+                                float(config.get("HUBER_KAPPA", 1.0)),
+                            )
+
+                        td_rep_grad = jax.grad(
+                            lambda h: 0.5
+                            * jnp.square(
+                                select_action_values(
+                                    (
+                                        jnp.sum(
+                                            jax.nn.softmax(
+                                                network.apply(
+                                                    variables, h, method=DistributionalMinAtarNetwork.decode
+                                                )["logits"],
+                                                axis=-1,
+                                            )
+                                            * support,
+                                            axis=-1,
+                                        )
+                                        if variant == "ctd"
+                                        else network.apply(
+                                            variables, h, taus=probe_taus if variant == "iqn" else None, method=DistributionalMinAtarNetwork.decode
+                                        )["quantiles"].mean(axis=-1)
+                                    ),
+                                    minibatch.action,
+                                )
+                                - lambda_target
+                            ).mean()
+                        )(latent)
+                        dist_rep_grad = jax.grad(
+                            lambda h: (
+                                -jnp.sum(
+                                    target_probs_probe
+                                    * jax.nn.log_softmax(
+                                        select_action_values(
+                                            network.apply(
+                                                variables, h, method=DistributionalMinAtarNetwork.decode
+                                            )["logits"],
+                                            minibatch.action,
+                                        ),
+                                        axis=-1,
+                                    ),
+                                    axis=-1,
+                                ).mean()
+                                if variant == "ctd" and dist_kind != "weighted_cf"
+                                else (
+                                    categorical_cf_weighted_mse(
+                                        select_action_values(
+                                            network.apply(
+                                                variables, h, method=DistributionalMinAtarNetwork.decode
+                                            )["logits"],
+                                            minibatch.action,
+                                        ),
+                                        target_probs_probe,
+                                        support,
+                                        omega_block,
+                                        bool(config.get("IS_DIVIDED_BY_SIGMA_SQUARED", True)),
+                                    )[0]
+                                    if variant == "ctd"
+                                    else quantile_huber_loss(
+                                        select_action_values(
+                                            network.apply(
+                                                variables, h, taus=probe_taus if variant == "iqn" else None, method=DistributionalMinAtarNetwork.decode
+                                            )["quantiles"],
+                                            minibatch.action,
+                                        ),
+                                        target_quantiles_probe,
+                                        tau_values_probe,
+                                        float(config.get("HUBER_KAPPA", 1.0)),
+                                    )
+                                )
+                            )
+                        )(latent)
+                        td_rep_norm = jnp.sqrt(jnp.sum(jnp.square(td_rep_grad)) + 1e-8)
+                        dist_rep_norm = jnp.sqrt(jnp.sum(jnp.square(dist_rep_grad)) + 1e-8)
+                        grad_cos = jnp.sum(td_rep_grad * dist_rep_grad) / (td_rep_norm * dist_rep_norm + 1e-8)
+
+                        aux_grads = jax.grad(
+                            lambda p: 0.5
+                            * jnp.square(
+                                select_action_values(
+                                    network.apply(
+                                        {"params": p, "batch_stats": train_state.batch_stats},
+                                        minibatch.obs,
+                                        train=False,
+                                        support=support,
+                                        method=DistributionalMinAtarNetwork.q_values,
+                                    )[0],
+                                    minibatch.action,
+                                )
+                                - lambda_target
+                            ).mean()
+                        )(params)
+                        step_size = float(config.get("CENTERED_SHAPE_STEP_SIZE", config["LR"]))
+                        new_params = jax.tree_util.tree_map(lambda p, g: p - step_size * g, params, aux_grads)
+                        new_vars = {"params": new_params, "batch_stats": train_state.batch_stats}
+                        old_vars = variables
+                        if variant == "ctd":
+                            old_probs = jax.nn.softmax(
+                                select_action_values(
+                                    network.apply(old_vars, minibatch.obs, train=False)["logits"], minibatch.action
+                                ),
+                                axis=-1,
+                            )
+                            new_probs = jax.nn.softmax(
+                                select_action_values(
+                                    network.apply(new_vars, minibatch.obs, train=False)["logits"], minibatch.action
+                                ),
+                                axis=-1,
+                            )
+                            volatility = centered_cramer_categorical(
+                                old_probs,
+                                support,
+                                new_probs,
+                                grid_size=int(config.get("CENTERED_SHAPE_GRID_SIZE", 129)),
+                            )
+                        else:
+                            old_q = select_action_values(
+                                network.apply(old_vars, minibatch.obs, train=False)["quantiles"], minibatch.action
+                            )
+                            new_q = select_action_values(
+                                network.apply(new_vars, minibatch.obs, train=False)["quantiles"], minibatch.action
+                            )
+                            volatility = centered_cramer_quantile(
+                                old_q,
+                                new_q,
+                                grid_size=int(config.get("CENTERED_SHAPE_GRID_SIZE", 129)),
+                            )
+                        return dist_only, td_only, td_rep_norm, dist_rep_norm, grad_cos, volatility
+
                     (loss, (updates, dist_loss, mean_loss, chosen_q)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
                     )(train_state.params)
+                    (
+                        dist_only_probe,
+                        td_only_probe,
+                        td_rep_grad_norm,
+                        dist_rep_grad_norm,
+                        grad_cosine_similarity,
+                        centered_shape_volatility,
+                    ) = jax.lax.cond(
+                        config.get("LOG_AUX_DIST_GRAD_ALIGNMENT", True),
+                        lambda p: _probe_alignment_and_volatility(p),
+                        lambda _: (
+                            jnp.array(0.0, dtype=jnp.float32),
+                            jnp.array(0.0, dtype=jnp.float32),
+                            jnp.array(0.0, dtype=jnp.float32),
+                            jnp.array(0.0, dtype=jnp.float32),
+                            jnp.array(0.0, dtype=jnp.float32),
+                            jnp.array(0.0, dtype=jnp.float32),
+                        ),
+                        operand=train_state.params,
+                    )
                     grad_norm = optax.global_norm(grads)
                     layer_grad_norms = (
                         get_layer_grad_norms(grads)
@@ -617,6 +908,12 @@ def make_train(config: dict):
                         chosen_q.mean(),
                         grad_norm,
                         layer_grad_norms,
+                        dist_only_probe,
+                        td_only_probe,
+                        td_rep_grad_norm,
+                        dist_rep_grad_norm,
+                        grad_cosine_similarity,
+                        centered_shape_volatility,
                     )
 
                 def preprocess_transition(x, rng_perm):
@@ -640,7 +937,20 @@ def make_train(config: dict):
                 _learn_epoch, (train_state, rng_epochs), None, config["NUM_EPOCHS"]
             )
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
-            loss, dist_loss, mean_loss, qvals, grad_norm, layer_grad_norms = epoch_metrics
+            (
+                loss,
+                dist_loss,
+                mean_loss,
+                qvals,
+                grad_norm,
+                layer_grad_norms,
+                dist_only_probe,
+                td_only_probe,
+                td_rep_grad_norm,
+                dist_rep_grad_norm,
+                grad_cosine_similarity,
+                centered_shape_volatility,
+            ) = epoch_metrics
             metrics = {
                 "env_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
@@ -650,6 +960,12 @@ def make_train(config: dict):
                 "td_lambda_loss": mean_loss.mean(),
                 "qvals": qvals.mean(),
                 "grad_norm": grad_norm.mean(),
+                "dist_loss_for_grad_probe": dist_only_probe.mean(),
+                "aux_td_lambda_loss_for_grad_probe": td_only_probe.mean(),
+                "trunk_dist_grad_norm": dist_rep_grad_norm.mean(),
+                "trunk_td_lambda_grad_norm": td_rep_grad_norm.mean(),
+                "trunk_grad_cosine_similarity": grad_cosine_similarity.mean(),
+                "centered_shape_volatility": centered_shape_volatility.mean(),
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):
                 layer_grad_norms = jax.tree_util.tree_map(lambda x: x.mean(), layer_grad_norms)

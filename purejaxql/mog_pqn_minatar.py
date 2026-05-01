@@ -38,6 +38,51 @@ from omegaconf import OmegaConf
 import gymnax
 
 from purejaxql.utils.mog_cf import build_mog_cf, mog_q_values, sample_frequencies
+
+
+def normal_cdf(x: jnp.ndarray) -> jnp.ndarray:
+    return 0.5 * (1.0 + jax.lax.erf(x / jnp.sqrt(2.0)))
+
+
+def mog_centered_cramer_distance(
+    pi_old: jnp.ndarray,
+    mu_old: jnp.ndarray,
+    sigma_old: jnp.ndarray,
+    pi_new: jnp.ndarray,
+    mu_new: jnp.ndarray,
+    sigma_new: jnp.ndarray,
+    *,
+    grid_size: int = 129,
+) -> jnp.ndarray:
+    """Cramer distance between centered old/new action distributions."""
+    mean_old = jnp.sum(pi_old * mu_old, axis=-1, keepdims=True)
+    mean_new = jnp.sum(pi_new * mu_new, axis=-1, keepdims=True)
+    mu_old_c = mu_old - mean_old
+    mu_new_c = mu_new - mean_new
+
+    scale_old = jnp.sum(pi_old * sigma_old, axis=-1)
+    scale_new = jnp.sum(pi_new * sigma_new, axis=-1)
+    max_scale = jnp.maximum(scale_old, scale_new)
+    max_mu = jnp.maximum(
+        jnp.max(jnp.abs(mu_old_c), axis=-1),
+        jnp.max(jnp.abs(mu_new_c), axis=-1),
+    )
+    radius = jnp.maximum(1.0, max_mu + 4.0 * max_scale)
+    x = jnp.linspace(-1.0, 1.0, grid_size, dtype=pi_old.dtype)
+    x = radius[..., None] * x
+    dx = jnp.maximum(1e-6, (2.0 * radius) / jnp.maximum(grid_size - 1, 1))
+
+    cdf_old = jnp.sum(
+        pi_old[..., None, :] * normal_cdf((x[..., None] - mu_old_c[..., None, :]) / (sigma_old[..., None, :] + 1e-6)),
+        axis=-1,
+    )
+    cdf_new = jnp.sum(
+        pi_new[..., None, :] * normal_cdf((x[..., None] - mu_new_c[..., None, :]) / (sigma_new[..., None, :] + 1e-6)),
+        axis=-1,
+    )
+    sq = jnp.square(cdf_old - cdf_new)
+    per_dist = jnp.sum(sq, axis=-1) * dx
+    return jnp.mean(per_dist)
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
     if norm_type == "layer_norm":
         return nn.LayerNorm()(x)
@@ -81,7 +126,7 @@ class MoGMinAtarQNetwork(nn.Module):
     mlp_hidden_dim: int = 128
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
+    def encode(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train, name="input_norm")(x)
         else:
@@ -110,13 +155,21 @@ class MoGMinAtarQNetwork(nn.Module):
             )(x)
             x = apply_norm(x, self.norm_type, train)
             x = x + resid
+        return x
 
+    @nn.compact
+    def decode(self, latent: jnp.ndarray):
         a, m = self.action_dim, self.num_components
-        pi_logits = nn.Dense(a * m)(x)
+        pi_logits = nn.Dense(a * m, name="head_pi_logits")(latent)
         pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
-        mu = nn.Dense(a * m)(x).reshape(-1, a, m)
-        sigma = jax.nn.softplus(nn.Dense(a * m)(x).reshape(-1, a, m))
+        mu = nn.Dense(a * m, name="head_mu")(latent).reshape(-1, a, m)
+        sigma = jax.nn.softplus(nn.Dense(a * m, name="head_sigma")(latent).reshape(-1, a, m))
         return pi, mu, sigma
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        latent = self.encode(x, train)
+        return self.decode(latent)
 
 
 @chex.dataclass(frozen=True)
@@ -356,9 +409,132 @@ def make_train(config: dict):
                     td_lambda_loss,
                 )
 
+            def _separate_loss_grads(params):
+                variables = {"params": params, "batch_stats": train_state.batch_stats}
+                latent = network.apply(variables, s_obs, train=False, method=MoGMinAtarQNetwork.encode)
+                online_pi, online_mu, online_sigma = network.apply(
+                    variables, latent, method=MoGMinAtarQNetwork.decode
+                )
+                online_phi = build_mog_cf(online_pi, online_mu, online_sigma, omegas)
+                online_phi_sel = online_phi[bidx, :, s_actions]
+                residual = online_phi_sel - td_target
+                err_squared = jnp.abs(residual) ** 2
+                if config.get("IS_DIVIDED_BY_OMEGA_SQUARED", True):
+                    omega_weights = (1.0 / jnp.maximum(omegas, 1e-8) ** 2)[None, :]
+                    err_squared = err_squared * omega_weights
+                dist_loss = jnp.mean(err_squared)
+
+                q_all = mog_q_values(online_pi, online_mu)
+                chosen_action_qvals = jnp.take_along_axis(
+                    q_all,
+                    jnp.expand_dims(s_actions, axis=-1),
+                    axis=-1,
+                ).squeeze(axis=-1)
+                td_loss = 0.5 * jnp.mean(jnp.square(chosen_action_qvals - lambda_target))
+
+                td_rep_grad = jax.grad(
+                    lambda h: 0.5
+                    * jnp.mean(
+                        jnp.square(
+                            jnp.take_along_axis(
+                                mog_q_values(
+                                    network.apply(variables, h, method=MoGMinAtarQNetwork.decode)[0],
+                                    network.apply(variables, h, method=MoGMinAtarQNetwork.decode)[1],
+                                ),
+                                jnp.expand_dims(s_actions, axis=-1),
+                                axis=-1,
+                            ).squeeze(axis=-1)
+                            - lambda_target
+                        )
+                    )
+                )(latent)
+                dist_rep_grad = jax.grad(
+                    lambda h: jnp.mean(
+                        (
+                            jnp.abs(
+                                build_mog_cf(*network.apply(variables, h, method=MoGMinAtarQNetwork.decode), omegas)[
+                                    bidx, :, s_actions
+                                ]
+                                - td_target
+                            )
+                            ** 2
+                        )
+                        * (
+                            (1.0 / jnp.maximum(omegas, 1e-8) ** 2)[None, :]
+                            if config.get("IS_DIVIDED_BY_OMEGA_SQUARED", True)
+                            else 1.0
+                        )
+                    )
+                )(latent)
+                td_rep_norm = jnp.sqrt(jnp.sum(jnp.square(td_rep_grad)) + 1e-8)
+                dist_rep_norm = jnp.sqrt(jnp.sum(jnp.square(dist_rep_grad)) + 1e-8)
+                grad_cos = jnp.sum(td_rep_grad * dist_rep_grad) / (td_rep_norm * dist_rep_norm + 1e-8)
+
+                aux_param_grads = jax.grad(
+                    lambda p: 0.5
+                    * jnp.mean(
+                        jnp.square(
+                            jnp.take_along_axis(
+                                mog_q_values(
+                                    network.apply(
+                                        {"params": p, "batch_stats": train_state.batch_stats},
+                                        s_obs,
+                                        train=False,
+                                    )[0],
+                                    network.apply(
+                                        {"params": p, "batch_stats": train_state.batch_stats},
+                                        s_obs,
+                                        train=False,
+                                    )[1],
+                                ),
+                                jnp.expand_dims(s_actions, axis=-1),
+                                axis=-1,
+                            ).squeeze(axis=-1)
+                            - lambda_target
+                        )
+                    )
+                )(params)
+                step_size = float(config.get("CENTERED_SHAPE_STEP_SIZE", config["LR"]))
+                updated_params = jax.tree_util.tree_map(lambda p, g: p - step_size * g, params, aux_param_grads)
+                new_pi, new_mu, new_sigma = network.apply(
+                    {"params": updated_params, "batch_stats": train_state.batch_stats},
+                    s_obs,
+                    train=False,
+                )
+                centered_shape_volatility = mog_centered_cramer_distance(
+                    online_pi[bidx, s_actions],
+                    online_mu[bidx, s_actions],
+                    online_sigma[bidx, s_actions],
+                    new_pi[bidx, s_actions],
+                    new_mu[bidx, s_actions],
+                    new_sigma[bidx, s_actions],
+                    grid_size=int(config.get("CENTERED_SHAPE_GRID_SIZE", 129)),
+                )
+                return dist_loss, td_loss, td_rep_norm, dist_rep_norm, grad_cos, centered_shape_volatility
+
             (loss, (updates, q_mean, q_gap, mog_ent, sig_m, cf_im, cf_loss, td_lambda_loss)), grads = jax.value_and_grad(
                 _loss_fn, has_aux=True
             )(train_state.params)
+            (
+                dist_only_loss,
+                td_only_loss,
+                td_rep_grad_norm,
+                dist_rep_grad_norm,
+                grad_cosine_similarity,
+                centered_shape_volatility,
+            ) = jax.lax.cond(
+                config.get("LOG_AUX_DIST_GRAD_ALIGNMENT", True),
+                lambda p: _separate_loss_grads(p),
+                lambda _: (
+                    jnp.array(0.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                ),
+                operand=train_state.params,
+            )
             grad_norm = optax.global_norm(grads)
             if config.get("LOG_LAYER_GRAD_NORMS", False):
                 layer_grad_norms = get_layer_grad_norms(grads)
@@ -377,6 +553,14 @@ def make_train(config: dict):
                 (q_mean, q_gap, mog_ent, sig_m, cf_im, cf_loss, td_lambda_loss),
                 grad_norm,
                 layer_grad_norms,
+                (
+                    dist_only_loss,
+                    td_only_loss,
+                    td_rep_grad_norm,
+                    dist_rep_grad_norm,
+                    grad_cosine_similarity,
+                    centered_shape_volatility,
+                ),
             )
 
         def _update_step(runner_state, unused):
@@ -473,8 +657,17 @@ def make_train(config: dict):
                         aux,
                         grad_norm,
                         layer_grad_norms,
+                        grad_alignment_aux,
                     ) = mog_gradient_step(train_state, minibatch, lambda_td, rng_gs)
                     q_mean, q_gap, mog_ent, sig_m, cf_im, cf_l, td_l = aux
+                    (
+                        dist_only_loss,
+                        td_only_loss,
+                        td_rep_grad_norm,
+                        dist_rep_grad_norm,
+                        grad_cosine_similarity,
+                        centered_shape_volatility,
+                    ) = grad_alignment_aux
                     return (
                         train_state,
                         rng,
@@ -489,6 +682,12 @@ def make_train(config: dict):
                         td_l,
                         grad_norm,
                         layer_grad_norms,
+                        dist_only_loss,
+                        td_only_loss,
+                        td_rep_grad_norm,
+                        dist_rep_grad_norm,
+                        grad_cosine_similarity,
+                        centered_shape_volatility,
                     )
 
                 def preprocess_transition(x, rng_perm):
@@ -516,6 +715,12 @@ def make_train(config: dict):
                     td_lambda_losses,
                     grad_norms,
                     layer_grad_norms,
+                    dist_only_losses,
+                    td_only_losses,
+                    td_rep_grad_norms,
+                    dist_rep_grad_norms,
+                    grad_cosines,
+                    centered_shape_vols,
                 ) = jax.lax.scan(
                     _learn_phase,
                     (train_state, rng_epoch),
@@ -532,6 +737,12 @@ def make_train(config: dict):
                     td_lambda_losses,
                     grad_norms,
                     layer_grad_norms,
+                    dist_only_losses,
+                    td_only_losses,
+                    td_rep_grad_norms,
+                    dist_rep_grad_norms,
+                    grad_cosines,
+                    centered_shape_vols,
                 )
 
             rng, _rng = jax.random.split(rng)
@@ -549,6 +760,12 @@ def make_train(config: dict):
                 td_lambda_e,
                 grad_norm,
                 layer_grad_norms,
+                dist_only_loss_e,
+                td_only_loss_e,
+                td_rep_grad_norm_e,
+                dist_rep_grad_norm_e,
+                grad_cosine_e,
+                centered_shape_vol_e,
             ) = jax.lax.scan(_learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"])
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
@@ -569,6 +786,12 @@ def make_train(config: dict):
                 "sigma_mean": sig_m_e.mean(),
                 "cf_loss_imag": cf_im_e.mean(),
                 "grad_norm": grad_norm.mean(),
+                "aux_td_lambda_loss_for_grad_probe": td_only_loss_e.mean(),
+                "dist_loss_for_grad_probe": dist_only_loss_e.mean(),
+                "trunk_td_lambda_grad_norm": td_rep_grad_norm_e.mean(),
+                "trunk_dist_grad_norm": dist_rep_grad_norm_e.mean(),
+                "trunk_grad_cosine_similarity": grad_cosine_e.mean(),
+                "centered_shape_volatility": centered_shape_vol_e.mean(),
                 "epsilon": eps,
             }
             if config.get("LOG_LAYER_GRAD_NORMS", False):

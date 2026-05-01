@@ -317,6 +317,12 @@ def _pretty_metric_label(metric: str) -> str:
         "returned_episode_returns": "Episodic Return",
         "charts/grad_norm": "Gradient Norm",
         "grad_norm": "Gradient Norm",
+        "trunk_grad_cosine_similarity": "Trunk Gradient Cosine Similarity",
+        "trunk_td_lambda_grad_norm": "Trunk TD(lambda) Gradient Norm",
+        "trunk_dist_grad_norm": "Trunk Distributional Gradient Norm",
+        "centered_shape_volatility": "Centered Shape Volatility (Cramer)",
+        "aux_td_lambda_loss_for_grad_probe": "Aux TD(lambda) Loss (Probe)",
+        "dist_loss_for_grad_probe": "Distributional Loss (Probe)",
     }
     if metric in metric_label_map:
         return metric_label_map[metric]
@@ -1325,75 +1331,59 @@ def plot_minatar_sampling_distribution_ablation(
     )
 
 
+def plot_minatar_gradient_alignment_and_volatility(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_10M_Cosine_Similarity",
+    env_ids: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    step_metric: str = "global_step",
+    algo_tags: list[str] | None = None,
+    max_runs: int = 2000,
+    smooth_window: int = 31,
+    grid_points: int = 800,
+    multi_seed_tag: str = "multi_seed",
+    out_prefix: str = "figures/minatar_grad_alignment",
+) -> None:
+    """Render one figure per diagnostic metric for MoG/CTD/QTD."""
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+    if algo_tags is None:
+        algo_tags = ["MoG", "CTD", "QTD"]
+    metrics = [
+        "trunk_grad_cosine_similarity",
+        # "trunk_td_lambda_grad_norm",
+        # "trunk_dist_grad_norm",
+        "centered_shape_volatility",
+    ]
+    for m in metrics:
+        safe_name = m.replace("/", "_")
+        plot_episodic_return(
+            project=project,
+            entity=entity,
+            experiment_tag=experiment_tag,
+            env_ids=env_ids,
+            use_run_name_for_env=use_run_name_for_env,
+            algo_tags=algo_tags,
+            metric=m,
+            step_metric=step_metric,
+            out=f"{out_prefix}_{safe_name}.png",
+            grid_points=grid_points,
+            max_runs=max_runs,
+            smooth_window=smooth_window,
+            multi_seed_tag=multi_seed_tag,
+        )
+
+
 if __name__ == "__main__":
     # Comment out the experiment you are *not* plotting; leave exactly one ``plot_episodic_return`` call active.
     # -------------------------------------------------------------------------
-
-    # (1) Breakout MinAtar — 3 algos (MoG / FFT / dqn), 3M-step sweep (no MinAtar_10M tag).
-    # plot_episodic_return(
-    #     project="Deep-CVI-Experiments",
-    #     entity=None,
-    #     required_tag=[],
-    #     algo_tags=["MoG", "FFT", "dqn"],
-    #     experiment_tag=None,
-    #     env_ids=["Breakout-MinAtar"],
-    #     use_run_name_for_env=True,
-    #     metric="charts/episodic_return",
-    #     step_metric="global_step",
-    #     out="figures/breakout_3algo_3M_episodic_return.png",
-    #     grid_points=800,
-    #     max_runs=500,
-    #     smooth_window=41,
-    #     env_name="Breakout MinAtar",
-    # )
-
-    # (2) MinAtar 10M — one panel per game; tags: MinAtar_10M + MoG|dqn|C51|QR-DQN|IQN|FQF.
-    #     Set include_pong_misc=True to add the Pong-misc panel (5 columns); default is 4 MinAtar games only.
-    # plot_minatar_10m_grid(
-    #     project="Deep-CVI-Experiments",
-    #     entity=None,
-    #     experiment_tag="MinAtar_10M",
-    #     include_pong_misc=False,
-    #     use_run_name_for_env=True,
-    #     algo_tags=["MoG", "dqn", "C51", "QR-DQN", "IQN"],
-    #     metric="charts/episodic_return",
-    #     step_metric="global_step",
-    #     out="figures/minatar_10m_episodic_return.png",
-    #     grid_points=800,
-    #     max_runs=2000,
-    #     smooth_window=41,
-    # )
-
-    # (3) MinAtar 10M PQN — MoG / PQN / CTD / QTD / IQN (``MoG``, ``PQN``, ``CTD``, ``QTD``, ``IQN`` tags)
-    # plot_minatar_10m_mog_cqn_pqn(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     include_pong_misc=False,
-    #     metric="charts/episodic_return",
-    #     step_metric="global_step",
-    #     experiment_tag="MinAtar_10M_PQN",
-    #     out="figures/minatar_10m_episodic_return_pqn_ctd_qtd_iqn.png",
-    # )
-    
-    # plot_minatar_10m_mog_cqn_pqn(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     include_pong_misc=False,
-    #     metric="charts/episodic_return",
-    #     step_metric="global_step",
-    #     experiment_tag="MinAtar_30M_PQN",
-    #     out="figures/minatar_30m_episodic_return_pqn_ctd_qtd_iqn.png",
-    # )
-    
-    # plot_minatar_10m_mog_cqn_pqn(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     include_pong_misc=False,
-    #     metric="charts/episodic_return",
-    #     step_metric="global_step",
-    #     experiment_tag="MinAtar_100M_PQN",
-    #     out="figures/minatar_100m_episodic_return_mog_cqn_pqn.png",
-    # )
     
     #! without the new mog weighted cf
     # plot_minatar_20m_td_lambda_aux_3exp(
@@ -1414,60 +1404,61 @@ if __name__ == "__main__":
     #     out="figures/minatar_sampling_distribution_ablation.png",
     # )
     
-    #! with the new mog weighted cf (takes a long time to run)
+    # #! 4 envs, 3 experiments, 6 algos
     # plot_minatar_20m_td_lambda_aux_3exp(
     #     project="Deep-CVI-Experiments",
     #     entity="fatty_data",
     #     metric="charts/episodic_return",
     #     step_metric="global_step",
     #     experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
-    #     out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog.png",
+    #     max_runs=300,
+    #     max_runs_per_group=5,
+    #     weighted_cf_as_true_mog=True,
+    #     out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog_episodic_return.png",
+    #     display_titles=False,
+    # )
+
+    # #! 4 envs, exp 1 only (weighted CF MoG replaces MoG)
+    # plot_minatar_20m_td_lambda_aux_3exp(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+    #     max_runs=300,
+    #     max_runs_per_group=5,
+    #     weighted_cf_as_true_mog=True,
+    #     showing_exp=[0],
+    #     showing_env=[0, 1, 2, 3],
+    #     out="figures/minatar_20m_td_lambda_aux_exp1_weighted_cf_mog_episodic_return.png",
+    #     display_titles=False,
+    #     panel_layout="horizontal",
+    # )
+
+    # #! exp 3, envs: Asterix + Breakout (weighted CF MoG replaces MoG)
+    # plot_minatar_20m_td_lambda_aux_3exp(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+    #     max_runs=300,
+    #     max_runs_per_group=5,
+    #     weighted_cf_as_true_mog=True,
+    #     showing_exp=[2],
+    #     showing_env=[0, 1],
+    #     out="figures/minatar_20m_td_lambda_aux_exp3_asterix_breakout_weighted_cf_mog_episodic_return.png",
+    #     display_titles=False,
+    #     panel_layout="vertical",
     # )
     
-    #! 4 envs, 3 experiments, 6 algos
-    plot_minatar_20m_td_lambda_aux_3exp(
+    plot_minatar_gradient_alignment_and_volatility(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
+        experiment_tag="MinAtar_10M_Cosine_Similarity",
+        out_prefix="figures/minatar_10m_cosine_similarity",
+        grid_points=800,
         max_runs=300,
-        max_runs_per_group=5,
-        weighted_cf_as_true_mog=True,
-        out="figures/minatar_20m_td_lambda_aux_3exp_weighted_cf_mog_episodic_return.png",
-        display_titles=False,
-    )
-
-    #! 4 envs, exp 1 only (weighted CF MoG replaces MoG)
-    plot_minatar_20m_td_lambda_aux_3exp(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
-        max_runs=300,
-        max_runs_per_group=5,
-        weighted_cf_as_true_mog=True,
-        showing_exp=[0],
-        showing_env=[0, 1, 2, 3],
-        out="figures/minatar_20m_td_lambda_aux_exp1_weighted_cf_mog_episodic_return.png",
-        display_titles=False,
-        panel_layout="horizontal",
-    )
-
-    #! exp 3, envs: Asterix + Breakout (weighted CF MoG replaces MoG)
-    plot_minatar_20m_td_lambda_aux_3exp(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag=["MinAtar_20M_Td_Lambda", "MinAtar_20M_Td_Lambda_WeightedCF_MoG"],
-        max_runs=300,
-        max_runs_per_group=5,
-        weighted_cf_as_true_mog=True,
-        showing_exp=[2],
-        showing_env=[0, 1],
-        out="figures/minatar_20m_td_lambda_aux_exp3_asterix_breakout_weighted_cf_mog_episodic_return.png",
-        display_titles=False,
-        panel_layout="vertical",
+        smooth_window=31,
+        multi_seed_tag="multi_seed",
     )
