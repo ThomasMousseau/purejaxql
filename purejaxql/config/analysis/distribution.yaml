@@ -17,8 +17,8 @@ num_atoms: 51
 num_mog_components: 51
 
 num_omega: 32
-gamma: 0.95
-immediate_reward_std: 0.1
+gamma: 0.9
+immediate_reward_std: 0.2
 omega_max: 15.0
 huber_kappa: 1.0
 lr: 0.001

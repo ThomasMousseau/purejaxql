@@ -33,6 +33,7 @@ class Config:
     train_steps: int = 3000
     eval_every: int = 100
     lr: float = 7.5e-3
+    cf_loss_omega_eps: float = 1e-3
     t_max: float = 25.0
     num_t: int = 256
     x_min: float = -16.0
@@ -148,9 +149,11 @@ def cramer_l2_sq_cdf(f_hat: jax.Array, f_true: jax.Array, x_grid: jax.Array) -> 
     return jnp.trapezoid((f_hat - f_true) ** 2, x_grid)
 
 
-def cf_l2_sq_over_omega2(phi_hat: jax.Array, phi_true: jax.Array, omega_grid: jax.Array, eps: float = 1e-4) -> jax.Array:
-    w = 1.0 / (omega_grid**2 + eps)
-    return jnp.mean(w * jnp.abs(phi_hat - phi_true) ** 2)
+def cf_l2_sq_over_omega2(phi_hat: jax.Array, phi_true: jax.Array, omega_grid: jax.Array, eps: float = 1e-3) -> jax.Array:
+    d = phi_hat - phi_true
+    num = jnp.real(d) ** 2 + jnp.imag(d) ** 2
+    den = jnp.maximum(jnp.square(jnp.abs(omega_grid)), jnp.float64(eps**2))
+    return jnp.trapezoid(num / den, omega_grid) / (2.0 * jnp.pi)
 
 
 def sample_gaussian_mixture(key: jax.Array, n: int, weights: jax.Array, mu: jax.Array, sigma: jax.Array) -> jax.Array:
@@ -389,13 +392,16 @@ def train_one_model(
     params = init_params(family, cfg.num_components, key)
     tx = optax.adam(cfg.lr)
     opt_state = tx.init(params)
-    eps = 1e-3
+    eps = cfg.cf_loss_omega_eps
 
     @jax.jit
     def step(p, s):
         def loss_fn(pp):
             ph = model_phi_return(family, pp, t_grid)
-            return jnp.mean(jnp.abs(ph - target_phi) ** 2 / (t_grid**2 + eps))
+            d = ph - target_phi
+            num = jnp.real(d) ** 2 + jnp.imag(d) ** 2
+            den = jnp.maximum(jnp.square(jnp.abs(t_grid)), jnp.float64(eps**2))
+            return 0.5 * jnp.mean(num / den)
 
         loss, grads = jax.value_and_grad(loss_fn)(p)
         updates, s_new = tx.update(grads, s, p)
@@ -815,7 +821,7 @@ def run_experiment(cfg: Config, output_dir: Path) -> None:
             metrics = {
                 "w1": w1_cdf(cdf_hat, cdf_truth, x_grid),
                 "cramer_l2": cramer_l2_sq_cdf(cdf_hat, cdf_truth, x_grid),
-                "cf_l2_w": cf_l2_sq_over_omega2(phi_hat, phi_truth, t_grid),
+                "cf_l2_w": cf_l2_sq_over_omega2(phi_hat, phi_truth, t_grid, cfg.cf_loss_omega_eps),
             }
             fit_data[target_name][model_name] = {
                 "params": params,
@@ -849,6 +855,7 @@ def parse_args(argv=None):
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--num-components", type=int, default=None, help="Mixture components (fixed to 51 for fair comparison).")
     p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--cf-loss-omega-eps", type=float, default=None)
     p.add_argument("--gamma", type=float, default=None)
     p.add_argument("--reward-std", type=float, default=None)
     p.add_argument("--t-max", type=float, default=None)
@@ -870,6 +877,7 @@ def main(argv=None):
         "eval_every": args.eval_every,
         "num_components": args.num_components,
         "lr": args.lr,
+        "cf_loss_omega_eps": args.cf_loss_omega_eps,
         "gamma": args.gamma,
         "reward_std": args.reward_std,
         "t_max": args.t_max,

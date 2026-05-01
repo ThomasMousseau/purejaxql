@@ -375,10 +375,10 @@ class DAConfig:
     batch_size: int = 1024
     num_tau: int = 51
     num_atoms: int = 51
-    num_mog_components: int = 51
+    num_mog_components: int = 17
     num_omega: int = 32
-    gamma: float = 0.95
-    immediate_reward_std: float = 0.1
+    gamma: float = 0.9
+    immediate_reward_std: float = 0.2
     omega_max: float = 15.0
     huber_kappa: float = 1.0
     lr: float = 1e-3
@@ -1833,5 +1833,5 @@ def replot(figures_dir: Path | None = None) -> None:
 
 
 if __name__ == "__main__":
-    # main(sys.argv[1:])
-    replot()
+    main(sys.argv[1:])
+    # replot()

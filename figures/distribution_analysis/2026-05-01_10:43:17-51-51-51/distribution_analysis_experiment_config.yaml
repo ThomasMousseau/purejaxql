@@ -10,8 +10,8 @@ num_tau: 51
 num_atoms: 51
 num_mog_components: 51
 num_omega: 32
-gamma: 0.95
-immediate_reward_std: 0.1
+gamma: 0.9
+immediate_reward_std: 0.2
 omega_max: 15.0
 huber_kappa: 1.0
 lr: 0.001
@@ -44,4 +44,4 @@ gp_num_t: 2001
 cvar_alpha: 0.05
 er_beta: 0.1
 mv_lambda: 0.1
-artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/distribution_analysis/2026-04-26_13:56:24"
+artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/distribution_analysis/2026-05-01_10:43:17"

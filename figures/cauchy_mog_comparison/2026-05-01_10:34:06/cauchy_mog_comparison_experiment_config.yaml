@@ -5,6 +5,7 @@ num_components: 5
 train_steps: 3000
 eval_every: 100
 lr: 0.0075
+cf_loss_omega_eps: 0.001
 t_max: 25.0
 num_t: 256
 x_min: -16.0
@@ -12,4 +13,4 @@ x_max: 20.0
 num_x: 1200
 truth_samples: 300000
 panel_samples: 12000
-artifacts_dir: "/Users/thomasmousseau/Mila/purejaxql/figures/cauchy_mog_comparison/2026-04-29_12:13:04"
+artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/cauchy_mog_comparison/2026-05-01_10:34:06"
