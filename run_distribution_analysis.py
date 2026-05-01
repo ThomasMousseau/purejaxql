@@ -1219,6 +1219,7 @@ def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], row_ke
 
 def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te: np.ndarray, xe: np.ndarray, cf_hw: float, path: str) -> None:
     import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
 
     cf_series = (
         (("panel_phi_true",), "truth", "Truth"),
@@ -1270,6 +1271,36 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             pkey = _plot_resolve_panel_key(mean_p, candidates)
             if pkey is None:
                 continue
+            if ckey == "ctd":
+                # CTD is a discrete distribution: render it as Dirac-like spikes from CDF jumps.
+                cdf_key = _plot_resolve_panel_key(mean_p, ("panel_F_ctd", "panel_F_c51"))
+                if cdf_key is None:
+                    continue
+                cdf_vals = np.asarray(mean_p[cdf_key][row], dtype=np.float64)
+                jumps = np.diff(np.concatenate(([0.0], cdf_vals)))
+                jumps = np.clip(jumps, 0.0, None)
+                jump_se = np.zeros_like(jumps)
+                if cdf_key in se_p:
+                    cdf_se = np.asarray(se_p[cdf_key][row], dtype=np.float64)
+                    jump_se = np.clip(np.diff(np.concatenate(([0.0], cdf_se))), 0.0, None)
+                atom_x = xe
+                keep = (atom_x >= dist.plot_x_min) & (atom_x <= dist.plot_x_max) & (jumps > 1e-6)
+                if np.any(keep):
+                    segs = [((x, 0.0), (x, h)) for x, h in zip(atom_x[keep], jumps[keep])]
+                    axp.add_collection(LineCollection(segs, colors=PLOT_COLORS[ckey], linewidths=PLOT_LW[ckey], alpha=0.95))
+                    if np.any(jump_se[keep] > 0):
+                        axp.errorbar(
+                            atom_x[keep],
+                            jumps[keep],
+                            yerr=jump_se[keep],
+                            fmt="none",
+                            ecolor=PLOT_COLORS[ckey],
+                            elinewidth=0.8,
+                            alpha=0.35,
+                            capsize=0,
+                        )
+                    axp.plot([], [], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+                continue
             if ckey == "truth":
                 y = np.asarray(mean_p[pkey][row], dtype=np.float64)
                 ys = np.asarray(se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], dtype=np.float64)
@@ -1289,8 +1320,11 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
                 continue
             y = mean_p[pkey][row]
             ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
-            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
-            axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0, step="post" if ckey == "ctd" else None)
+            if ckey == "ctd":
+                axc.step(xe[xmask], y[xmask], where="post", color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+            else:
+                axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axc)
         axc.set_xlim(dist.plot_x_min, dist.plot_x_max)
         if row == 0:

@@ -255,11 +255,26 @@ def plot_craftax_rnn_compare(
         _render_single(_title_variant_path(out), include_titles=True)
 
 
+def _experiment_tags_for_group(group: dict) -> list[str]:
+    """Resolve experiment tag(s) for a group: ``experiment_tags`` (list) or ``experiment_tag`` (str)."""
+    if "experiment_tags" in group:
+        v = group["experiment_tags"]
+        if isinstance(v, str):
+            return [v]
+        return list(v)
+    return [group["experiment_tag"]]
+
+
+def _run_matches_any_experiment_tag(run, experiment_tags: list[str]) -> bool:
+    tags = set(run.tags or [])
+    return any(t in tags for t in experiment_tags)
+
+
 def plot_craftax_rnn_compare_multi_source(
     *,
     project: str,
     entity: str | None,
-    groups: list[dict[str, str]],
+    groups: list[dict],
     metric: str,
     step_metric: str,
     out: str,
@@ -275,9 +290,11 @@ def plot_craftax_rnn_compare_multi_source(
 
     Each group entry must contain:
       - name: unique display key for legend ordering
-      - experiment_tag: required tag for run selection
+      - experiment_tag: required tag for run selection (unless experiment_tags is set)
       - algo_tag: single algo tag required in run tags
     Optional:
+      - experiment_tags: list of W&B tags; run matches if it has **any** of them
+        (use this to pool seeds across experiments into one curve)
       - label: legend label override
       - linestyle: matplotlib line style (defaults to solid)
     """
@@ -288,10 +305,10 @@ def plot_craftax_rnn_compare_multi_source(
     by_name: dict[str, list] = defaultdict(list)
     for group in groups:
         name = group["name"]
-        required = [group["experiment_tag"]]
+        experiment_tags = _experiment_tags_for_group(group)
         algo_tag = group["algo_tag"]
         for run in runs:
-            if not _run_matches_required(run, required):
+            if not _run_matches_any_experiment_tag(run, experiment_tags):
                 continue
             if env_name_filter:
                 cfg = getattr(run, "config", None)
@@ -388,7 +405,10 @@ def plot_craftax_rnn_compare_multi_source(
         if include_titles:
             metric_title = _pretty_metric_label(metric)
             seed_summary = _group_seed_summary_text() or "no matched runs"
-            tags = ", ".join(sorted({g["experiment_tag"] for g in groups}))
+            all_exp_tags: list[str] = []
+            for g in groups:
+                all_exp_tags.extend(_experiment_tags_for_group(g))
+            tags = ", ".join(sorted(set(all_exp_tags)))
             env_txt = env_name_filter if env_name_filter else "all environments"
             ax.set_title(
                 f"{tags} | env={env_txt} | metric={metric_title} | shaded=95% CI | {seed_summary}",
@@ -432,18 +452,19 @@ def main() -> None:
     )
 
     #! Craftax 1B (using lambda=0.0 and aux mean loss weight=0.0)
-    #TODO: I will need to combine 3 seeds from Craftax-RNN-CTD-MoG-WeightedCF and 2 seeds from Craftax-1B-5ALG for MoG-CQN-RNN
+    # MoG-CQN-RNN: pool seeds from WeightedCF and 5ALG experiment tags into one curve.
     plot_craftax_rnn_compare_multi_source(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
         groups=[
             {"name": "ctd_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "CTD_RNN"},
             {"name": "qtd_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "QTD_RNN"},
-            # {"name": "mog_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "MOG_PQN_RNN", "label": "MOG-CQN-RNN (5ALG)"},
             {"name": "pqn_5alg", "experiment_tag": "Craftax-1B-5ALG", "algo_tag": "PQN_RNN"},
             {
-                "name": "mog_weightedcf",
-                "experiment_tag": "Craftax-RNN-CTD-MoG-WeightedCF",
+                "name": "mog_combined",
+                "experiment_tags": [
+                    "Craftax-RNN-CTD-MoG-WeightedCF",
+                ],
                 "algo_tag": "MOG_PQN_RNN",
                 "label": "MoG-CQN-RNN",
             },
