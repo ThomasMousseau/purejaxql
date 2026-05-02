@@ -1,7 +1,8 @@
 """
 Phi-TD on MinAtar: same CNN shell as ``mog_pqn_minatar.py``, but one distributional family
-at a time with **only** the weighted characteristic-function Bellman loss (no TD(λ) / PQN
-mean auxiliary).
+at a time with **only** the characteristic-function TD(0) Bellman loss (no TD(λ) / PQN mean
+auxiliary). Default ω sampling is truncated Pareto (α=1) with **no** ``1/ω²`` loss weights,
+matching a Cramér-type CF objective (see ``purejaxql.utils.cf_pareto``).
 
 Families (shared atom count ``NUM_ATOMS`` = m):
 
@@ -249,11 +250,14 @@ def make_train(config: dict):
     action_dim = env.action_space(env_params).n
     family = str(config.get("FAMILY_DISTRIBUTION", "dirac")).lower()
     num_atoms = int(config["NUM_ATOMS"])
-    support = jnp.linspace(
-        float(config.get("V_MIN", 0.0)),
-        float(config.get("V_MAX", 200.0)),
-        num_atoms,
-    )
+    if family == "categorical":
+        support = jnp.linspace(
+            float(config.get("V_MIN", 0.0)),
+            float(config.get("V_MAX", 200.0)),
+            num_atoms,
+        )
+    else:
+        support = None
 
     def eps_greedy_exploration(rng, q_vals, eps):
         rng_a, rng_e = jax.random.split(rng)
@@ -384,7 +388,8 @@ def make_train(config: dict):
                 omega_key,
                 int(config["NUM_OMEGA_SAMPLES"]),
                 float(config["OMEGA_MAX"]),
-                distribution=config.get("OMEGA_SAMPLING_DISTRIBUTION", "half_laplacian"),
+                distribution=config.get("OMEGA_SAMPLING_DISTRIBUTION", "pareto_1"),
+                omega_min=config.get("OMEGA_MIN"),
             )
             variables_eval = {
                 "params": train_state.params,
@@ -568,7 +573,7 @@ def make_train(config: dict):
                 residual = online_phi_sel - td_target
                 err_squared = jnp.abs(residual) ** 2
                 imag_abs = jnp.abs(jnp.imag(residual))
-                if config.get("IS_DIVIDED_BY_OMEGA_SQUARED", True):
+                if config.get("IS_DIVIDED_BY_OMEGA_SQUARED", False):
                     omega_weights = (1.0 / jnp.maximum(omegas, 1e-8) ** 2)[None, :]
                     err_squared = err_squared * omega_weights
                     imag_abs = imag_abs * omega_weights

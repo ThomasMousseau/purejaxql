@@ -11,6 +11,8 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
 
+from purejaxql.utils.cf_pareto import sample_truncated_pareto_alpha_1
+
 
 def normalize_dist_loss_name(name: str) -> str:
     """Map YAML/config values for CTD ``DIST_LOSS`` to canonical strings."""
@@ -267,16 +269,19 @@ def sample_frequencies(
     distribution="half_laplacian",
     gaussian_mean=0.0,
     gaussian_std=1.0,
+    omega_min=None,
 ):
     """Sample positive ω frequencies for CF losses.
 
     Supported distributions:
       - ``half_laplacian``: truncated exponential on ``[0, omega_max]``.
+      - ``pareto_1`` / ``pareto_alpha_1``: truncated Pareto with shape α=1 on
+        ``[omega_min, omega_max]``. Pass ``omega_min`` explicitly (defaults inside
+        ``sample_truncated_pareto_alpha_1``). Intended for unweighted CF MSE (Cramér-type objective).
       - ``uniform``: uniform on ``[0, omega_max]``.
       - ``half_gaussian``: absolute Gaussian ``|N(mean, std)|``, clipped to ``omega_max``.
 
     Notes:
-      - ``half_laplacian`` remains the default for backward compatibility.
       - Frequencies are always non-negative (conjugate symmetry in CF space).
     """
     distribution = str(distribution).lower()
@@ -309,7 +314,15 @@ def sample_frequencies(
         omega = gaussian_std * jnp.sqrt(2.0) * jsp.erfinv(u * cdf_max)
         return jnp.clip(omega, 0.0, omega_max)
 
+    if distribution in ("pareto_1", "pareto_alpha_1"):
+        return sample_truncated_pareto_alpha_1(
+            key,
+            num_samples,
+            omega_max,
+            omega_min=omega_min,
+        )
+
     raise ValueError(
         "Unknown distribution for sample_frequencies: "
-        f"{distribution}. Supported: half_laplacian, uniform, half_gaussian."
+        f"{distribution}. Supported: half_laplacian, pareto_1, uniform, half_gaussian."
     )

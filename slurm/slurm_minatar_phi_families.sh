@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=minatar-phi-families
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:rtx8000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1
 #SBATCH --array=0-19%20
@@ -26,6 +26,10 @@
 # Submit from repo root:  sbatch slurm/slurm_minatar_phi_families.sh
 ################################################################################
 
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:rtx8000:1
+
+
 set -euo pipefail
 
 ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -37,7 +41,7 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="MinAtar_10M_PhiTD_Families"
+EXPERIMENT_TAG="MinAtar_10M_PhiTD_Families_v2"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
 ENV_IDX=$((TID / 5))

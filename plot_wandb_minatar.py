@@ -1598,16 +1598,31 @@ if __name__ == "__main__":
     #     panel_layout="vertical",
     # )
     
-    #! CTD, QTD, Phi-TD (F_m / F_C,m / F_Q,m) — slurm_minatar_phi_families.sh
+    # #! CTD, QTD, Phi-TD (F_m / F_C,m / F_Q,m) — slurm_minatar_phi_families.sh
+    # plot_minatar_10m_phi_td_families(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     out="figures/minatar_10m_phi_td_families.png",
+    # )
+    # #! MoG-PQN vs Phi-TD MoG / Gamma / Laplace / Logistic — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
+    # plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+    # )
+    
+    #! Pareto distribution, no weighted CF
     plot_minatar_10m_phi_td_families(
         project="Deep-CVI-Experiments",
+        experiment_tag="MinAtar_10M_PhiTD_Families_v2",
         entity="fatty_data",
-        out="figures/minatar_10m_phi_td_families.png",
+        out="figures/minatar_10m_phi_td_families_v2.png",
     )
-    #! MoG-PQN vs Phi-TD MoG / Gamma / Laplace / Logistic — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
+    #! Pareto distribution, no weighted CF
     plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         project="Deep-CVI-Experiments",
+        experiment_tag="MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic_v2",
         entity="fatty_data",
-        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic_v2.png",
     )
 
