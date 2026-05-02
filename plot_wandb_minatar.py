@@ -1385,6 +1385,17 @@ if __name__ == "__main__":
     # Comment out the experiment you are *not* plotting; leave exactly one ``plot_episodic_return`` call active.
     # -------------------------------------------------------------------------
     
+    # plot_minatar_gradient_alignment_and_volatility(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     experiment_tag="MinAtar_10M_Cosine_Similarity",
+    #     out_prefix="figures/minatar_10m_cosine_similarity",
+    #     grid_points=800,
+    #     max_runs=300,
+    #     smooth_window=31,
+    #     multi_seed_tag="multi_seed",
+    # )
+    
     #! without the new mog weighted cf
     # plot_minatar_20m_td_lambda_aux_3exp(
     #     project="Deep-CVI-Experiments",
@@ -1394,6 +1405,8 @@ if __name__ == "__main__":
     #     experiment_tag="MinAtar_20M_Td_Lambda",
     #     out="figures/minatar_20m_td_lambda_aux_3exp.png",
     # )
+    
+    #? UNDER THIS ARE ALL OF THE PLOTS NEEDED FOR THE FINAL PAPER
     
     # plot_minatar_sampling_distribution_ablation(
     #     project="Deep-CVI-Experiments",
@@ -1452,13 +1465,13 @@ if __name__ == "__main__":
     #     panel_layout="vertical",
     # )
     
-    plot_minatar_gradient_alignment_and_volatility(
+    # #! CTD, QTD, Phi-TD, Categorical Phi-TD, Quantile Phi-TD
+    plot_minatar_20m_td_lambda_aux_3exp(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        experiment_tag="MinAtar_10M_Cosine_Similarity",
-        out_prefix="figures/minatar_10m_cosine_similarity",
-        grid_points=800,
-        max_runs=300,
-        smooth_window=31,
-        multi_seed_tag="multi_seed",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        experiment_tag="MinAtar_10M_PhiTD_Families",
+        out="figures/minatar_10m_full_ctd_qtd_phitd_categorical_phitd_quantile_phitd.png",
     )
+    

@@ -65,6 +65,43 @@ def categorical_cf_weighted_mse(
     return jnp.mean(err_squared), jnp.mean(im)
 
 
+def build_dirac_mixture_cf(pi, mu, omegas):
+    """Characteristic function of a mixture of Dirac masses (learned atom locations).
+
+    φ(ω) = Σ_k π_k · exp(i · ω · μ_k). Same mixture structure as MoG but without Gaussian
+    smoothing (used by Phi-TD / ``F_m`` on MinAtar).
+    """
+    pi_e = pi[..., None, :, :]
+    mu_e = mu[..., None, :, :]
+    w = omegas[..., None, None]
+    phase = w * mu_e
+    comp_cf = jnp.exp(1j * phase)
+    phi = jnp.sum(pi_e * comp_cf, axis=-1)
+    return phi
+
+
+def build_quantile_cf(quantiles, omegas):
+    """Characteristic function of the empirical / quantile-histogram distribution.
+
+    Mass 1/M on each ordered quantile location θ_j (``F_{Q,m}`` convention):
+
+        φ(ω) = (1/M) Σ_j exp(i · ω · θ_j).
+
+    Args:
+        quantiles: (..., M) learned quantile values.
+        omegas: (N,) real frequencies.
+
+    Returns:
+        Complex array (..., N).
+    """
+
+    def for_omega(w: jnp.ndarray) -> jnp.ndarray:
+        return jnp.mean(jnp.exp(1j * w * quantiles), axis=-1)
+
+    stacked = jax.vmap(for_omega)(omegas)
+    return jnp.moveaxis(stacked, 0, -1)
+
+
 def build_mog_cf(pi, mu, sigma, omegas):
     """Construct the Mixture-of-Gaussians characteristic function.
 
