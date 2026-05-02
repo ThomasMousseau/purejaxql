@@ -24,6 +24,12 @@ plus :func:`plot_minatar_10m_all_algos_combined` for **all** benchmark + PQN cur
 **Vmap’d seeds (one W&B run):** tag runs with ``multi_seed`` and log ``seed_i/charts/episodic_return``
 (``WANDB_LOG_ALL_SEEDS`` in trainers). :func:`curves_from_wandb_run` expands those into
 multiple curves so mean ± 95% CI matches multi-run aggregation.
+
+**Phi-TD MinAtar 10M** (``slurm/slurm_minatar_phi_families.sh``,
+``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh``): use
+:func:`plot_minatar_10m_phi_td_families` and :func:`plot_minatar_10m_phi_td_mog_gamma_laplace_logistic`
+with the experiment tags and algo tags emitted by those scripts (plus ``phi_family_compare`` /
+``phi_mog_gamma_laplace_logistic`` on runs).
 """
 from __future__ import annotations
 
@@ -66,6 +72,16 @@ def _algo_colors(algo_tags: list[str]) -> list[str]:
         "HALF_LAPLACIAN": "mog",
         "UNIFORM": "pqn",
         "HALF_GAUSSIAN": "qtd",
+        # Phi-TD family compare (slurm_minatar_phi_families.sh)
+        "PhiTD-Fm": "mog",
+        "PhiTD-FCm": "iqn",
+        "PhiTD-FQm": "pqn",
+        # MoG vs Phi-TD mixture CFs (slurm_minatar_phi_mog_gamma_laplace_logistic.sh)
+        "PhiTD-MoG": "qtd",
+        "PhiTD-MoGamma": "ctd",
+        "PhiTD-Laplace": "iqn",
+        "PhiTD-Logistic": "pqn",
+        "MoG-PQN": "mog",
     }
     return [algo_color(alias_map.get(tag, tag)) for tag in algo_tags]
 
@@ -412,6 +428,14 @@ def _draw_algo_curves_on_ax(
             "HALF_LAPLACIAN": "Half-Laplacian",
             "UNIFORM": "Uniform",
             "HALF_GAUSSIAN": "Half-Gaussian",
+            "PhiTD-Fm": "Phi-TD (F_m)",
+            "PhiTD-FCm": "Phi-TD (F_C,m)",
+            "PhiTD-FQm": "Phi-TD (F_Q,m)",
+            "PhiTD-MoG": "Phi-TD MoG",
+            "PhiTD-MoGamma": "Phi-TD Gamma",
+            "PhiTD-Laplace": "Phi-TD Laplace",
+            "PhiTD-Logistic": "Phi-TD Logistic",
+            "MoG-PQN": "MoG-PQN",
         }
         label = label_map.get(algo_tag, algo_tag)
         c = colors[idx % len(colors)]
@@ -1331,6 +1355,115 @@ def plot_minatar_sampling_distribution_ablation(
     )
 
 
+def plot_minatar_10m_phi_td_families(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_10M_PhiTD_Families",
+    out: str = "figures/minatar_10m_phi_td_families.png",
+    env_ids: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 3000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """CTD / QTD / Phi-TD variants from ``slurm/slurm_minatar_phi_families.sh``.
+
+    Runs must include tags: ``experiment_tag``, ``multi_seed``, ``phi_family_compare``, and exactly
+    one of ``CTD``, ``QTD``, ``PhiTD-Fm``, ``PhiTD-FCm``, ``PhiTD-FQm`` (algo tags from W&B).
+    """
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+    if algo_tags is None:
+        algo_tags = ["CTD", "QTD", "PhiTD-Fm", "PhiTD-FCm", "PhiTD-FQm"]
+
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        required_tag=["phi_family_compare"],
+        algo_tags=algo_tags,
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+    )
+
+
+def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic",
+    out: str = "figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+    env_ids: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 3000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = 0.1,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """MoG-PQN vs Phi-TD mixture CFs from ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh``.
+
+    Runs must include tags: ``experiment_tag``, ``multi_seed``, ``phi_mog_gamma_laplace_logistic``,
+    and exactly one of ``MoG-PQN``, ``PhiTD-MoG``, ``PhiTD-MoGamma``, ``PhiTD-Laplace``,
+    ``PhiTD-Logistic``.
+    """
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+    if algo_tags is None:
+        algo_tags = [
+            "MoG-PQN",
+            "PhiTD-MoG",
+            "PhiTD-MoGamma",
+            "PhiTD-Laplace",
+            "PhiTD-Logistic",
+        ]
+
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        required_tag=["phi_mog_gamma_laplace_logistic"],
+        algo_tags=algo_tags,
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+    )
+
+
 def plot_minatar_gradient_alignment_and_volatility(
     *,
     project: str = "Deep-CVI-Experiments",
@@ -1465,13 +1598,16 @@ if __name__ == "__main__":
     #     panel_layout="vertical",
     # )
     
-    # #! CTD, QTD, Phi-TD, Categorical Phi-TD, Quantile Phi-TD
-    plot_minatar_20m_td_lambda_aux_3exp(
+    #! CTD, QTD, Phi-TD (F_m / F_C,m / F_Q,m) — slurm_minatar_phi_families.sh
+    plot_minatar_10m_phi_td_families(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        experiment_tag="MinAtar_10M_PhiTD_Families",
-        out="figures/minatar_10m_full_ctd_qtd_phitd_categorical_phitd_quantile_phitd.png",
+        out="figures/minatar_10m_phi_td_families.png",
     )
-    
+    #! MoG-PQN vs Phi-TD MoG / Gamma / Laplace / Logistic — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
+    plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+    )
+

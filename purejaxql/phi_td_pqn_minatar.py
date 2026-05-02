@@ -8,6 +8,11 @@ Families (shared atom count ``NUM_ATOMS`` = m):
   - **dirac** (``F_m``): mixture of Diracs, φ(ω) = Σ_k π_k exp(i ω μ_k).
   - **categorical** (``F_{C,m}``): C51-style fixed support + softmax probs.
   - **quantile** (``F_{Q,m}``): fixed τ fractions + learned locations; φ is the empirical CF.
+  - **mog**: mixture of Gaussians (same heads as ``mog_pqn_minatar``); φ via ``build_mog_cf`` (CF-only loss).
+  - **cauchy**: mixture of Cauchy laws (MoC); optional / legacy.
+  - **gamma**: mixture of Gammas (MoΓ); φ(ω) = Σ_k π_k (1 − i θ_k ω)^(−α_k). Q = Σ_k π_k α_k θ_k.
+  - **laplace**: mixture of Laplaces; Q = Σ_k π_k μ_k (finite mean).
+  - **logistic**: mixture of logistics; Q = Σ_k π_k μ_k.
 
 See ``purejaxql.utils.mog_cf`` for CF primitives.
 """
@@ -37,8 +42,14 @@ import gymnax
 from purejaxql.distributional_pqn_minatar import project_categorical, select_action_values
 from purejaxql.utils.mog_cf import (
     build_categorical_cf,
+    build_cauchy_mixture_cf,
     build_dirac_mixture_cf,
+    build_gamma_mixture_cf,
+    build_laplace_mixture_cf,
+    build_logistic_mixture_cf,
+    build_mog_cf,
     build_quantile_cf,
+    gamma_mixture_q_values,
     mog_q_values,
     sample_frequencies,
 )
@@ -77,7 +88,7 @@ class CNN(nn.Module):
 
 
 class PhiTDMinAtarQNetwork(nn.Module):
-    """CNN trunk + head chosen by ``family_distribution`` (dirac / categorical / quantile)."""
+    """CNN trunk + head chosen by ``family_distribution`` (incl. mog / gamma / laplace / logistic)."""
 
     family_distribution: str
     action_dim: int
@@ -142,6 +153,48 @@ class PhiTDMinAtarQNetwork(nn.Module):
                 name="head_quantiles",
             )(latent)
             return {"quantiles": qv.reshape(-1, a, m)}
+        if fam == "mog":
+            pi_logits = nn.Dense(a * m, name="head_pi_logits")(latent)
+            pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
+            mu = nn.Dense(a * m, name="head_mu")(latent).reshape(-1, a, m)
+            sigma = jax.nn.softplus(
+                nn.Dense(a * m, name="head_sigma")(latent).reshape(-1, a, m)
+            )
+            return {"pi": pi, "mu": mu, "sigma": sigma}
+        if fam == "cauchy":
+            pi_logits = nn.Dense(a * m, name="head_pi_logits")(latent)
+            pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
+            loc = nn.Dense(a * m, name="head_loc")(latent).reshape(-1, a, m)
+            scale = jax.nn.softplus(
+                nn.Dense(a * m, name="head_cauchy_scale")(latent).reshape(-1, a, m)
+            )
+            return {"pi": pi, "loc": loc, "scale": scale}
+        if fam == "gamma":
+            pi_logits = nn.Dense(a * m, name="head_pi_logits")(latent)
+            pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
+            shape = jax.nn.softplus(
+                nn.Dense(a * m, name="head_gamma_shape")(latent).reshape(-1, a, m)
+            )
+            scale = jax.nn.softplus(
+                nn.Dense(a * m, name="head_gamma_scale")(latent).reshape(-1, a, m)
+            )
+            return {"pi": pi, "shape": shape, "scale": scale}
+        if fam == "laplace":
+            pi_logits = nn.Dense(a * m, name="head_pi_logits")(latent)
+            pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
+            loc = nn.Dense(a * m, name="head_laplace_loc")(latent).reshape(-1, a, m)
+            scale = jax.nn.softplus(
+                nn.Dense(a * m, name="head_laplace_scale")(latent).reshape(-1, a, m)
+            )
+            return {"pi": pi, "loc": loc, "scale": scale}
+        if fam == "logistic":
+            pi_logits = nn.Dense(a * m, name="head_pi_logits")(latent)
+            pi = jax.nn.softmax(pi_logits.reshape(-1, a, m), axis=-1)
+            loc = nn.Dense(a * m, name="head_logistic_loc")(latent).reshape(-1, a, m)
+            scale = jax.nn.softplus(
+                nn.Dense(a * m, name="head_logistic_scale")(latent).reshape(-1, a, m)
+            )
+            return {"pi": pi, "loc": loc, "scale": scale}
         raise ValueError(f"Unknown family_distribution: {self.family_distribution}")
 
     @nn.compact
@@ -305,9 +358,17 @@ def make_train(config: dict):
             out = network.apply(variables, obs, train=False)
             if family == "dirac":
                 return mog_q_values(out["pi"], out["mu"])
+            if family == "mog":
+                return mog_q_values(out["pi"], out["mu"])
             if family == "categorical":
                 probs = jax.nn.softmax(out["logits"], axis=-1)
                 return jnp.sum(probs * support, axis=-1)
+            if family == "cauchy":
+                return mog_q_values(out["pi"], out["loc"])
+            if family == "gamma":
+                return gamma_mixture_q_values(out["pi"], out["shape"], out["scale"])
+            if family in ("laplace", "logistic"):
+                return mog_q_values(out["pi"], out["loc"])
             return jnp.mean(out["quantiles"], axis=-1)
 
         def phi_gradient_step(train_state, batch, rng_step):
@@ -374,6 +435,88 @@ def make_train(config: dict):
                     1.0 - s_dones.astype(jnp.float32)[:, None]
                 ) * sel_nq
                 td_target = build_quantile_cf(jax.lax.stop_gradient(target_q), omegas)
+            elif family == "mog":
+                q_next = mog_q_values(out_next["pi"], out_next["mu"])
+                next_actions = jnp.argmax(q_next, axis=1)
+                pi_sel = out_next["pi"][bidx, next_actions]
+                mu_sel = out_next["mu"][bidx, next_actions]
+                sig_sel = out_next["sigma"][bidx, next_actions]
+                gammas = config["GAMMA"] * (1.0 - s_dones)
+                bellman_mu = s_rewards[:, None] + gammas[:, None] * mu_sel
+                bellman_sigma = gammas[:, None] * sig_sel
+                td_target = build_mog_cf(
+                    pi_sel[:, None, :],
+                    bellman_mu[:, None, :],
+                    bellman_sigma[:, None, :],
+                    omegas,
+                )
+                td_target = td_target[:, :, 0]
+            elif family == "cauchy":
+                q_next = mog_q_values(out_next["pi"], out_next["loc"])
+                next_actions = jnp.argmax(q_next, axis=1)
+                pi_sel = out_next["pi"][bidx, next_actions]
+                loc_sel = out_next["loc"][bidx, next_actions]
+                scale_sel = out_next["scale"][bidx, next_actions]
+                gammas = config["GAMMA"] * (1.0 - s_dones)
+                bellman_loc = s_rewards[:, None] + gammas[:, None] * loc_sel
+                bellman_scale = gammas[:, None] * scale_sel
+                td_target = build_cauchy_mixture_cf(
+                    pi_sel[:, None, :],
+                    bellman_loc[:, None, :],
+                    bellman_scale[:, None, :],
+                    omegas,
+                )
+                td_target = td_target[:, :, 0]
+            elif family == "gamma":
+                q_next = gamma_mixture_q_values(
+                    out_next["pi"], out_next["shape"], out_next["scale"]
+                )
+                next_actions = jnp.argmax(q_next, axis=1)
+                pi_sel = out_next["pi"][bidx, next_actions]
+                shape_sel = out_next["shape"][bidx, next_actions]
+                scale_sel = out_next["scale"][bidx, next_actions]
+                gammas = config["GAMMA"] * (1.0 - s_dones)
+                bellman_scale = gammas[:, None] * scale_sel
+                phase_r = jnp.exp(1j * s_rewards[:, None] * omegas[None, :])
+                mix_cf = build_gamma_mixture_cf(
+                    pi_sel[:, None, :],
+                    shape_sel[:, None, :],
+                    bellman_scale[:, None, :],
+                    omegas,
+                )
+                td_target = phase_r * mix_cf[:, :, 0]
+            elif family == "laplace":
+                q_next = mog_q_values(out_next["pi"], out_next["loc"])
+                next_actions = jnp.argmax(q_next, axis=1)
+                pi_sel = out_next["pi"][bidx, next_actions]
+                loc_sel = out_next["loc"][bidx, next_actions]
+                scale_sel = out_next["scale"][bidx, next_actions]
+                gammas = config["GAMMA"] * (1.0 - s_dones)
+                bellman_loc = s_rewards[:, None] + gammas[:, None] * loc_sel
+                bellman_scale = gammas[:, None] * scale_sel
+                td_target = build_laplace_mixture_cf(
+                    pi_sel[:, None, :],
+                    bellman_loc[:, None, :],
+                    bellman_scale[:, None, :],
+                    omegas,
+                )
+                td_target = td_target[:, :, 0]
+            elif family == "logistic":
+                q_next = mog_q_values(out_next["pi"], out_next["loc"])
+                next_actions = jnp.argmax(q_next, axis=1)
+                pi_sel = out_next["pi"][bidx, next_actions]
+                loc_sel = out_next["loc"][bidx, next_actions]
+                scale_sel = out_next["scale"][bidx, next_actions]
+                gammas = config["GAMMA"] * (1.0 - s_dones)
+                bellman_loc = s_rewards[:, None] + gammas[:, None] * loc_sel
+                bellman_scale = gammas[:, None] * scale_sel
+                td_target = build_logistic_mixture_cf(
+                    pi_sel[:, None, :],
+                    bellman_loc[:, None, :],
+                    bellman_scale[:, None, :],
+                    omegas,
+                )
+                td_target = td_target[:, :, 0]
             else:
                 raise ValueError(f"Unknown FAMILY_DISTRIBUTION: {family}")
 
@@ -396,6 +539,29 @@ def make_train(config: dict):
                 elif family == "quantile":
                     sel_q = select_action_values(out["quantiles"], s_actions)
                     online_phi_sel = build_quantile_cf(sel_q, omegas)
+                elif family == "mog":
+                    online_phi = build_mog_cf(out["pi"], out["mu"], out["sigma"], omegas)
+                    online_phi_sel = online_phi[bidx, :, s_actions]
+                elif family == "cauchy":
+                    online_phi = build_cauchy_mixture_cf(
+                        out["pi"], out["loc"], out["scale"], omegas
+                    )
+                    online_phi_sel = online_phi[bidx, :, s_actions]
+                elif family == "gamma":
+                    online_phi = build_gamma_mixture_cf(
+                        out["pi"], out["shape"], out["scale"], omegas
+                    )
+                    online_phi_sel = online_phi[bidx, :, s_actions]
+                elif family == "laplace":
+                    online_phi = build_laplace_mixture_cf(
+                        out["pi"], out["loc"], out["scale"], omegas
+                    )
+                    online_phi_sel = online_phi[bidx, :, s_actions]
+                elif family == "logistic":
+                    online_phi = build_logistic_mixture_cf(
+                        out["pi"], out["loc"], out["scale"], omegas
+                    )
+                    online_phi_sel = online_phi[bidx, :, s_actions]
                 else:
                     raise ValueError(f"Unknown FAMILY_DISTRIBUTION: {family}")
 
@@ -411,9 +577,17 @@ def make_train(config: dict):
 
                 if family == "dirac":
                     q_all = mog_q_values(out["pi"], out["mu"])
+                elif family == "mog":
+                    q_all = mog_q_values(out["pi"], out["mu"])
                 elif family == "categorical":
                     probs = jax.nn.softmax(out["logits"], axis=-1)
                     q_all = jnp.sum(probs * support, axis=-1)
+                elif family == "cauchy":
+                    q_all = mog_q_values(out["pi"], out["loc"])
+                elif family == "gamma":
+                    q_all = gamma_mixture_q_values(out["pi"], out["shape"], out["scale"])
+                elif family in ("laplace", "logistic"):
+                    q_all = mog_q_values(out["pi"], out["loc"])
                 else:
                     q_all = jnp.mean(out["quantiles"], axis=-1)
                 chosen_action_qvals = jnp.take_along_axis(
@@ -431,6 +605,8 @@ def make_train(config: dict):
                         * jax.nn.log_softmax(out["logits"], -1),
                         axis=-1,
                     ).mean()
+                elif family in ("cauchy", "gamma", "mog", "laplace", "logistic"):
+                    ent = -jnp.sum(out["pi"] * jnp.log(out["pi"] + 1e-8), axis=-1).mean()
                 else:
                     ent = jnp.array(0.0, dtype=jnp.float32)
                 return cf_loss, (updates, q_mean, q_gap, ent, cf_im, cf_loss)

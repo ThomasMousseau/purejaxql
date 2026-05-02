@@ -1,6 +1,6 @@
-# Canonical MoG MinAtar — match ``pqn_minatar.yaml`` shell (ε schedule, RAdam, batch stats);
-# MoG heads + CF Bellman + TD(λ) on ``q_mog_mean`` (see ``mog_pqn_minatar.py``).
-ALG_NAME: "mog_pqn"
+# Phi-TD MinAtar — mixture of Gammas (MoΓ): π, shape α, scale θ; CF Bellman only.
+ALG_NAME: "phi_td_gamma"
+FAMILY_DISTRIBUTION: "gamma"
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000
 
@@ -23,19 +23,18 @@ MAX_GRAD_NORM: 10
 PER_LAYER_GRADIENT_CLIPPING: False
 LR_LINEAR_DECAY: True
 
-# MoG–CF (one-step backup; same weight tape as PQN bootstrap)
+NUM_ATOMS: 51
+
 IS_DIVIDED_BY_OMEGA_SQUARED: True
 NUM_OMEGA_SAMPLES: 128
 OMEGA_MAX: 1.0
-OMEGA_SAMPLING_DISTRIBUTION: "half_laplacian"  # [half_laplacian, uniform, half_gaussian]
-OMEGA_HALF_GAUSSIAN_MEAN: 0.0
-OMEGA_HALF_GAUSSIAN_STD: 0.5
-NUM_COMPONENTS: 8
-AUX_MEAN_LOSS_WEIGHT: 0.0  # TD(λ) half-MSE weight vs CF loss -> #! 1.0 by default
+OMEGA_SAMPLING_DISTRIBUTION: "half_laplacian"
+
+V_MIN: 0.0
+V_MAX: 200.0
 
 REW_SCALE: 1.0
 GAMMA: 0.99
-LAMBDA: 0.0  # same default as pqn_minatar.yaml (Q(λ) mixing) -> #! 0.65 by default
 
 ENV_NAME: "Asterix-MinAtar"
 ENV_KWARGS: {}

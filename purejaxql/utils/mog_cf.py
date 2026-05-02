@@ -140,6 +140,125 @@ def mog_q_values(pi, mu):
     return jnp.sum(pi * mu, axis=-1)
 
 
+def build_cauchy_mixture_cf(pi, loc, scale, omegas):
+    """Characteristic function of a mixture of Cauchy(loc_k, scale_k).
+
+    φ(ω) = Σ_k π_k · exp(i·ω·loc_k − scale_k·|ω|).
+
+    Under affine returns Z = r + γ X with X Cauchy(loc, scale), Z is Cauchy(r + γ·loc, γ·scale),
+    matching the same Bellman closure pattern as MoG (scale scales with γ).
+
+    Args:
+        pi:    (..., action_dim, M) — mixture weights.
+        loc:   (..., action_dim, M) — Cauchy locations.
+        scale: (..., action_dim, M) — positive scale parameters.
+        omegas: (N,) — real frequencies.
+
+    Returns:
+        Complex array (..., N, action_dim).
+    """
+    pi_e = pi[..., None, :, :]
+    loc_e = loc[..., None, :, :]
+    scale_e = scale[..., None, :, :]
+    w = omegas[..., None, None]
+    phase = w * loc_e
+    decay = -scale_e * jnp.abs(w)
+    comp_cf = jnp.exp(decay + 1j * phase)
+    phi = jnp.sum(pi_e * comp_cf, axis=-1)
+    return phi
+
+
+def build_gamma_mixture_cf(pi, shape, scale, omegas):
+    """Characteristic function of a mixture of Gamma(shape_k, scale_k).
+
+    For X ~ Gamma(α, θ) (shape α, scale θ): φ_X(ω) = (1 − i·θ·ω)^(−α).
+
+    φ_mixture(ω) = Σ_k π_k · (1 − i·θ_k·ω)^(−α_k).
+
+    For returns Z = r + γ X, φ_Z(ω) = exp(i·r·ω) · φ_X(γω); equivalently per-component
+    (α, θ) ↦ (α, γ·θ) with an outer exp(i·r·ω) factor (handled in the trainer).
+
+    Args:
+        pi:     (..., action_dim, M) — mixture weights.
+        shape:  (..., action_dim, M) — Gamma shape α_k > 0.
+        scale:  (..., action_dim, M) — Gamma scale θ_k > 0.
+        omegas: (N,) — real frequencies.
+
+    Returns:
+        Complex array (..., N, action_dim).
+    """
+    pi_e = pi[..., None, :, :]
+    shape_e = shape[..., None, :, :]
+    scale_e = scale[..., None, :, :]
+    w = omegas[..., None, None]
+    z = (1.0 - 1j * scale_e * w).astype(jnp.complex64)
+    comp_cf = jnp.power(z, -shape_e)
+    phi = jnp.sum(pi_e * comp_cf, axis=-1)
+    return phi
+
+
+def gamma_mixture_q_values(pi, shape, scale):
+    """Expectation Q(s, a) = E[G] = Σ_k π_k · α_k · θ_k for Gamma components."""
+    return jnp.sum(pi * shape * scale, axis=-1)
+
+
+def build_laplace_mixture_cf(pi, loc, scale, omegas):
+    """Characteristic function of a mixture of Laplace(location μ, scale b).
+
+    φ(ω) = Σ_k π_k · exp(i·μ_k·ω) / (1 + b_k² ω²).
+
+    For Z = r + γ X with Laplace(μ, b), Z ~ Laplace(r + γ μ, γ b), same affine closure as MoG.
+
+    Args:
+        pi:    (..., action_dim, M) — mixture weights.
+        loc:   (..., action_dim, M) — locations (means).
+        scale: (..., action_dim, M) — scale b_k > 0.
+        omegas: (N,) — real frequencies.
+
+    Returns:
+        Complex array (..., N, action_dim).
+    """
+    pi_e = pi[..., None, :, :]
+    loc_e = loc[..., None, :, :]
+    scale_e = scale[..., None, :, :]
+    w = omegas[..., None, None]
+    denom = 1.0 + (scale_e * w) ** 2
+    comp_cf = jnp.exp(1j * loc_e * w) / denom
+    phi = jnp.sum(pi_e * comp_cf, axis=-1)
+    return phi
+
+
+def build_logistic_mixture_cf(pi, loc, scale, omegas):
+    """Characteristic function of a mixture of logistic distributions.
+
+    Standard logistic with location μ and scale s > 0:
+
+        φ(ω) = exp(i·μ·ω) · (π s ω) / sinh(π s ω).
+
+    Mixture: Σ_k π_k φ_k(ω). For Z = r + γ X, φ_Z(ω) = exp(i r ω) φ_X(γ ω), hence per bootstrap
+    μ' = r + γ μ, s' = γ s (handled in the trainer like Laplace / MoG).
+
+    Args:
+        pi:    (..., action_dim, M) — mixture weights.
+        loc:   (..., action_dim, M) — locations.
+        scale: (..., action_dim, M) — scale s_k > 0.
+        omegas: (N,) — real frequencies.
+
+    Returns:
+        Complex array (..., N, action_dim).
+    """
+    pi_e = pi[..., None, :, :]
+    loc_e = loc[..., None, :, :]
+    scale_e = scale[..., None, :, :]
+    w = omegas[..., None, None]
+    x = jnp.pi * scale_e * w
+    sinh_x = jnp.sinh(x)
+    ratio = jnp.where(jnp.abs(x) > 1e-7, x / sinh_x, jnp.ones_like(x))
+    comp_cf = jnp.exp(1j * loc_e * w) * ratio
+    phi = jnp.sum(pi_e * comp_cf, axis=-1)
+    return phi
+
+
 def sample_frequencies(
     key,
     num_samples,
