@@ -40,7 +40,7 @@ from itertools import islice
 from pathlib import Path
 
 import numpy as np
-from plot_colors import algo_color
+from plot_colors import algo_color, legend_label_for_wandb_algo_tag
 
 try:
     import matplotlib.pyplot as plt
@@ -52,38 +52,50 @@ try:
 except ImportError as e:
     raise SystemExit("Please install wandb: pip install wandb") from e
 
+from paper_plots import (
+    DEFAULT_CURVE_Y_MARGIN_FRAC,
+    configure_matplotlib,
+    save_figure_png_and_pdf,
+    style_axes_wandb_curve,
+    xlabel_for_step_metric,
+    ylabel_for_metric,
+)
+
+configure_matplotlib()
+
 def _algo_colors(algo_tags: list[str]) -> list[str]:
-    # Normalize run tags/aliases to shared palette keys from plot_colors.py.
-    alias_map: dict[str, str] = {
-        "MoG": "mog",
-        "IQN": "iqn",
-        "CTD": "ctd",
-        "QTD": "qtd",
-        "PQN": "pqn",
-        "CQN": "mog_cqn",
-        "QR-DQN": "qr_dqn",
-        "C51": "c51",
-        "IQN_RNN": "iqn_rnn",
-        "QTD_RNN": "qtd_rnn",
-        "CTD_RNN": "ctd_rnn",
-        "PQN_RNN": "pqn_rnn",
-        "MOG_PQN_RNN": "mog_pqn_rnn",
-        # Sampling-distribution ablation tags (MoG-PQN MinAtar).
-        "HALF_LAPLACIAN": "mog",
-        "UNIFORM": "pqn",
-        "HALF_GAUSSIAN": "qtd",
-        # Phi-TD family compare (slurm_minatar_phi_families.sh)
-        "PhiTD-Fm": "mog",
-        "PhiTD-FCm": "iqn",
-        "PhiTD-FQm": "pqn",
-        # MoG vs Phi-TD mixture CFs (slurm_minatar_phi_mog_gamma_laplace_logistic.sh)
-        "PhiTD-MoG": "qtd",
-        "PhiTD-MoGamma": "ctd",
-        "PhiTD-Laplace": "iqn",
-        "PhiTD-Logistic": "pqn",
-        "MoG-PQN": "mog",
-    }
-    return [algo_color(alias_map.get(tag, tag)) for tag in algo_tags]
+    """One canonical hex per W&B algo tag (see ``plot_colors.algo_color``)."""
+    return [algo_color(t) for t in algo_tags]
+
+
+_LEGACY_ALGO_LEGEND: dict[str, str] = {
+    "dqn": "DQN",
+    "C51": "C51",
+    "MoG": "MoG",
+    "FFT": "FFT",
+    "QR-DQN": "QR-DQN",
+    "IQN": "IQN",
+    "FQF": "FQF",
+    "MoG-PQN-stab": "MoG-PQN (stab.)",
+    "MoG-PQN": "MoG-PQN",
+    "CQN": "CQN",
+    "PQN": "PQN",
+    "PQN_RNN": "PQN-RNN",
+    "MOG_PQN_RNN": "MoG-PQN-RNN",
+    "HALF_LAPLACIAN": "Half-Laplacian",
+    "UNIFORM": "Uniform",
+    "HALF_GAUSSIAN": "Half-Gaussian",
+    "CTD": "CTD",
+    "QTD": "QTD",
+}
+
+
+def _legend_for_algo_tag(algo_tag: str, *, phi_families_compare: bool = False) -> str:
+    """Legend text: φTD variants use mathtext (``plot_colors``)."""
+    lab = legend_label_for_wandb_algo_tag(algo_tag, phi_families_compare=phi_families_compare)
+    if lab != algo_tag:
+        return lab
+    return _LEGACY_ALGO_LEGEND.get(algo_tag, algo_tag)
 
 
 def _wandb_path(entity: str | None, project: str) -> str:
@@ -326,36 +338,28 @@ def _smooth_1d(y: np.ndarray, window: int) -> np.ndarray:
 
 
 def _pretty_metric_label(metric: str) -> str:
+    """Y-axis label (short, publication-style)."""
     metric_label_map: dict[str, str] = {
-        "charts/episodic_return": "Episodic Return",
+        "charts/episodic_return": "Episode Return",
         "charts/episode_return": "Episode Return",
-        "episodic_return": "Episodic Return",
-        "returned_episode_returns": "Episodic Return",
+        "episodic_return": "Episode Return",
+        "returned_episode_returns": "Episode Return",
         "charts/grad_norm": "Gradient Norm",
         "grad_norm": "Gradient Norm",
-        "trunk_grad_cosine_similarity": "Trunk Gradient Cosine Similarity",
-        "trunk_td_lambda_grad_norm": "Trunk TD(lambda) Gradient Norm",
-        "trunk_dist_grad_norm": "Trunk Distributional Gradient Norm",
-        "centered_shape_volatility": "Centered Shape Volatility (Cramer)",
-        "aux_td_lambda_loss_for_grad_probe": "Aux TD(lambda) Loss (Probe)",
-        "dist_loss_for_grad_probe": "Distributional Loss (Probe)",
+        "trunk_grad_cosine_similarity": "Cosine Similarity",
+        "trunk_td_lambda_grad_norm": "TD(lambda) Gradient Norm",
+        "trunk_dist_grad_norm": "Distributional Gradient Norm",
+        "centered_shape_volatility": "Shape Volatility",
+        "aux_td_lambda_loss_for_grad_probe": "Aux TD(lambda) Loss",
+        "dist_loss_for_grad_probe": "Distributional Loss",
     }
     if metric in metric_label_map:
         return metric_label_map[metric]
-    tail = metric.split("/")[-1]
-    return tail.replace("_", " ").strip().title()
+    return ylabel_for_metric(metric)
 
 
 def _pretty_step_label(step_metric: str) -> str:
-    step_label_map: dict[str, str] = {
-        "global_step": "Environment Steps",
-        "env_step": "Environment Steps",
-        "update_steps": "Update Steps",
-        "_step": "Logging Step",
-    }
-    if step_metric in step_label_map:
-        return step_label_map[step_metric]
-    return step_metric.replace("_", " ").strip().title()
+    return xlabel_for_step_metric(step_metric)
 
 
 def _pretty_env_title(env_id: str) -> str:
@@ -376,10 +380,11 @@ def _draw_algo_curves_on_ax(
     metric: str,
     show_ylabel: bool,
     autoscale_y: bool = False,
-    y_top_margin: float = 0.1,
+    y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     y_bottom: float | None = 0.0,
+    phi_td_families_compare_legend: bool = False,
 ) -> None:
-    """If ``autoscale_y``, set y-axis to ``[y_bottom, (max of mean+95% CI) * (1 + y_top_margin)]`` per panel."""
+    """If ``autoscale_y``, y-limits use a small pad (``y_top_margin`` × span of the band)."""
     ymax_track = -np.inf
     ymin_track = np.inf
 
@@ -411,33 +416,7 @@ def _draw_algo_curves_on_ax(
         ymax_track = max(ymax_track, float(np.nanmax(upper)))
         ymin_track = min(ymin_track, float(np.nanmin(lower)))
 
-        label_map = {
-            "dqn": "DQN",
-            "C51": "C51",
-            "MoG": "MoG",
-            "FFT": "FFT",
-            "QR-DQN": "QR-DQN",
-            "IQN": "IQN",
-            "FQF": "FQF",
-            "MoG-PQN-stab": "MoG-PQN (stab.)",
-            "MoG-PQN": "MoG-PQN",
-            "CQN": "CQN",
-            "PQN": "PQN",
-            "PQN_RNN": "PQN-RNN",
-            "MOG_PQN_RNN": "MoG-PQN-RNN",
-            "HALF_LAPLACIAN": "Half-Laplacian",
-            "UNIFORM": "Uniform",
-            "HALF_GAUSSIAN": "Half-Gaussian",
-            "PhiTD-Fm": "Phi-TD (F_m)",
-            "PhiTD-FCm": "Phi-TD (F_C,m)",
-            "PhiTD-FQm": "Phi-TD (F_Q,m)",
-            "PhiTD-MoG": "Phi-TD MoG",
-            "PhiTD-MoGamma": "Phi-TD Gamma",
-            "PhiTD-Laplace": "Phi-TD Laplace",
-            "PhiTD-Logistic": "Phi-TD Logistic",
-            "MoG-PQN": "MoG-PQN",
-        }
-        label = label_map.get(algo_tag, algo_tag)
+        label = _legend_for_algo_tag(algo_tag, phi_families_compare=phi_td_families_compare_legend)
         c = colors[idx % len(colors)]
         ax.plot(grid, mean, color=c, linewidth=2.0, label=label)
         ax.fill_between(grid, lower, upper, color=c, alpha=0.2)
@@ -446,17 +425,19 @@ def _draw_algo_curves_on_ax(
     if show_ylabel:
         ax.set_ylabel(_pretty_metric_label(metric))
     leg_fs = 6 if len(algo_tags) > 6 else 8
+    style_axes_wandb_curve(ax)
     ax.legend(fontsize=leg_fs, loc="best")
-    ax.grid(True, alpha=0.3)
 
     if autoscale_y and np.isfinite(ymax_track) and ymax_track > 0:
-        top = ymax_track * (1.0 + y_top_margin)
+        span = max(float(ymax_track - ymin_track), 1e-6)
+        pad = y_top_margin * span
+        top = float(ymax_track) + pad
         if y_bottom is not None:
             bot = float(y_bottom)
         elif np.isfinite(ymin_track) and ymin_track < 0:
-            bot = ymin_track * (1.0 + y_top_margin)
+            bot = float(ymin_track) - pad
         else:
-            bot = 0.0
+            bot = max(0.0, float(ymin_track) - pad) if np.isfinite(ymin_track) else 0.0
         ax.set_ylim(bottom=bot, top=top)
 
 
@@ -505,23 +486,26 @@ def plot_episodic_return(
     experiment_tag: str | None = None,
     env_ids: list[str] | None = None,
     use_run_name_for_env: bool = True,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
+    phi_td_families_compare_legend: bool = False,
 ) -> None:
     """Plot mean ± 95% CI episodic return from W&B.
 
     - **Legacy (single panel):** leave ``env_ids`` as ``None``. Optionally set ``experiment_tag`` to filter runs.
     - **One env, filtered by id:** ``env_ids=[\"Breakout-MinAtar\"]`` and ``experiment_tag`` if needed.
     - **Five-env grid:** pass ``experiment_tag`` (e.g. ``\"MinAtar_10M\"``) and ``env_ids`` with 2+ entries;
-      one subplot per env, **independent y-axes** (not shared). Each panel’s top is
-      ``(max of mean+95% CI across algos) * (1 + multi_env_y_top_margin)`` (default 10 % headroom) so scales
-      match each game.
+      one subplot per env, **independent y-axes** (not shared). Y-limits add a small pad
+      (``multi_env_y_top_margin`` × span of the data in each panel).
 
     If ``config.env_id`` is missing on older runs, set ``use_run_name_for_env=True`` (default) to recover
     env from ``run.name``.
 
     Runs tagged with ``multi_seed_tag`` (default ``"multi_seed"``) use :func:`curves_from_wandb_run`
     to load ``seed_i/*`` metrics so one W&B run contributes multiple seed curves for mean ± 95% CI.
+
+    Set ``phi_td_families_compare_legend=True`` only for :func:`plot_minatar_10m_phi_td_families` so
+    Dirac / Categorical / Quantile legends include the ``$(F_{\cdot})$`` suffix.
     """
     if required_tag is None:
         required_tag = []
@@ -537,7 +521,6 @@ def plot_episodic_return(
     runs = list(islice(api.runs(path, order="-created_at"), max_runs))
 
     colors = _algo_colors(algo_tags)
-    metric_title = _pretty_metric_label(metric)
 
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
 
@@ -590,16 +573,14 @@ def plot_episodic_return(
                     autoscale_y=True,
                     y_top_margin=multi_env_y_top_margin,
                     y_bottom=0.0,
+                    phi_td_families_compare_legend=phi_td_families_compare_legend,
                 )
             ax.set_title(_pretty_env_title(eid), fontsize=10)
 
-        et = experiment_tag or ""
-        supt = f"{et} {metric_title}  "
-        fig.suptitle(supt, fontsize=12, y=1.03)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        fig.savefig(out, dpi=150, bbox_inches="tight")
+        fig.tight_layout(rect=[0, 0, 1, 1])
+        png_path, pdf_path = save_figure_png_and_pdf(fig, out, dpi_png=150, dpi_pdf=300)
         plt.close(fig)
-        print(f"Wrote {out}")
+        print(f"Wrote {png_path}\n      {pdf_path}")
         return
 
     # ----- Single panel -----
@@ -637,12 +618,16 @@ def plot_episodic_return(
         step_metric=step_metric,
         metric=metric,
         show_ylabel=True,
+        autoscale_y=True,
+        y_top_margin=multi_env_y_top_margin,
+        y_bottom=0.0,
+        phi_td_families_compare_legend=phi_td_families_compare_legend,
     )
-    plt.title(f"{metric_title} in {env_name}", fontsize=12)
+    plt.title(env_name, fontsize=12)
     plt.tight_layout()
-    plt.savefig(out, dpi=150)
+    png_path, pdf_path = save_figure_png_and_pdf(fig=plt.gcf(), path=out, dpi_png=150, dpi_pdf=300)
     plt.close()
-    print(f"Wrote {out}")
+    print(f"Wrote {png_path}\n      {pdf_path}")
 
 
 def plot_minatar_20m_td_lambda_aux_3exp(
@@ -831,6 +816,9 @@ def plot_minatar_20m_td_lambda_aux_3exp(
         "IQN": "IQN",
     }
 
+    def _label_algo(algo: str) -> str:
+        return label_map.get(algo, _legend_for_algo_tag(algo))
+
     stats: dict[str, dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]] = defaultdict(
         lambda: defaultdict(dict)
     )
@@ -891,26 +879,6 @@ def plot_minatar_20m_td_lambda_aux_3exp(
             return 1, total
         return total, 1
 
-    def _seed_summary_text() -> str:
-        parts: list[str] = []
-        for algo in algo_tags_plot:
-            counts: list[int] = []
-            for exp_key in exp_keys:
-                for env_id in env_ids:
-                    n_curves = len(by_exp_env_algo.get(exp_key, {}).get(env_id, {}).get(algo, []))
-                    if n_curves > 0:
-                        counts.append(n_curves)
-            if not counts:
-                continue
-            lo = min(counts)
-            hi = max(counts)
-            label = label_map.get(algo, algo)
-            if lo == hi:
-                parts.append(f"{label}: n={lo}")
-            else:
-                parts.append(f"{label}: n={lo}-{hi}")
-        return "; ".join(parts)
-
     def _render_single(output_path: str, *, include_titles: bool) -> None:
         base_rows = len(env_ids)
         base_cols = len(exp_keys)
@@ -945,7 +913,7 @@ def plot_minatar_20m_td_lambda_aux_3exp(
                     mean,
                     color=color,
                     linewidth=2.0,
-                    label=label_map.get(algo, algo),
+                    label=_label_algo(algo),
                 )
                 ax.fill_between(grid, lower, upper, color=color, alpha=0.2)
                 plotted_any = True
@@ -955,7 +923,7 @@ def plot_minatar_20m_td_lambda_aux_3exp(
 
             if include_titles:
                 tag_label = next(spec["tag_label"] for spec in exp_specs if spec["label"] == exp_key)
-                ax.set_title(f"{_pretty_env_title(env_id)} | {exp_key}\n{tag_label}", fontsize=9)
+                ax.set_title(f"{_pretty_env_title(env_id)}\n{exp_key}\n{tag_label}", fontsize=8)
             else:
                 ax.set_title(_pretty_env_title(env_id), fontsize=9)
             if c == 0 or n_cols == 1:
@@ -967,26 +935,19 @@ def plot_minatar_20m_td_lambda_aux_3exp(
                 ax.set_xlim(row_lims["x_min"], row_lims["x_max"])
             if np.isfinite(row_lims["y_min"]) and np.isfinite(row_lims["y_max"]):
                 row_y_bottom = min(0.0, row_lims["y_min"])
-                row_y_top = row_lims["y_max"] * 1.05 if row_lims["y_max"] > 0 else row_lims["y_max"] + 1.0
+                span = max(float(row_lims["y_max"] - row_lims["y_min"]), 1e-6)
+                pad = DEFAULT_CURVE_Y_MARGIN_FRAC * span
+                row_y_top = float(row_lims["y_max"]) + pad
                 ax.set_ylim(row_y_bottom, row_y_top)
-            ax.grid(True, alpha=0.3)
+            style_axes_wandb_curve(ax)
             if panel_i == len(flat_positions) - 1:
                 ax.legend(fontsize=7, loc="best")
 
-        if include_titles:
-            metric_title = _pretty_metric_label(metric)
-            exp_title = ", ".join(experiment_tags)
-            seed_summary = _seed_summary_text() or "no matched runs"
-            fig.suptitle(
-                f"{exp_title} | metric={metric_title} | shaded=95% CI | seeds per algo: {seed_summary}",
-                fontsize=10,
-                y=1.01,
-            )
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-        fig.tight_layout(rect=[0, 0, 1, 0.98])
-        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        fig.tight_layout(rect=[0, 0, 1, 1])
+        png_path, pdf_path = save_figure_png_and_pdf(fig, output_path, dpi_png=150, dpi_pdf=300)
         plt.close(fig)
-        print(f"Wrote {output_path}")
+        print(f"Wrote {png_path}\n      {pdf_path}")
 
     _render_single(out, include_titles=display_titles)
     if not display_titles:
@@ -1008,7 +969,7 @@ def plot_minatar_10m_mog_cqn_pqn(
     grid_points: int = 800,
     max_runs: int = 2000,
     smooth_window: int = 41,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
     """Four panels (one per MinAtar game): **MoG**, **PQN**, **CTD**, **QTD**, **IQN** only.
@@ -1069,7 +1030,7 @@ def plot_minatar_10m_benchmark_and_pqn_compare(
     grid_points: int = 800,
     max_runs: int = 2000,
     smooth_window: int = 41,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
     """Two or three multi-env figures from W&B.
@@ -1172,7 +1133,7 @@ def plot_minatar_10m_all_algos_combined(
     grid_points: int = 800,
     max_runs: int = 2000,
     smooth_window: int = 41,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
     """One figure: **benchmark + PQN-sweep** algorithms together (default **5 + 4 = 9** curves per env).
@@ -1202,7 +1163,6 @@ def plot_minatar_10m_all_algos_combined(
         **{t: experiment_tag_pqn for t in algo_tags_pqn},
     }
     colors = _algo_colors(algo_tags_all)
-    metric_title = _pretty_metric_label(metric)
 
     api = wandb.Api()
     path = _wandb_path(entity, project)
@@ -1259,13 +1219,11 @@ def plot_minatar_10m_all_algos_combined(
             )
         ax.set_title(_pretty_env_title(eid), fontsize=10)
 
-    supt = f"{experiment_tag_benchmark} + {experiment_tag_pqn}  {metric_title}"
-    fig.suptitle(supt, fontsize=11, y=1.02)
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.tight_layout(rect=[0, 0, 1, 1])
+    png_path, pdf_path = save_figure_png_and_pdf(fig, out, dpi_png=150, dpi_pdf=300)
     plt.close(fig)
-    print(f"Wrote {out}")
+    print(f"Wrote {png_path}\n      {pdf_path}")
 
 
 def plot_minatar_10m_grid(
@@ -1318,7 +1276,7 @@ def plot_minatar_sampling_distribution_ablation(
     grid_points: int = 800,
     max_runs: int = 3000,
     smooth_window: int = 41,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
     """Plot MinAtar MoG sampling-distribution ablation from W&B tags.
@@ -1369,13 +1327,16 @@ def plot_minatar_10m_phi_td_families(
     grid_points: int = 800,
     max_runs: int = 3000,
     smooth_window: int = 41,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
-    """CTD / QTD / Phi-TD variants from ``slurm/slurm_minatar_phi_families.sh``.
+    """CTD / QTD / :math:`\\varphi`TD-Dirac / Categorical / Quantile from ``slurm/slurm_minatar_phi_families.sh``.
+
+    Legends append ``$(F_m)$``, ``$(F_{C,m})$``, ``$(F_{Q,m})$`` only here; W&B tags stay
+    ``PhiTD-Fm``, ``PhiTD-FCm``, ``PhiTD-FQm``.
 
     Runs must include tags: ``experiment_tag``, ``multi_seed``, ``phi_family_compare``, and exactly
-    one of ``CTD``, ``QTD``, ``PhiTD-Fm``, ``PhiTD-FCm``, ``PhiTD-FQm`` (algo tags from W&B).
+    one of ``CTD``, ``QTD``, ``PhiTD-Fm``, ``PhiTD-FCm``, ``PhiTD-FQm``.
     """
     if env_ids is None:
         env_ids = [
@@ -1403,6 +1364,7 @@ def plot_minatar_10m_phi_td_families(
         use_run_name_for_env=use_run_name_for_env,
         multi_env_y_top_margin=multi_env_y_top_margin,
         multi_seed_tag=multi_seed_tag,
+        phi_td_families_compare_legend=True,
     )
 
 
@@ -1420,7 +1382,7 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     grid_points: int = 800,
     max_runs: int = 3000,
     smooth_window: int = 41,
-    multi_env_y_top_margin: float = 0.1,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
 ) -> None:
     """MoG-PQN vs Phi-TD mixture CFs from ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh``.

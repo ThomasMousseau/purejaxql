@@ -17,7 +17,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 
+from paper_plots import configure_matplotlib, save_figure_png_and_pdf, style_axes_panel
+
 jax_config.update("jax_enable_x64", True)
+configure_matplotlib()
 
 
 _HERE = Path(__file__).resolve().parent
@@ -490,8 +493,8 @@ def make_panels_and_table(
             fontsize=9,
             fontweight="bold",
         )
-    fig_tbl.suptitle("Per-action metrics (rows) across model families (columns)")
-    fig_tbl.savefig(out_dir / "cauchy_mog_comparison_metrics.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
+    stem = out_dir / "cauchy_mog_comparison_metrics"
+    save_figure_png_and_pdf(fig_tbl, stem, dpi_png=300, dpi_pdf=300, pad_inches=0.1)
     plt.close(fig_tbl)
 
     fig, axes = plt.subplots(len(rows), 4, figsize=(14.2, 2.8 * len(rows)))
@@ -598,17 +601,13 @@ def make_panels_and_table(
         ax_cdf.set_title("CDF" if i == 0 else "")
 
         for ax in (ax_hist, ax_phi, ax_pdf, ax_cdf):
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
-            ax.set_axisbelow(True)
+            style_axes_panel(ax)
         ax_hist.set_ylabel(r.replace("_", "\n").title(), fontsize=9, fontweight="bold")
 
     handles, labels = axes[0, 3].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 0.01), frameon=False)
-    #fig.suptitle("2-step MDP return fitting with CF loss: family-matched models win", y=0.995)
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.28, hspace=0.35)
-    fig.savefig(out_dir / "cauchy_mog_comparison_panels.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
+    save_figure_png_and_pdf(fig, out_dir / "cauchy_mog_comparison_panels", dpi_png=300, dpi_pdf=300, pad_inches=0.1)
     plt.close(fig)
 
     # Extra compact panels: Density + Re phi only (2x4 and 4x2).
@@ -638,10 +637,7 @@ def make_panels_and_table(
         )
         ax_density.set_title(r.replace("_action", "").replace("_", " ").title(), fontsize=9, fontweight="bold")
         ax_density.set_xlim(*rng)
-        ax_density.spines["top"].set_visible(False)
-        ax_density.spines["right"].set_visible(False)
-        ax_density.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
-        ax_density.set_axisbelow(True)
+        style_axes_panel(ax_density)
 
         ax_phi.plot(
             t_np,
@@ -666,16 +662,13 @@ def make_panels_and_table(
                 label=MODEL_NAME[c],
             )
         ax_phi.set_xlim(t_np.min(), t_np.max())
-        ax_phi.spines["top"].set_visible(False)
-        ax_phi.spines["right"].set_visible(False)
-        ax_phi.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
-        ax_phi.set_axisbelow(True)
+        style_axes_panel(ax_phi)
 
     axes_2x4[0, 0].set_ylabel("Density", fontweight="bold")
     axes_2x4[1, 0].set_ylabel(r"Re $\varphi$", fontweight="bold")
     axes_2x4[1, 0].legend(loc="lower right", frameon=False, fontsize=7, ncol=1)
     fig_2x4.subplots_adjust(left=0.07, right=0.995, top=0.92, bottom=0.10, wspace=0.22, hspace=0.23)
-    fig_2x4.savefig(out_dir / "cauchy_mog_comparison_panels_density_rephi_2x4.png", dpi=300, bbox_inches="tight", pad_inches=0.08)
+    save_figure_png_and_pdf(fig_2x4, out_dir / "cauchy_mog_comparison_panels_density_rephi_2x4", dpi_png=300, dpi_pdf=300, pad_inches=0.08)
     plt.close(fig_2x4)
 
     fig_4x2, axes_4x2 = plt.subplots(len(rows), 2, figsize=(7.5, 8.4))
@@ -704,10 +697,7 @@ def make_panels_and_table(
             label="Truth",
         )
         ax_density.set_xlim(*rng)
-        ax_density.spines["top"].set_visible(False)
-        ax_density.spines["right"].set_visible(False)
-        ax_density.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
-        ax_density.set_axisbelow(True)
+        style_axes_panel(ax_density)
 
         ax_phi.plot(
             t_np,
@@ -732,10 +722,7 @@ def make_panels_and_table(
                 label=MODEL_NAME[c],
             )
         ax_phi.set_xlim(t_np.min(), t_np.max())
-        ax_phi.spines["top"].set_visible(False)
-        ax_phi.spines["right"].set_visible(False)
-        ax_phi.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
-        ax_phi.set_axisbelow(True)
+        style_axes_panel(ax_phi)
         ax_density.text(
             -0.34,
             0.5,
@@ -749,7 +736,7 @@ def make_panels_and_table(
 
     axes_4x2[0, 1].legend(loc="lower right", frameon=False, fontsize=7, ncol=1)
     fig_4x2.subplots_adjust(left=0.15, right=0.99, top=0.96, bottom=0.08, wspace=0.18, hspace=0.28)
-    fig_4x2.savefig(out_dir / "cauchy_mog_comparison_panels_density_rephi_4x2.png", dpi=300, bbox_inches="tight", pad_inches=0.08)
+    save_figure_png_and_pdf(fig_4x2, out_dir / "cauchy_mog_comparison_panels_density_rephi_4x2", dpi_png=300, dpi_pdf=300, pad_inches=0.08)
     plt.close(fig_4x2)
 
     fig_curve, axes_curve = plt.subplots(1, len(rows), figsize=(4.4 * len(rows), 3.3))
@@ -772,17 +759,13 @@ def make_panels_and_table(
             )
         ax.set_yscale("log")
         ax.set_title(r.replace("_", " ").title())
-        ax.set_xlabel("Train step")
+        ax.set_xlabel("Training Step")
         if i == 0:
-            ax.set_ylabel("CF weighted loss")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.grid(True, linestyle="--", color="#e1e1e1", alpha=0.7)
-        ax.set_axisbelow(True)
+            ax.set_ylabel("Loss")
+        style_axes_panel(ax)
     axes_curve[-1].legend(frameon=False, loc="upper right")
-    fig_curve.suptitle("CF training curves")
     fig_curve.tight_layout()
-    fig_curve.savefig(out_dir / "cauchy_mog_comparison_training_curves.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
+    save_figure_png_and_pdf(fig_curve, out_dir / "cauchy_mog_comparison_training_curves", dpi_png=300, dpi_pdf=300, pad_inches=0.1)
     plt.close(fig_curve)
 
 

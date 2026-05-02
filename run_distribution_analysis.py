@@ -28,6 +28,14 @@ import numpy as np
 import optax
 from flax.training import train_state
 from plot_colors import algo_color
+from paper_plots import (
+    configure_matplotlib,
+    pdf_path_for_png_stem,
+    save_figure_png_and_pdf,
+    style_axes_panel,
+    style_axes_wandb_curve,
+)
+
 jax.config.update("jax_enable_x64", True)
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -990,7 +998,6 @@ def _save_parseval_training_plot(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = output_dir / f"distribution_analysis_parseval_training_mog_cqn_seed{cfg.seed}"
-    png_path = stem.with_suffix(".png")
     csv_path = stem.with_suffix(".csv")
 
     steps = np.asarray(history["step"], dtype=np.float64)
@@ -1009,27 +1016,26 @@ def _save_parseval_training_plot(
     y_cf = np.clip(np.nan_to_num(np.nanmean(cf_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
     y_cr_std = np.nan_to_num(np.nanstd(cr_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
     y_cf_std = np.nan_to_num(np.nanstd(cf_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
-    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10, "pdf.fonttype": 42, "ps.fonttype": 42})
     cr_color = "#5E2B97"
     cf_color = "#A06CD5"
 
+    configure_matplotlib()
     fig, ax = plt.subplots(1, 1, figsize=(6.1, 3.5))
-    ax.fill_between(steps, np.clip(y_cr - y_cr_std, 0.0, None), y_cr + y_cr_std, color=cr_color, alpha=0.18, lw=0)
-    ax.fill_between(steps, np.clip(y_cf - y_cf_std, 0.0, None), y_cf + y_cf_std, color=cf_color, alpha=0.14, lw=0)
+    ax.fill_between(steps, np.clip(y_cr - y_cr_std, 0.0, None), y_cr + y_cr_std, color=cr_color, alpha=0.2, lw=0)
+    ax.fill_between(steps, np.clip(y_cf - y_cf_std, 0.0, None), y_cf + y_cf_std, color=cf_color, alpha=0.2, lw=0)
     ax.plot(steps, y_cr, color=cr_color, lw=2.0, label=r"Cramer $L_2^2$ (CDF)")
     ax.plot(steps, y_cf, color=cf_color, lw=2.0, ls="--", label=r"CF $L_2^2/\omega^2$")
     pos = np.concatenate([y_cr[np.isfinite(y_cr)], y_cf[np.isfinite(y_cf)]])
     pos = pos[pos > 0]
     if pos.size and float(np.nanmin(pos)) > 0:
         ax.set_yscale("log")
-    ax.grid(True, linestyle="--", color="#D8D8D8", alpha=0.7)
-    ax.set_title("Empirical Parseval-Plancherel Theorem Validation")
-    ax.set_xlabel("Training step")
+    style_axes_wandb_curve(ax)
+    ax.set_title("Parseval anchor")
+    ax.set_xlabel("Training Step")
     ax.set_ylabel("Loss")
-    ax.legend(frameon=False, fontsize=8.5)
-    # fig.suptitle(f"Training ({tag})", y=1.02, fontsize=11)
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout(rect=[0, 0, 1, 1])
+    png_out, pdf_out = save_figure_png_and_pdf(fig, stem, dpi_png=300, dpi_pdf=300)
     plt.close(fig)
 
     fieldnames = (
@@ -1053,7 +1059,7 @@ def _save_parseval_training_plot(
                 }
             )
 
-    return {"png": str(png_path), "csv": str(csv_path)}
+    return {"png": png_out, "pdf": pdf_out, "csv": str(csv_path)}
 
 
 def save_msgpack(cfg: DAConfig, *params):
@@ -1103,15 +1109,13 @@ PLOT_LW = {"truth": 2.15, "iqn": 1.05, "qtd": 1.08, "ctd": 1.12, "mog_cqn": 1.2,
 
 
 def _plot_minimal_style(ax) -> None:
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(True, linestyle="--", color="#E0E0E0", alpha=0.7)
-    ax.set_axisbelow(True)
+    """Match ``paper_plots.style_axes_panel`` / Cauchy / MinAtar-derived panel aesthetic."""
+    style_axes_panel(ax)
 
 
 def _plot_save_fig(fig, path: str, *, png_dpi: int = 300) -> None:
     stem = os.path.splitext(path)[0]
-    fig.savefig(f"{stem}.png", format="png", bbox_inches="tight", pad_inches=0.08, dpi=png_dpi)
+    save_figure_png_and_pdf(fig, stem, dpi_png=png_dpi, dpi_pdf=png_dpi, pad_inches=0.08)
 
 
 def _plot_fmt_disp(x: float) -> str:
@@ -1212,7 +1216,6 @@ def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], row_ke
                 cell.set_facecolor(PLOT_WIN_BG)
         ax.text(0.5, 1.02, PLOT_DA_TITLES[algo], transform=ax.transAxes, ha="center", fontsize=9, fontweight="bold")
 
-    fig.suptitle("Mean ± SE over seeds", fontsize=11, y=0.985)
     _plot_save_fig(fig, path)
     plt.close(fig)
 
@@ -1260,7 +1263,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
                 continue
             y = np.real(mean_p[pkey][row])
             ys = np.real(se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row])
-            axcf.fill_between(te[tmask], (y - ys)[tmask], (y + ys)[tmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
+            axcf.fill_between(te[tmask], (y - ys)[tmask], (y + ys)[tmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axcf.plot(te[tmask], y[tmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axcf)
         axcf.set_xlim(-cf_hw, cf_hw)
@@ -1307,7 +1310,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             else:
                 y = _plot_smooth_curve(mean_p[pkey][row])
                 ys = _plot_smooth_curve(se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], passes=1)
-            axp.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
+            axp.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axp.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axp)
         axp.set_xlim(dist.plot_x_min, dist.plot_x_max)
@@ -1320,7 +1323,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
                 continue
             y = mean_p[pkey][row]
             ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
-            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0, step="post" if ckey == "ctd" else None)
+            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0, step="post" if ckey == "ctd" else None)
             if ckey == "ctd":
                 axc.step(xe[xmask], y[xmask], where="post", color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
             else:
@@ -1336,7 +1339,6 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
 
     if legend:
         fig.legend(*legend, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=4, frameon=False, fontsize=8)
-    fig.suptitle("Distribution panels", y=0.995)
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.3, hspace=0.42)
     _plot_save_fig(fig, path)
     plt.close(fig)
@@ -1384,7 +1386,7 @@ def _plot_density_cdf_only_panels(
                 continue
             y = mean_p[pkey][col]
             ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[col]
-            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
+            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axc)
         axc.set_xlim(dist.plot_x_min, dist.plot_x_max)
@@ -1415,7 +1417,7 @@ def _plot_density_cdf_only_panels(
                 continue
             y = mean_p[pkey][row]
             ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
-            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.18, lw=0)
+            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axc)
         axc.set_xlim(dist.plot_x_min, dist.plot_x_max)
@@ -1530,7 +1532,7 @@ def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> 
 
     if not payloads:
         raise ValueError("No payloads to plot.")
-    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10, "pdf.fonttype": 42, "ps.fonttype": 42})
+    configure_matplotlib()
     output_dir.mkdir(parents=True, exist_ok=True)
     row_keys = _plot_resolve_row_keys(payloads)
     metric_stats, panel_mean, panel_se, t_eval, x_eval, omega_max = _plot_aggregate_payloads(payloads, row_keys)
@@ -1554,9 +1556,13 @@ def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> 
 
     return {
         "metrics_png": os.path.splitext(metrics_png_base)[0] + ".png",
+        "metrics_pdf": str(pdf_path_for_png_stem(Path(metrics_png_base).with_suffix(""))),
         "panels_png": os.path.splitext(panels_png_base)[0] + ".png",
+        "panels_pdf": str(pdf_path_for_png_stem(Path(panels_png_base).with_suffix(""))),
         "panels_density_cdf_2x4_png": os.path.splitext(panels_density_cdf_2x4_base)[0] + ".png",
+        "panels_density_cdf_2x4_pdf": str(pdf_path_for_png_stem(Path(panels_density_cdf_2x4_base).with_suffix(""))),
         "panels_density_cdf_4x2_png": os.path.splitext(panels_density_cdf_4x2_base)[0] + ".png",
+        "panels_density_cdf_4x2_pdf": str(pdf_path_for_png_stem(Path(panels_density_cdf_4x2_base).with_suffix(""))),
         "metrics_csv": metrics_csv,
     }
 
@@ -1568,7 +1574,7 @@ def plot_distribution_analysis_from_wandb(
     import matplotlib.pyplot as plt
     import wandb
 
-    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10, "pdf.fonttype": 42, "ps.fonttype": 42})
+    configure_matplotlib()
 
     api = wandb.Api()
     final_entity = entity or os.environ.get("WANDB_ENTITY") or getattr(api, "default_entity", None)
@@ -1705,9 +1711,12 @@ def train_and_export(
         if last_losses:
             wandb_mod.summary.update(last_losses)
         if parseval_plot_paths:
-            for p in parseval_plot_paths.values():
+            for key, p in parseval_plot_paths.items():
+                if key == "csv":
+                    continue
                 wandb_mod.save(p, policy="now")
             wandb_mod.summary["parseval_train_plot_png"] = parseval_plot_paths["png"]
+            wandb_mod.summary["parseval_train_plot_pdf"] = parseval_plot_paths.get("pdf", "")
             wandb_mod.summary["parseval_train_metrics_csv"] = parseval_plot_paths["csv"]
         _wandb_log_eval_metrics(pm, tag, step=cfg.total_steps)
         _save_eval_payload_to_wandb(payload)
