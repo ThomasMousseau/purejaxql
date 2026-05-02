@@ -4,7 +4,7 @@ at a time with **only** the characteristic-function TD(0) Bellman loss (no TD(λ
 auxiliary). Default ω sampling is truncated Pareto (α=1) with **no** ``1/ω²`` loss weights,
 matching a Cramér-type CF objective (see ``purejaxql.utils.cf_pareto``).
 
-Families (shared atom count ``NUM_ATOMS`` = m):
+Families (shared particle count ``M_PARTICLES`` = m):
 
   - **dirac** (``F_m``): mixture of Diracs, φ(ω) = Σ_k π_k exp(i ω μ_k).
   - **categorical** (``F_{C,m}``): C51-style fixed support + softmax probs.
@@ -249,7 +249,12 @@ def make_train(config: dict):
 
     action_dim = env.action_space(env_params).n
     family = str(config.get("FAMILY_DISTRIBUTION", "dirac")).lower()
-    num_atoms = int(config["NUM_ATOMS"])
+    if config.get("M_PARTICLES") is not None:
+        num_atoms = int(config["M_PARTICLES"])
+    elif config.get("NUM_PARTICLES") is not None:
+        num_atoms = int(config["NUM_PARTICLES"])
+    else:
+        num_atoms = int(config["NUM_ATOMS"])
     if family == "categorical":
         support = jnp.linspace(
             float(config.get("V_MIN", 0.0)),

@@ -21,8 +21,9 @@ NUM_LAYERS: 1
 NUM_RNN_LAYERS: 1
 ADD_LAST_ACTION: True
 
-NUM_ATOMS: 51
-# C51 atom support [V_MIN, V_MAX]; required only for ``FAMILY_DISTRIBUTION: categorical``.
+# C51: m support particles on [V_MIN, V_MAX] (categorical / F_C only).
+M_PARTICLES: 51
+# Only used for ``FAMILY_DISTRIBUTION: categorical``.
 V_MIN: 0.0
 V_MAX: 200.0
 

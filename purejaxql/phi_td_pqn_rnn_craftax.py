@@ -450,7 +450,12 @@ def make_train(config: dict):
     obs_shape = env.observation_space(env_params).shape
 
     family = str(config.get("FAMILY_DISTRIBUTION", "categorical")).lower()
-    num_atoms = int(config["NUM_ATOMS"])
+    if config.get("M_PARTICLES") is not None:
+        num_atoms = int(config["M_PARTICLES"])
+    elif config.get("NUM_PARTICLES") is not None:
+        num_atoms = int(config["NUM_PARTICLES"])
+    else:
+        num_atoms = int(config["NUM_ATOMS"])
     if family == "categorical":
         support = jnp.linspace(
             float(config.get("V_MIN", 0.0)),

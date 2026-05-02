@@ -21,8 +21,8 @@ NUM_LAYERS: 1
 NUM_RNN_LAYERS: 1
 ADD_LAST_ACTION: True
 
-# Same head width as QR-DQN-RNN (``NUM_QUANTILES`` there).
-NUM_ATOMS: 51
+# Quantile count m (same head width as ``qtd_rnn_craftax`` ``NUM_QUANTILES``).
+M_PARTICLES: 51
 
 IS_DIVIDED_BY_OMEGA_SQUARED: False
 NUM_OMEGA_SAMPLES: 128

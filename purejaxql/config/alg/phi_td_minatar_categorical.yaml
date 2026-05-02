@@ -23,8 +23,8 @@ MAX_GRAD_NORM: 10
 PER_LAYER_GRADIENT_CLIPPING: False
 LR_LINEAR_DECAY: True
 
-NUM_ATOMS: 51
-# C51 atom support [V_MIN, V_MAX]; required only for ``FAMILY_DISTRIBUTION: categorical``.
+M_PARTICLES: 51
+# C51: m support particles on [V_MIN, V_MAX]; only for ``FAMILY_DISTRIBUTION: categorical``.
 V_MIN: 0.0
 V_MAX: 200.0
 
