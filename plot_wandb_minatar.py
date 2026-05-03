@@ -30,6 +30,10 @@ multiple curves so mean ± 95% CI matches multi-run aggregation.
 :func:`plot_minatar_10m_phi_td_families` and :func:`plot_minatar_10m_phi_td_mog_gamma_laplace_logistic`
 with the experiment tags and algo tags emitted by those scripts (plus ``phi_family_compare`` /
 ``phi_mog_gamma_laplace_logistic`` on runs).
+
+**φTD-MoG vs MoG-PQN weighted CF (Exp 1):** train with
+``slurm/slurm_minatar_phi_td_mog_mimic_weighted_cf_exp1.sh`` and compare to historical
+``MinAtar_20M_Td_Lambda_WeightedCF_MoG`` using :func:`plot_minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic`.
 """
 from __future__ import annotations
 
@@ -954,6 +958,246 @@ def plot_minatar_20m_td_lambda_aux_3exp(
         _render_single(_title_variant_path(out), include_titles=True)
 
 
+def plot_minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    baseline_experiment_tag: str = "MinAtar_20M_Td_Lambda_WeightedCF_MoG",
+    phi_mimic_experiment_tag: str = "MinAtar_20M_PhiTD_MoG_Mimic_WeightedCF",
+    out: str = "figures/minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic.png",
+    env_ids: list[str] | None = None,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 600,
+    max_runs_per_group: int = 5,
+    smooth_window: int = 41,
+    use_run_name_for_env: bool = True,
+    multi_seed_tag: str = "multi_seed",
+    display_titles: bool = False,
+    panel_layout: str = "horizontal",
+) -> None:
+    """Four panels (one per MinAtar game): Exp 1 only — MoG-PQN weighted CF vs φTD-MoG mimic.
+
+    **Baseline** runs must match the historical weighted-CF sweep (``slurm_minatar_lambda_aux_sensitivity_weighted_cf_mog.sh`` Exp 1): experiment tag ``baseline_experiment_tag``, tags ``MoG``, ``WEIGHTED_CF``, ``IS_DIVIDED_BY_OMEGA_SQUARED-True``, ``LAMBDA-0.0``, ``AUX_MEAN_LOSS_WEIGHT-0.0``, ``multi_seed``.
+
+    **φTD mimic** runs use ``phi_mimic_experiment_tag`` and must carry exactly one of the algo tags in :func:`_algo_group` — default ``PhiTD-MoG`` from ``slurm/slurm_minatar_phi_td_mog_mimic_weighted_cf_exp1.sh``.
+    """
+    baseline_algo_key = "MoG-WeightedCF"
+    phi_algo_key = "PhiTD-MoG"
+    algo_tags_plot = [baseline_algo_key, phi_algo_key]
+
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+
+    baseline_required = [
+        baseline_experiment_tag,
+        "MoG",
+        "WEIGHTED_CF",
+        "IS_DIVIDED_BY_OMEGA_SQUARED-True",
+        "LAMBDA-0.0",
+        "AUX_MEAN_LOSS_WEIGHT-0.0",
+        multi_seed_tag,
+    ]
+    phi_required = [
+        phi_mimic_experiment_tag,
+        phi_algo_key,
+        "WEIGHTED_CF",
+        "IS_DIVIDED_BY_OMEGA_SQUARED-True",
+        "LAMBDA-0.0",
+        "AUX_MEAN_LOSS_WEIGHT-0.0",
+        "EXP1_PHI_TD_MIMIC",
+        multi_seed_tag,
+    ]
+
+    api = wandb.Api()
+    path = _wandb_path(entity, project)
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
+
+    group_counts: dict[tuple[str, str], int] = defaultdict(int)
+    run_jobs: list[tuple] = []
+
+    for run in runs:
+        env_id = _get_run_env_id(run, use_run_name=use_run_name_for_env)
+        if env_id is None or env_id not in env_ids:
+            continue
+
+        algo: str | None = None
+        if _run_matches_required(run, baseline_required):
+            algo = baseline_algo_key
+        elif _run_matches_required(run, phi_required):
+            algo = phi_algo_key
+        else:
+            continue
+
+        key = (env_id, algo)
+        if group_counts[key] >= max_runs_per_group:
+            continue
+        group_counts[key] += 1
+        run_jobs.append((run, env_id, algo))
+
+    if not run_jobs:
+        raise RuntimeError(
+            "No runs matched for Exp1 MoG weighted CF vs φTD mimic. "
+            "Check W&B tags (baseline vs mimic experiment tags) and env ids."
+        )
+
+    by_env_algo: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    workers = min(12, len(run_jobs))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                curves_from_wandb_run,
+                run,
+                metric=metric,
+                step_metric=step_metric,
+                multi_seed_tag=multi_seed_tag,
+            ): (env_id, algo)
+            for run, env_id, algo in run_jobs
+        }
+        for fut in as_completed(futures):
+            env_id, algo = futures[fut]
+            try:
+                series_list = fut.result()
+            except Exception:
+                continue
+            for series in series_list:
+                by_env_algo[env_id][algo].append(series)
+
+    if not by_env_algo:
+        raise RuntimeError("Matched runs did not yield any metric series.")
+
+    colors = _algo_colors(algo_tags_plot)
+    label_map = {
+        baseline_algo_key: "MoG-CQN (Weighted CF)",
+        phi_algo_key: _legend_for_algo_tag(phi_algo_key),
+    }
+
+    row_limits: dict[str, dict[str, float]] = {
+        env_id: {
+            "x_min": np.inf,
+            "x_max": -np.inf,
+            "y_min": np.inf,
+            "y_max": -np.inf,
+        }
+        for env_id in env_ids
+    }
+
+    stats: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = defaultdict(
+        dict
+    )
+    for env_id in env_ids:
+        for algo in algo_tags_plot:
+            curves = by_env_algo.get(env_id, {}).get(algo, [])
+            computed = _curve_mean_ci_on_grid(
+                curves,
+                grid_points=grid_points,
+                smooth_window=smooth_window,
+            )
+            if computed is None:
+                continue
+            stats[env_id][algo] = computed
+            grid, _, lower, upper = computed
+            if np.isfinite(np.nanmin(grid)):
+                row_limits[env_id]["x_min"] = min(row_limits[env_id]["x_min"], float(np.nanmin(grid)))
+            if np.isfinite(np.nanmax(grid)):
+                row_limits[env_id]["x_max"] = max(row_limits[env_id]["x_max"], float(np.nanmax(grid)))
+            if np.isfinite(np.nanmin(lower)):
+                row_limits[env_id]["y_min"] = min(row_limits[env_id]["y_min"], float(np.nanmin(lower)))
+            if np.isfinite(np.nanmax(upper)):
+                row_limits[env_id]["y_max"] = max(row_limits[env_id]["y_max"], float(np.nanmax(upper)))
+
+    def _title_variant_path(path: str) -> str:
+        p = Path(path)
+        return str(p.with_name(f"{p.stem}_with_titles{p.suffix}"))
+
+    def _layout_dims(nr: int, nc: int, layout: str) -> tuple[int, int]:
+        total = nr * nc
+        if total < 2 or total > 4:
+            return nr, nc
+        mode = layout.strip().lower()
+        if mode not in {"horizontal", "vertical"}:
+            raise ValueError("panel_layout must be 'horizontal' or 'vertical'.")
+        if mode == "horizontal":
+            return 1, total
+        return total, 1
+
+    def _render_single(output_path: str, *, include_titles: bool) -> None:
+        base_rows = len(env_ids)
+        base_cols = 1
+        n_rows, n_cols = _layout_dims(base_rows, base_cols, panel_layout)
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(4.8 * n_cols, 3.1 * n_rows),
+            squeeze=False,
+        )
+
+        flat_positions = [(r, c) for r in range(base_rows) for c in range(base_cols)]
+        for panel_i, (r, c) in enumerate(flat_positions):
+            if n_rows == base_rows and n_cols == base_cols:
+                ax = axes[r][c]
+            elif n_rows == 1:
+                ax = axes[0][panel_i]
+            else:
+                ax = axes[panel_i][0]
+            env_id = env_ids[r]
+
+            plotted_any = False
+            for idx, algo in enumerate(algo_tags_plot):
+                computed = stats.get(env_id, {}).get(algo)
+                if computed is None:
+                    continue
+                grid, mean, lower, upper = computed
+                color = colors[idx % len(colors)]
+                ax.plot(grid, mean, color=color, linewidth=2.0, label=label_map.get(algo, algo))
+                ax.fill_between(grid, lower, upper, color=color, alpha=0.2)
+                plotted_any = True
+
+            if not plotted_any:
+                ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
+
+            title_env = _pretty_env_title(env_id)
+            if include_titles:
+                ax.set_title(
+                    f"{title_env}\nExp 1: λ=0, aux=0\nMoG weighted CF vs φTD-MoG mimic",
+                    fontsize=8,
+                )
+            else:
+                ax.set_title(title_env, fontsize=9)
+            if c == 0 or n_cols == 1:
+                ax.set_ylabel(_pretty_metric_label(metric))
+            if r == base_rows - 1 or n_rows == 1:
+                ax.set_xlabel(_pretty_step_label(step_metric))
+            row_lims = row_limits[env_id]
+            if np.isfinite(row_lims["x_min"]) and np.isfinite(row_lims["x_max"]):
+                ax.set_xlim(row_lims["x_min"], row_lims["x_max"])
+            if np.isfinite(row_lims["y_min"]) and np.isfinite(row_lims["y_max"]):
+                row_y_bottom = min(0.0, row_lims["y_min"])
+                span = max(float(row_lims["y_max"] - row_lims["y_min"]), 1e-6)
+                pad = DEFAULT_CURVE_Y_MARGIN_FRAC * span
+                row_y_top = float(row_lims["y_max"]) + pad
+                ax.set_ylim(row_y_bottom, row_y_top)
+            style_axes_wandb_curve(ax)
+            if panel_i == len(flat_positions) - 1:
+                ax.legend(fontsize=7, loc="best")
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        fig.tight_layout(rect=[0, 0, 1, 1])
+        png_path, pdf_path = save_figure_png_and_pdf(fig, output_path, dpi_png=150, dpi_pdf=300)
+        plt.close(fig)
+        print(f"Wrote {png_path}\n      {pdf_path}")
+
+    _render_single(out, include_titles=display_titles)
+    if not display_titles:
+        _render_single(_title_variant_path(out), include_titles=True)
+
+
 def plot_minatar_10m_mog_cqn_pqn(
     *,
     project: str = "Deep-CVI-Experiments",
@@ -1521,12 +1765,12 @@ if __name__ == "__main__":
     #     out="figures/minatar_sampling_distribution_ablation.png",
     # )
     
-    plot_minatar_sampling_distribution_ablation(
-        experiment_tag="MinAtar_PhiTD_MoG_Sampling_Distribution",
-        required_tag=["PhiTD-MoG"],
-        algo_tags=["HALF_LAPLACIAN", "UNIFORM", "HALF_GAUSSIAN", "PARETO_1"],
-        out="figures/minatar_phitd_mog_sampling_distribution.png",
-    )
+    # plot_minatar_sampling_distribution_ablation(
+    #     experiment_tag="MinAtar_PhiTD_MoG_Sampling_Distribution",
+    #     required_tag=["PhiTD-MoG"],
+    #     algo_tags=["HALF_LAPLACIAN", "UNIFORM", "HALF_GAUSSIAN", "PARETO_1"],
+    #     out="figures/minatar_phitd_mog_sampling_distribution.png",
+    # )
     
     # #! 4 envs, 3 experiments, 6 algos
     # plot_minatar_20m_td_lambda_aux_3exp(
@@ -1603,4 +1847,19 @@ if __name__ == "__main__":
     #     entity="fatty_data",
     #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic_v2.png",
     # )
+    
+    # Exp 1 (λ=0, aux=0): baseline ``MinAtar_20M_Td_Lambda_WeightedCF_MoG`` vs φTD-MoG mimic
+    # (``slurm/slurm_minatar_phi_td_mog_mimic_weighted_cf_exp1.sh``).
+    plot_minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        metric="charts/episodic_return",
+        step_metric="global_step",
+        baseline_experiment_tag="MinAtar_20M_Td_Lambda_WeightedCF_MoG",
+        phi_mimic_experiment_tag="MinAtar_20M_PhiTD_MoG_Mimic_WeightedCF",
+        out="figures/minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic.png",
+        max_runs=600,
+        max_runs_per_group=5,
+        display_titles=False,
+    )
 

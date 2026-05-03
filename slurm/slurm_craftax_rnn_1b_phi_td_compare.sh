@@ -6,7 +6,7 @@
 #SBATCH --array=0-39%40
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=32G
-#SBATCH --time=10:00:00
+#SBATCH --time=8:00:00
 
 ################################################################################
 # Craftax 1B env steps: **8 Phi-TD families** × **5 seeds (0–4)** = **40 tasks** (array 0–39).
@@ -16,7 +16,7 @@
 #
 # Apples-to-apples (shared across phi YAMLs): env, rollout, LSTM trunk, optimizer, exploration.
 #
-# W&B: ``WANDB_EXPERIMENT_TAG`` (default Craftax-1B-phi-td-compare).
+# W&B: ``WANDB_EXPERIMENT_TAG`` (default ``Craftax-1B-phiTD-hLap-wOmega2``; must be ≤64 chars).
 #
 # Mapping: TID → ALGO_IDX = TID/5, SEED_IDX = TID%5 (ALGO_IDX 0–7 → phi family yaml).
 #
@@ -37,7 +37,7 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-phi-td-compare-half-laplace-sampling-distribution}"
+EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-phiTD-hLap-wOmega2}"
 CRAFTAX_ENV_NAME="${CRAFTAX_ENV_NAME:-Craftax-Symbolic-v1}"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
@@ -92,7 +92,8 @@ HYDRA_COMMON=(
   "+alg.EXPERIMENT_TAG=${EXPERIMENT_TAG}"
   "alg.ENV_NAME=${CRAFTAX_ENV_NAME}"
   "alg.OMEGA_SAMPLING_DISTRIBUTION=half_laplace"
-  "alg.IS_DIVIDED_BY_OMEGA_SQUARED=False"
+  "alg.IS_DIVIDED_BY_OMEGA_SQUARED=True"
+  "alg.NUM_OMEGA_SAMPLES=32"
 )
 
 srun uv run --no-sync python -m purejaxql.phi_td_pqn_rnn_craftax \

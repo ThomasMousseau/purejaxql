@@ -43,6 +43,8 @@ _WANDB_TAG_HEX: dict[str, str] = {
     "PhiTD-FCm": COLOR_PHITD_FCM,
     "PhiTD-FQm": COLOR_PHITD_FQM,
     "PhiTD-MoG": COLOR_PHITD_MOG,
+    # MoG-PQN weighted-CF sweep (``plot_minatar_20m_td_lambda_aux_3exp`` / mimic vs baseline)
+    "MoG-WeightedCF": "#ff0000",
     "PhiTD-MoGamma": COLOR_PHITD_MOGAMMA,
     "PhiTD-Laplace": COLOR_PHITD_LAPLACE,
     "PhiTD-Logistic": COLOR_PHITD_LOGISTIC,
