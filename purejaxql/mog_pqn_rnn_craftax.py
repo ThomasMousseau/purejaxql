@@ -449,6 +449,17 @@ def make_train(config: dict):
                             rng_omega,
                             int(config["NUM_OMEGA_SAMPLES"]),
                             float(config["OMEGA_MAX"]),
+                            scale=config.get("OMEGA_SCALE"),
+                            distribution=config.get(
+                                "OMEGA_SAMPLING_DISTRIBUTION", "half_laplacian"
+                            ),
+                            gaussian_mean=float(
+                                config.get("OMEGA_HALF_GAUSSIAN_MEAN", 0.0)
+                            ),
+                            gaussian_std=float(
+                                config.get("OMEGA_HALF_GAUSSIAN_STD", 0.5)
+                            ),
+                            omega_min=config.get("OMEGA_MIN"),
                         )
                         (_, (pi, mu, sigma)), updates = partial(
                             network.apply, train=True, mutable=["batch_stats"]

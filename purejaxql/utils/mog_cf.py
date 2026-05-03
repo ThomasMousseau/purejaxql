@@ -274,7 +274,7 @@ def sample_frequencies(
     """Sample positive ω frequencies for CF losses.
 
     Supported distributions:
-      - ``half_laplacian``: truncated exponential on ``[0, omega_max]``.
+      - ``half_laplacian`` / ``half_laplace``: truncated exponential on ``[0, omega_max]``.
       - ``pareto_1`` / ``pareto_alpha_1``: truncated Pareto with shape α=1 on
         ``[omega_min, omega_max]``. Pass ``omega_min`` explicitly (defaults inside
         ``sample_truncated_pareto_alpha_1``). Intended for unweighted CF MSE (Cramér-type objective).
@@ -285,6 +285,8 @@ def sample_frequencies(
       - Frequencies are always non-negative (conjugate symmetry in CF space).
     """
     distribution = str(distribution).lower()
+    if distribution == "half_laplace":
+        distribution = "half_laplacian"
 
     if distribution == "half_laplacian":
         if scale is None:
@@ -324,5 +326,5 @@ def sample_frequencies(
 
     raise ValueError(
         "Unknown distribution for sample_frequencies: "
-        f"{distribution}. Supported: half_laplacian, pareto_1, uniform, half_gaussian."
+        f"{distribution}. Supported: half_laplacian (alias half_laplace), pareto_1, uniform, half_gaussian."
     )

@@ -453,9 +453,16 @@ def main() -> None:
         entity="fatty_data",
         phi_experiment_tag="Craftax-1B-phi-td-compare",
         baseline_experiment_tag="Craftax-1B-5ALG",
-        out="figures/craftax_1b_rnn_phi_td_with_baselines.png",
+        out="figures/craftax_1b_rnn_phi_td_with_baselines_pareto_1_sampling_distribution.png",
     )
-    pass
+    
+    plot_craftax_phi_td_with_baselines(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        phi_experiment_tag="Craftax-1B-phi-td-compare-half-laplace-sampling-distribution",
+        baseline_experiment_tag="Craftax-1B-5ALG",
+        out="figures/craftax_1b_rnn_phi_td_with_baselines_half_laplace_sampling_distribution.png",
+    )
 
 
 if __name__ == "__main__":

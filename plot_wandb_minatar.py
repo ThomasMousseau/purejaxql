@@ -1278,13 +1278,18 @@ def plot_minatar_sampling_distribution_ablation(
     smooth_window: int = 41,
     multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
+    required_tag: list[str] | None = None,
+    algo_tags: list[str] | None = None,
 ) -> None:
-    """Plot MinAtar MoG sampling-distribution ablation from W&B tags.
+    """Plot MinAtar ω sampling-distribution ablation from W&B tags.
 
-    Expected run tags from ``slurm/slurm_minatar_sampling_distribution.sh``:
-    - ``MinAtar_MoG_Sampling_Distribution`` (experiment tag)
-    - one of ``HALF_LAPLACIAN``, ``UNIFORM``, ``HALF_GAUSSIAN``
-    - ``MoG`` and usually ``multi_seed``
+    **MoG-PQN** (legacy ``slurm_minatar_sampling_distribution.sh`` before Phi-TD): experiment tag
+    ``MinAtar_MoG_Sampling_Distribution``, required tag ``MoG``, distribution tags
+    ``HALF_LAPLACIAN`` / ``UNIFORM`` / ``HALF_GAUSSIAN``.
+
+    **Phi-TD MoG** (current script): ``MinAtar_PhiTD_MoG_Sampling_Distribution``,
+    ``required_tag=["PhiTD-MoG"]``, and ``algo_tags`` including ``PARETO_1`` for the truncated Pareto
+    (α=1 on ``[0.01, 1]``) variant.
     """
     if env_ids is None:
         env_ids = [
@@ -1293,12 +1298,16 @@ def plot_minatar_sampling_distribution_ablation(
             "Freeway-MinAtar",
             "SpaceInvaders-MinAtar",
         ]
+    if required_tag is None:
+        required_tag = ["MoG"]
+    if algo_tags is None:
+        algo_tags = ["HALF_LAPLACIAN", "UNIFORM", "HALF_GAUSSIAN"]
 
     plot_episodic_return(
         project=project,
         entity=entity,
-        required_tag=["MoG"],
-        algo_tags=["HALF_LAPLACIAN", "UNIFORM", "HALF_GAUSSIAN"],
+        required_tag=required_tag,
+        algo_tags=algo_tags,
         metric=metric,
         step_metric=step_metric,
         out=out,
@@ -1512,6 +1521,13 @@ if __name__ == "__main__":
     #     out="figures/minatar_sampling_distribution_ablation.png",
     # )
     
+    plot_minatar_sampling_distribution_ablation(
+        experiment_tag="MinAtar_PhiTD_MoG_Sampling_Distribution",
+        required_tag=["PhiTD-MoG"],
+        algo_tags=["HALF_LAPLACIAN", "UNIFORM", "HALF_GAUSSIAN", "PARETO_1"],
+        out="figures/minatar_phitd_mog_sampling_distribution.png",
+    )
+    
     # #! 4 envs, 3 experiments, 6 algos
     # plot_minatar_20m_td_lambda_aux_3exp(
     #     project="Deep-CVI-Experiments",
@@ -1573,18 +1589,18 @@ if __name__ == "__main__":
     #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
     # )
     
-    #! Pareto distribution, no weighted CF
-    plot_minatar_10m_phi_td_families(
-        project="Deep-CVI-Experiments",
-        experiment_tag="MinAtar_10M_PhiTD_Families_v2",
-        entity="fatty_data",
-        out="figures/minatar_10m_phi_td_families_v2.png",
-    )
-    #! Pareto distribution, no weighted CF
-    plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
-        project="Deep-CVI-Experiments",
-        experiment_tag="MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic_v2",
-        entity="fatty_data",
-        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic_v2.png",
-    )
+    #m#! CTD vs F_C,m - QTD vs F_Q,m - Fm (Pareto distribution, no weighted CF)
+    # plot_minatar_10m_phi_td_families(
+    #     project="Deep-CVI-Experiments",
+    #     experiment_tag="MinAtar_10M_PhiTD_Families_v2",
+    #     entity="fatty_data",
+    #     out="figures/minatar_10m_phi_td_families_v2.png",
+    # )
+    # #! Gaussian, Laplace, Gamme (Pareto distribution, no weighted CF)
+    # plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+    #     project="Deep-CVI-Experiments",
+    #     experiment_tag="MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic_v2",
+    #     entity="fatty_data",
+    #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic_v2.png",
+    # )
 

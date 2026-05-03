@@ -37,7 +37,7 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-phi-td-compare}"
+EXPERIMENT_TAG="${WANDB_EXPERIMENT_TAG:-Craftax-1B-phi-td-compare-half-laplace-sampling-distribution}"
 CRAFTAX_ENV_NAME="${CRAFTAX_ENV_NAME:-Craftax-Symbolic-v1}"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
@@ -91,6 +91,8 @@ HYDRA_COMMON=(
   NUM_SEEDS=1
   "+alg.EXPERIMENT_TAG=${EXPERIMENT_TAG}"
   "alg.ENV_NAME=${CRAFTAX_ENV_NAME}"
+  "alg.OMEGA_SAMPLING_DISTRIBUTION=half_laplace"
+  "alg.IS_DIVIDED_BY_OMEGA_SQUARED=False"
 )
 
 srun uv run --no-sync python -m purejaxql.phi_td_pqn_rnn_craftax \
