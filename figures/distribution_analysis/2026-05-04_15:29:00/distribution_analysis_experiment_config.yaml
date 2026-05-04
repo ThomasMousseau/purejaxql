@@ -1,4 +1,5 @@
 seed: 0
+num_seeds: 1
 state_dim: 5
 dataset_size: 500000
 dataset_seed_offset: 1001
@@ -19,7 +20,7 @@ max_grad_norm: 10.0
 omega_clip: 15.0
 omega_laplace_scale: 0.8
 cf_loss_omega_eps: 0.001
-aux_mean_loss_weight: 0.1
+aux_mean_loss_weight: 0.0
 c51_v_min: -25.0
 c51_v_max: 25.0
 hidden_dim: 256
@@ -41,4 +42,6 @@ er_beta: 0.1
 mv_lambda: 0.1
 close_to_theory: false
 omega_min_pareto: 0.001
-artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/distribution_analysis/2026-05-04_00:36:36"
+phi_qt_same_arch_as_qtd: true
+phi_qt_num_quantiles: null
+artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/distribution_analysis/2026-05-04_15:29:00"

@@ -2,12 +2,21 @@
 """Offline bandit distribution benchmark: CTD, QTD, and φTD (Dirac / categorical / quantile).
 
 CTD uses categorical cross-entropy (C51-style); QTD uses quantile Huber (QR-DQN-style).
-The three φTD heads share the same Bellman CF target; ω sampling and CF loss scaling are set by
-``DAConfig.close_to_theory``: **False** → half-Laplacian ω and CF MSE divided by ``ω²``; **True** →
-truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and **unweighted** CF MSE (see
-``purejaxql.utils.mog_cf.sample_frequencies``). Representation differs only in ``build_*_cf``.
+The three φTD heads use the same sampled Bellman target as CTD/QTD (sample-only supervision):
+``target = r + gamma * z_sample`` and ``phi_target(omega)=exp(i*omega*target)``. ω sampling and CF
+loss scaling are set by ``DAConfig.close_to_theory``: **False** → half-Laplacian ω and CF MSE divided
+by ``ω²``; **True** → truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and **unweighted**
+CF MSE (see ``purejaxql.utils.mog_cf.sample_frequencies``). Representation differs only in ``build_*_cf``.
+Optional ``aux_mean_loss_weight`` adds a Huber penalty on predicted vs sampled mean return for φTD only;
+default **0** keeps the comparison CE (CTD) / quantile Huber (QTD) vs **pure CF** (φTD).
+``phi_qt_same_arch_as_qtd`` (default **True**) builds QTD and φTD Quant from the same ``QTDNet`` constructor
+(two parameter sets), mirroring CTD vs φ Cat.
 
 Config: ``purejaxql/config/analysis/distribution.yaml`` (overridable via ``--config``).
+``num_seeds`` (default 1 in ``DAConfig``; YAML may override) runs independent RNG seeds **sequentially in one process** by default
+(one GPU context; avoids multi-process CUDA OOM). Use ``--parallel-seed-workers`` only if you can
+afford one JAX process per seed (e.g. multiple GPUs / tuned memory limits). Combined outputs use
+95% CIs for the mean across seeds (Student t). Metrics: ``w1``, ``cramer_l2``, ``cf_l2_w``.
 Each run writes under ``figures/distribution_analysis/<YYYY-mm-dd_HH:MM:SS>/`` (parseval
 plot/CSV, panel/metric figures, payload JSON, checkpoints, resolved experiment YAML).
 """
@@ -18,10 +27,13 @@ import argparse
 import csv
 import datetime as dt
 import json
+import multiprocessing as mp
 import os
+import pickle
 import sys
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable
@@ -52,6 +64,57 @@ jax.config.update("jax_enable_x64", True)
 
 _REPO_ROOT = Path(__file__).resolve().parent
 
+# Two-sided 95% Student t critical values t_{0.975, df} for df = 1..30 (mean CI: ± t * s / √n).
+_T975_DF1_TO_30: tuple[float, ...] = (
+    12.70620473617471,
+    4.30265272974946,
+    3.18244630528371,
+    2.7764451051978,
+    2.57058183563637,
+    2.446911846023004,
+    2.364624251592874,
+    2.305962926813099,
+    2.262157158654392,
+    2.228138851986496,
+    2.200985160082949,
+    2.178812829672518,
+    2.160368652931024,
+    2.144786687053816,
+    2.131449546022662,
+    2.119905299285527,
+    2.109815577583358,
+    2.100922040309607,
+    2.093024054408617,
+    2.085963447428391,
+    2.079613844727773,
+    2.073873067878009,
+    2.068657610523972,
+    2.063898561628096,
+    2.059538552753294,
+    2.055529438843488,
+    2.051830516480699,
+    2.048407141795935,
+    2.045229642134926,
+    2.042272456301236,
+)
+
+
+def _t975_critical(df: int) -> float:
+    if df < 1:
+        return 0.0
+    if df <= len(_T975_DF1_TO_30):
+        return float(_T975_DF1_TO_30[df - 1])
+    return 1.96
+
+
+def _mean_ci95_halfwidth(stack: np.ndarray, axis: int = 0) -> np.ndarray:
+    """Half-width of 95% CI for the mean (Student t), NaN-aware."""
+    n = int(stack.shape[axis])
+    if n < 2:
+        return np.zeros_like(np.nanmean(stack, axis=axis))
+    s = np.nanstd(stack, axis=axis, ddof=1)
+    return (_t975_critical(n - 1) * s / np.sqrt(n)).astype(np.float64)
+
 
 def _artifact_purejaxql_dir() -> Path:
     """Artifact directory next to this script (same layout as package ``purejaxql``)."""
@@ -78,11 +141,6 @@ def gil_pelaez_cdf(phi_positive: jax.Array, t_pos: jax.Array, x_grid: jax.Array)
     return 0.5 - jnp.trapezoid(integrand, t_pos, axis=1) / jnp.pi
 
 
-def cf_mse_vs_truth(phi_hat: jax.Array, phi_t: jax.Array) -> jax.Array:
-    d = phi_hat - phi_t
-    return jnp.mean(jnp.real(d) ** 2 + jnp.imag(d) ** 2)
-
-
 def cramer_l2_sq_cdf(f_hat: jax.Array, f_true: jax.Array, x_grid: jax.Array) -> jax.Array:
     return jnp.trapezoid(jnp.square(f_hat - f_true), x_grid)
 
@@ -93,10 +151,6 @@ def cf_l2_sq_over_omega2(phi_hat: jax.Array, phi_t: jax.Array, omega_grid: jax.A
     den = jnp.maximum(jnp.square(jnp.abs(omega_grid)), jnp.float64(omega_eps**2))
     # Parseval-Plancherel normalization for CDF L2: (1 / 2π) ∫ |Δφ(ω)|² / ω² dω.
     return jnp.trapezoid(num / den, omega_grid) / (2.0 * jnp.pi)
-
-
-def ks_on_grid(f_hat: jax.Array, f_true: jax.Array) -> jax.Array:
-    return jnp.max(jnp.abs(f_hat - f_true))
 
 
 def w1_cdf(f_hat: jax.Array, f_true: jax.Array, x_grid: jax.Array) -> jax.Array:
@@ -111,21 +165,6 @@ def empirical_cdf(sorted_samples: jax.Array, x_grid: jax.Array) -> jax.Array:
 
 def empirical_cf_from_samples(samples: jax.Array, t_grid: jax.Array) -> jax.Array:
     return jnp.mean(jnp.exp(1j * t_grid[:, None] * samples[None, :]), axis=1)
-
-
-def cvar_from_cdf(F: jax.Array, x_grid: jax.Array, alpha: float = 0.05) -> jax.Array:
-    F_mono = jnp.clip(jax.lax.cummax(F.astype(jnp.float64)), 0.0, 1.0)
-    u = jnp.linspace(alpha / 200.0, alpha, 200, dtype=jnp.float64)
-    Q = jnp.interp(u, F_mono, x_grid.astype(jnp.float64))
-    return jnp.mean(Q)
-
-
-def entropic_risk_from_cdf(F: jax.Array, x_grid: jax.Array, beta: float) -> jax.Array:
-    F64, x64 = F.astype(jnp.float64), x_grid.astype(jnp.float64)
-    dF = jnp.clip(jnp.diff(F64), 0.0, None)
-    xm = 0.5 * (x64[:-1] + x64[1:])
-    ex = jnp.maximum(jnp.sum(jnp.exp(beta * xm) * dF), 1e-300)
-    return jnp.log(ex) / beta
 
 
 def entropic_risk_mog(pi: jax.Array, mu: jax.Array, sigma: jax.Array, beta: float) -> jax.Array:
@@ -177,14 +216,6 @@ def phi_dirac_cf_on_grid(pi: jax.Array, mu: jax.Array, t_grid: jax.Array) -> jax
 
 def mixture_dirac_cdf(x_grid: jax.Array, pi: jax.Array, mu: jax.Array) -> jax.Array:
     return jnp.sum(pi[:, None] * (mu[:, None] <= x_grid[None, :]).astype(jnp.float64), axis=0)
-
-
-def entropic_risk_dirac(pi: jax.Array, mu: jax.Array, beta: float) -> jax.Array:
-    dt = jnp.result_type(pi, mu)
-    b = jnp.asarray(beta, dtype=dt)
-    ee = jnp.sum(pi * jnp.exp(b * mu))
-    tiny = jnp.finfo(dt).tiny
-    return jnp.where(jnp.abs(b) < jnp.float32(1e-8), jnp.sum(pi * mu), jnp.log(jnp.maximum(ee, tiny)) / b)
 
 
 NUM_ACTIONS = 4
@@ -375,7 +406,12 @@ def analytic_bellman_moments(
 
 
 DATASET_SEED_OFFSET = 1001
-PANEL_ANCHOR_PRNG_KEY = jax.random.PRNGKey(42_424_242)
+_PANEL_ANCHOR_PRNG_SEED = 42_424_242
+
+
+def _panel_anchor_prng_key() -> jax.Array:
+    """Lazy key — avoids running JAX on GPU at import time (spawn workers import this module)."""
+    return jax.random.PRNGKey(_PANEL_ANCHOR_PRNG_SEED)
 
 DA_ORDER = ("ctd", "qtd", "dirac", "phi_cat", "phi_qt")
 LEGACY_ALGO_ALIASES = {
@@ -385,12 +421,13 @@ LEGACY_ALGO_ALIASES = {
     "phi_qt": "phitd_fqm",
     "dirac": "phitd_fm",
 }
-MK = ("phi_mse", "ks", "w1", "cramer_l2", "cf_l2_w", "cvar_err", "er_err", "mean_err", "var_err", "mv_err")
+MK = ("w1", "cramer_l2", "cf_l2_w")
 
 
 @dataclass(frozen=True)
 class DAConfig:
     seed: int = 0
+    num_seeds: int = 1
     state_dim: int = STATE_DIM
     dataset_size: int = 500_000
     dataset_seed_offset: int = DATASET_SEED_OFFSET
@@ -412,7 +449,8 @@ class DAConfig:
     omega_clip: float = 15.0
     omega_laplace_scale: float = 0.8
     cf_loss_omega_eps: float = 1e-3
-    aux_mean_loss_weight: float = 0.1
+    # Optional φTD-only auxiliary Huber on mean return (0 ⇒ pure CF loss vs CE/Huber for CTD/QTD).
+    aux_mean_loss_weight: float = 0.0
     c51_v_min: float = -25.0
     c51_v_max: float = 25.0
     hidden_dim: int = 256
@@ -437,6 +475,11 @@ class DAConfig:
     # **unweighted** CF MSE (Cramér-type; matches ``phi_td_pqn_minatar`` with Pareto ω and no ``1/ω²``).
     close_to_theory: bool = False
     omega_min_pareto: float = 0.001
+    # ``True``: φTD Quant uses the same ``QTDNet(hidden_dim, trunk_layers, num_tau)`` factory as QTD (two separate
+    # instances / weights, same architecture as CTD vs φ Cat). ``False``: φ Quant uses ``phi_qt_num_quantiles``.
+    phi_qt_same_arch_as_qtd: bool = True
+    # Used only when ``phi_qt_same_arch_as_qtd`` is ``False``; if ``None``, defaults to ``num_tau``.
+    phi_qt_num_quantiles: int | None = None
     # When set (e.g. figures/distribution_analysis/<timestamp>), checkpoints and local plots go here.
     artifacts_dir: Path | None = None
 
@@ -598,13 +641,23 @@ def _opt(lr: float, clip: float):
     return optax.chain(optax.clip_by_global_norm(clip), optax.adam(lr))
 
 
+def _build_qtd_net(cfg: DAConfig, *, num_quantiles: int | None = None) -> QTDNet:
+    """Same ``QTDNet`` spec as QTD; ``num_quantiles`` overrides ``cfg.num_tau`` when set."""
+    nq = int(cfg.num_tau if num_quantiles is None else num_quantiles)
+    return QTDNet(cfg.hidden_dim, cfg.trunk_layers, nq)
+
+
 def create_train_states(rng: jax.Array, cfg: DAConfig):
     rctd, rqtd, rphid, rphic, rphiq = jax.random.split(rng, 5)
     ctd = CTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_atoms)
-    qtd = QTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_tau)
+    qtd = _build_qtd_net(cfg)
     phi_d = PhiDiracNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_dirac_components)
     phi_cat = CTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_atoms)
-    phi_qt = QTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_tau)
+    if cfg.phi_qt_same_arch_as_qtd:
+        phi_qt = _build_qtd_net(cfg)
+    else:
+        n_phi = cfg.phi_qt_num_quantiles if cfg.phi_qt_num_quantiles is not None else cfg.num_tau
+        phi_qt = _build_qtd_net(cfg, num_quantiles=n_phi)
     x0, a0 = jnp.zeros((2, cfg.state_dim), jnp.float32), jnp.zeros((2, NUM_ACTIONS), jnp.float32)
     tx = _opt(cfg.lr, cfg.max_grad_norm)
     v5, vq, vd, vc, vqt = (
@@ -651,7 +704,6 @@ def make_train_chunk(
     xa, aa, ra, zn = ds
     n, aux_w = xa.shape[0], jnp.float32(cfg.aux_mean_loss_weight)
     g, atoms = jnp.float32(cfg.gamma), ctd_atoms(cfg)
-    phis = [d.phi for d in ACTION_DISTS]
 
     def step(c, _):
         sctd, sqtd, sphid, sphic, sphiq, rng = c
@@ -680,14 +732,9 @@ def make_train_chunk(
             ).reshape(cfg.batch_size, cfg.num_omega)
         tgt = rb + g * znb
 
-        gw = g * om
-        fr = jnp.exp(1j * om.astype(jnp.complex64) * rb[:, None].astype(jnp.complex64))
-
-        def ph1(ai, wi, xi):
-            return jax.lax.switch(ai, phis, wi.astype(jnp.float64), xi.astype(jnp.float64))
-
-        fz = jax.vmap(ph1)(ab, gw, xb).astype(jnp.complex64)
-        target_cf = fr * fz
+        # Sample-only fair supervision: same information budget as CTD/QTD.
+        # Bellman sample target is tgt = r + gamma * z_sample, so CF target is exp(i * omega * tgt).
+        target_cf = jnp.exp(1j * om.astype(jnp.complex64) * tgt[:, None].astype(jnp.complex64))
         if cfg.close_to_theory:
 
             def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
@@ -769,7 +816,6 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
     wm = cfg.omega_max
     te = jnp.linspace(-wm, wm, cfg.eval_num_t, jnp.float64)
     xe = jnp.linspace(cfg.eval_x_min, cfg.eval_x_max, cfg.eval_num_x, jnp.float64)
-    xr = jnp.linspace(cfg.risk_x_min, cfg.risk_x_max, cfg.risk_num_x, jnp.float64)
     tp = jnp.linspace(cfg.gp_t_delta, wm, cfg.gp_num_t, jnp.float64)
     g64, rs64 = jnp.float64(cfg.gamma), jnp.float64(cfg.immediate_reward_std)
     atoms = ctd_atoms(cfg)
@@ -781,25 +827,25 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
 
         lc = ctd.apply({"params": p5}, x1, a1)[0]
         ctd_probs = jax.nn.softmax(lc)
-        F5, F5r = discrete_return_cdf(ctd_probs, atoms, xe), discrete_return_cdf(ctd_probs, atoms, xr)
+        F5 = discrete_return_cdf(ctd_probs, atoms, xe)
         phi5 = discrete_return_cf(ctd_probs, atoms, te)
 
         qq = qtd.apply({"params": pq}, x1, a1)[0].astype(jnp.float64)
-        Fq, Fqr = empirical_cdf(jnp.sort(qq), xe), empirical_cdf(jnp.sort(qq), xr)
+        Fq = empirical_cdf(jnp.sort(qq), xe)
         phiq = empirical_cf_from_samples(qq.astype(jnp.complex128), te.astype(jnp.complex128))
 
         piv, mv = phi_d.apply({"params": pd}, x1, a1)
         pmv, mmv = piv[0], mv[0]
         phid = phi_dirac_cf_on_grid(pmv, mmv, te.astype(jnp.complex128))
-        Fd, Fdr = mixture_dirac_cdf(xe, pmv, mmv), mixture_dirac_cdf(xr, pmv, mmv)
+        Fd = mixture_dirac_cdf(xe, pmv, mmv)
 
         lc2 = phi_cat.apply({"params": pc}, x1, a1)[0]
         pc2 = jax.nn.softmax(lc2)
-        Fpc, Fpcr = discrete_return_cdf(pc2, atoms, xe), discrete_return_cdf(pc2, atoms, xr)
+        Fpc = discrete_return_cdf(pc2, atoms, xe)
         phipc = discrete_return_cf(pc2, atoms, te)
 
         qq2 = phi_qt.apply({"params": pqt}, x1, a1)[0].astype(jnp.float64)
-        Fq2, Fq2r = empirical_cdf(jnp.sort(qq2), xe), empirical_cdf(jnp.sort(qq2), xr)
+        Fq2 = empirical_cdf(jnp.sort(qq2), xe)
         phiq2 = empirical_cf_from_samples(qq2.astype(jnp.complex128), te.astype(jnp.complex128))
 
         pr = jnp.exp(-0.5 * (rs64**2) * te**2)
@@ -810,7 +856,6 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
         pzp = jax.lax.switch(k, phis, g64 * tp, xs.astype(jnp.float64))
         ptp = prp * pzp
         Ft = gil_pelaez_cdf(ptp, tp, xe)
-        Ftr = gil_pelaez_cdf(ptp, tp, xr)
         pdf_t = jnp.clip(jnp.gradient(Ft, xe), 0, None)
 
         pdf5 = jnp.clip(jnp.gradient(F5, xe), 0, None)
@@ -819,37 +864,6 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
         pdfpc = jnp.clip(jnp.gradient(Fpc, xe), 0, None)
         pdfq2 = jnp.clip(jnp.gradient(Fq2, xe), 0, None)
 
-        mtn, vtn, mvtn, ertn = analytic_bellman_moments(
-            k, xs, g64, rs64, jnp.float64(cfg.mv_lambda), jnp.float64(cfg.er_beta)
-        )
-
-        cv_t = cvar_from_cdf(Ftr, xr, cfg.cvar_alpha)
-
-        er_dir = entropic_risk_dirac(pmv, mmv, cfg.er_beta)
-        er_err_ctd = jnp.abs(entropic_risk_from_cdf(F5r, xr, cfg.er_beta) - ertn)
-        er_err_qtd = jnp.abs(entropic_risk_from_cdf(Fqr, xr, cfg.er_beta) - ertn)
-        er_err_phi_dirac = jnp.abs(er_dir - ertn)
-        er_err_phi_cat = jnp.abs(entropic_risk_from_cdf(Fpcr, xr, cfg.er_beta) - ertn)
-        er_err_phi_qt = jnp.abs(entropic_risk_from_cdf(Fq2r, xr, cfg.er_beta) - ertn)
-
-        mq, mqq = jnp.mean(qq), jnp.mean(jnp.square(qq - jnp.mean(qq)))
-        m5 = jnp.sum(ctd_probs * atoms)
-        v5 = jnp.sum(ctd_probs * atoms**2) - m5**2
-        md = jnp.sum(pmv * mmv)
-        vd = jnp.sum(pmv * mmv**2) - md**2
-        m5b = jnp.sum(pc2 * atoms)
-        v5b = jnp.sum(pc2 * atoms**2) - m5b**2
-        mq2, mqq2 = jnp.mean(qq2), jnp.mean(jnp.square(qq2 - jnp.mean(qq2)))
-
-        def mer(mp, vp, mf, vf):
-            return jnp.abs(mp - mf), jnp.abs(vp - vf), jnp.abs((mp - cfg.mv_lambda * vp) - mvtn)
-
-        meq = mer(mq, mqq, mtn, vtn)
-        me5 = mer(m5.astype(jnp.float64), v5.astype(jnp.float64), mtn, vtn)
-        med = mer(md.astype(jnp.float64), vd.astype(jnp.float64), mtn, vtn)
-        mepc = mer(m5b.astype(jnp.float64), v5b.astype(jnp.float64), mtn, vtn)
-        meq2 = mer(mq2, mqq2, mtn, vtn)
-
         cf_l2_ctd = cf_l2_sq_over_omega2(phi5, pt, te, cfg.gp_t_delta)
         cf_l2_qtd = cf_l2_sq_over_omega2(phiq, pt, te, cfg.gp_t_delta)
         cf_l2_phi_dirac = cf_l2_sq_over_omega2(phid, pt, te, cfg.gp_t_delta)
@@ -857,16 +871,6 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
         cf_l2_phi_qt = cf_l2_sq_over_omega2(phiq2, pt, te, cfg.gp_t_delta)
 
         out = {
-            "phi_mse_ctd": cf_mse_vs_truth(phi5, pt),
-            "phi_mse_qtd": cf_mse_vs_truth(phiq, pt),
-            "phi_mse_dirac": cf_mse_vs_truth(phid, pt),
-            "phi_mse_phi_cat": cf_mse_vs_truth(phipc, pt),
-            "phi_mse_phi_qt": cf_mse_vs_truth(phiq2, pt),
-            "ks_ctd": ks_on_grid(F5, Ft),
-            "ks_qtd": ks_on_grid(Fq, Ft),
-            "ks_dirac": ks_on_grid(Fd, Ft),
-            "ks_phi_cat": ks_on_grid(Fpc, Ft),
-            "ks_phi_qt": ks_on_grid(Fq2, Ft),
             "w1_ctd": w1_cdf(F5, Ft, xe),
             "w1_qtd": w1_cdf(Fq, Ft, xe),
             "w1_dirac": w1_cdf(Fd, Ft, xe),
@@ -882,16 +886,6 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
             "cf_l2_w_dirac": cf_l2_phi_dirac,
             "cf_l2_w_phi_cat": cf_l2_phi_cat,
             "cf_l2_w_phi_qt": cf_l2_phi_qt,
-            "cvar_err_ctd": jnp.abs(cvar_from_cdf(F5r, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_qtd": jnp.abs(cvar_from_cdf(Fqr, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_dirac": jnp.abs(cvar_from_cdf(Fdr, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_phi_cat": jnp.abs(cvar_from_cdf(Fpcr, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_phi_qt": jnp.abs(cvar_from_cdf(Fq2r, xr, cfg.cvar_alpha) - cv_t),
-            "er_err_ctd": er_err_ctd,
-            "er_err_qtd": er_err_qtd,
-            "er_err_dirac": er_err_phi_dirac,
-            "er_err_phi_cat": er_err_phi_cat,
-            "er_err_phi_qt": er_err_phi_qt,
             "phi_ctd": phi5,
             "phi_qtd": phiq,
             "phi_dirac": phid,
@@ -910,21 +904,6 @@ def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_
             "pdf_dirac": pdfd,
             "pdf_phi_cat": pdfpc,
             "pdf_phi_qt": pdfq2,
-            "mean_err_ctd": me5[0],
-            "mean_err_qtd": meq[0],
-            "mean_err_dirac": med[0],
-            "mean_err_phi_cat": mepc[0],
-            "mean_err_phi_qt": meq2[0],
-            "var_err_ctd": me5[1],
-            "var_err_qtd": meq[1],
-            "var_err_dirac": med[1],
-            "var_err_phi_cat": mepc[1],
-            "var_err_phi_qt": meq2[1],
-            "mv_err_ctd": me5[2],
-            "mv_err_qtd": meq[2],
-            "mv_err_dirac": med[2],
-            "mv_err_phi_cat": mepc[2],
-            "mv_err_phi_qt": meq2[2],
         }
 
         out.update(
@@ -1103,15 +1082,15 @@ def _save_parseval_training_plot(
     cf_matrix = _as_seed_matrix(history["cf_l2_w_dirac"])
     y_cr = np.clip(np.nan_to_num(np.nanmean(cr_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
     y_cf = np.clip(np.nan_to_num(np.nanmean(cf_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
-    y_cr_std = np.nan_to_num(np.nanstd(cr_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
-    y_cf_std = np.nan_to_num(np.nanstd(cf_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
+    y_cr_ci = np.nan_to_num(_mean_ci95_halfwidth(cr_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0)
+    y_cf_ci = np.nan_to_num(_mean_ci95_halfwidth(cf_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0)
     cr_color = "#5E2B97"
     cf_color = "#A06CD5"
 
     configure_matplotlib()
     fig, ax = plt.subplots(1, 1, figsize=(6.1, 3.5))
-    ax.fill_between(steps, np.clip(y_cr - y_cr_std, 0.0, None), y_cr + y_cr_std, color=cr_color, alpha=0.2, lw=0)
-    ax.fill_between(steps, np.clip(y_cf - y_cf_std, 0.0, None), y_cf + y_cf_std, color=cf_color, alpha=0.2, lw=0)
+    ax.fill_between(steps, np.clip(y_cr - y_cr_ci, 0.0, None), y_cr + y_cr_ci, color=cr_color, alpha=0.2, lw=0)
+    ax.fill_between(steps, np.clip(y_cf - y_cf_ci, 0.0, None), y_cf + y_cf_ci, color=cf_color, alpha=0.2, lw=0)
     ax.plot(steps, y_cr, color=cr_color, lw=2.0, label=r"Cramer $L_2^2$ (CDF)")
     ax.plot(steps, y_cf, color=cf_color, lw=2.0, ls="--", label=r"CF $L_2^2/\omega^2$")
     pos = np.concatenate([y_cr[np.isfinite(y_cr)], y_cf[np.isfinite(y_cf)]])
@@ -1131,8 +1110,8 @@ def _save_parseval_training_plot(
         "step",
         "cramer_l2_dirac",
         "cf_l2_w_dirac",
-        "cramer_l2_dirac_std",
-        "cf_l2_w_dirac_std",
+        "cramer_l2_dirac_ci95",
+        "cf_l2_w_dirac_ci95",
     )
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1143,8 +1122,8 @@ def _save_parseval_training_plot(
                     "step": st,
                     "cramer_l2_dirac": y_cr[i],
                     "cf_l2_w_dirac": y_cf[i],
-                    "cramer_l2_dirac_std": y_cr_std[i],
-                    "cf_l2_w_dirac_std": y_cf_std[i],
+                    "cramer_l2_dirac_ci95": y_cr_ci[i],
+                    "cf_l2_w_dirac_ci95": y_cf_ci[i],
                 }
             )
 
@@ -1183,16 +1162,9 @@ PLOT_DA_TITLES = {
 }
 PLOT_VISIBLE_ALGOS = ("ctd", "qtd", "dirac", "phi_cat", "phi_qt")
 PLOT_ROW_LBL = {
-    "phi_mse": r"$\varphi$-MSE $\downarrow$",
-    "ks": r"KS $\downarrow$",
     "w1": r"$W_1$ $\downarrow$",
     "cramer_l2": r"Cramér $\ell_2^2$ $\downarrow$",
     "cf_l2_w": r"CF-$\ell_2^2/\omega^2$ $\downarrow$",
-    "cvar_err": r"CVaR err $\downarrow$",
-    "er_err": r"Entropic err $\downarrow$",
-    "mean_err": r"Mean err $\downarrow$",
-    "var_err": r"Var err $\downarrow$",
-    "mv_err": r"M-V err $\downarrow$",
 }
 PLOT_WIN_BG = "#D2F4D9"
 PLOT_COLORS = {
@@ -1279,14 +1251,14 @@ def _plot_resolve_panel_key(data: dict[str, np.ndarray], candidates: tuple[str, 
     return None
 
 
-def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], row_keys: tuple[str, ...], path: str) -> None:
+def _plot_metric_tables(metric_pack: dict[str, tuple[np.ndarray, np.ndarray]], row_keys: tuple[str, ...], path: str) -> None:
     import matplotlib.pyplot as plt
 
-    algos = [a for a in PLOT_VISIBLE_ALGOS if a in stderr]
+    algos = [a for a in PLOT_VISIBLE_ALGOS if a in metric_pack]
     if not algos:
         raise ValueError("No metric data found for plotting.")
-    means = np.stack([stderr[a][0] for a in algos])
-    ses = np.stack([stderr[a][1] for a in algos])
+    means = np.stack([metric_pack[a][0] for a in algos])
+    cis = np.stack([metric_pack[a][1] for a in algos])
     inf = np.where(np.isfinite(means), means, np.inf)
     best = np.argmin(inf, 0)
     best = np.where(~np.isfinite(means).any(0), -1, best)
@@ -1307,9 +1279,9 @@ def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], row_ke
             row = []
             for c in range(len(ACTION_DISTS)):
                 mv = means[i, r, c]
-                sv = ses[i, r, c]
-                if np.isfinite(mv) and sv > 0:
-                    row.append(f"{mv:.4g}\n({sv:.3g})")
+                hw = cis[i, r, c]
+                if np.isfinite(mv) and np.isfinite(hw) and hw > 0:
+                    row.append(f"{mv:.4g}\n±{hw:.3g}")
                 else:
                     row.append(_plot_fmt_disp(mv))
             cells.append(row)
@@ -1329,7 +1301,7 @@ def _plot_metric_tables(stderr: dict[str, tuple[np.ndarray, np.ndarray]], row_ke
     plt.close(fig)
 
 
-def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te: np.ndarray, xe: np.ndarray, cf_hw: float, path: str) -> None:
+def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te: np.ndarray, xe: np.ndarray, cf_hw: float, path: str) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
 
@@ -1377,7 +1349,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             if pkey is None:
                 continue
             y = np.real(mean_p[pkey][row])
-            ys = np.real(se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row])
+            ys = np.real(ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row])
             axcf.fill_between(te[tmask], (y - ys)[tmask], (y + ys)[tmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axcf.plot(te[tmask], y[tmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axcf)
@@ -1401,8 +1373,8 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
                 jumps = np.diff(np.concatenate(([0.0], cdf_vals)))
                 jumps = np.clip(jumps, 0.0, None)
                 jump_se = np.zeros_like(jumps)
-                if cdf_key in se_p:
-                    cdf_se = np.asarray(se_p[cdf_key][row], dtype=np.float64)
+                if cdf_key in ci_p:
+                    cdf_se = np.asarray(ci_p[cdf_key][row], dtype=np.float64)
                     jump_se = np.clip(np.diff(np.concatenate(([0.0], cdf_se))), 0.0, None)
                 atom_x = xe
                 keep = (atom_x >= dist.plot_x_min) & (atom_x <= dist.plot_x_max) & (jumps > 1e-6)
@@ -1424,10 +1396,10 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
                 continue
             if ckey == "truth":
                 y = np.asarray(mean_p[pkey][row], dtype=np.float64)
-                ys = np.asarray(se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], dtype=np.float64)
+                ys = np.asarray(ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], dtype=np.float64)
             else:
                 y = _plot_smooth_curve(mean_p[pkey][row])
-                ys = _plot_smooth_curve(se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], passes=1)
+                ys = _plot_smooth_curve(ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], passes=1)
             axp.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axp.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axp)
@@ -1440,7 +1412,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             if pkey is None:
                 continue
             y = mean_p[pkey][row]
-            ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
+            ys = ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
             axc.fill_between(
                 xe[xmask],
                 (y - ys)[xmask],
@@ -1472,7 +1444,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
 
 def _plot_density_cdf_only_panels(
     mean_p: dict[str, np.ndarray],
-    se_p: dict[str, np.ndarray],
+    ci_p: dict[str, np.ndarray],
     xe: np.ndarray,
     path_2x4: str,
     path_4x2: str,
@@ -1513,7 +1485,7 @@ def _plot_density_cdf_only_panels(
             if pkey is None:
                 continue
             y = mean_p[pkey][col]
-            ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[col]
+            ys = ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[col]
             axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axc)
@@ -1544,7 +1516,7 @@ def _plot_density_cdf_only_panels(
             if pkey is None:
                 continue
             y = mean_p[pkey][row]
-            ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
+            ys = ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
             axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
             axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axc)
@@ -1569,6 +1541,7 @@ def _plot_density_cdf_only_panels(
 def _plot_aggregate_payloads(
     payloads: list[dict], row_keys: tuple[str, ...]
 ) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray, float]:
+    """Returns per-algorithm (mean, ci_halfwidth), panel means/CIs; CI is 95% for the mean across seeds."""
     if not payloads:
         raise ValueError("No payloads to aggregate.")
 
@@ -1600,8 +1573,8 @@ def _plot_aggregate_payloads(
             continue
         stack = np.stack(mats, axis=0)
         mean = np.nanmean(stack, axis=0)
-        se = np.zeros_like(mean) if stack.shape[0] < 2 else np.nanstd(stack, axis=0, ddof=1) / np.sqrt(stack.shape[0])
-        metric_stats[algo] = (mean, se)
+        ci = _mean_ci95_halfwidth(stack, axis=0)
+        metric_stats[algo] = (mean, ci)
 
     t_eval = np.asarray(payloads[0]["t_eval"], dtype=np.float64)
     x_eval = np.asarray(payloads[0]["x_eval"], dtype=np.float64)
@@ -1609,7 +1582,7 @@ def _plot_aggregate_payloads(
 
     panel_keys = sorted(payloads[0].get("panel", {}).keys())
     panel_mean: dict[str, np.ndarray] = {}
-    panel_se: dict[str, np.ndarray] = {}
+    panel_ci: dict[str, np.ndarray] = {}
     for key in panel_keys:
         vals = []
         for payload in payloads:
@@ -1619,15 +1592,15 @@ def _plot_aggregate_payloads(
             continue
         stack = np.stack(vals, axis=0)
         panel_mean[key] = np.nanmean(stack, axis=0)
-        panel_se[key] = np.zeros_like(panel_mean[key]) if stack.shape[0] < 2 else np.nanstd(stack, axis=0, ddof=1) / np.sqrt(stack.shape[0])
+        panel_ci[key] = _mean_ci95_halfwidth(stack, axis=0)
 
-    return metric_stats, panel_mean, panel_se, t_eval, x_eval, omega_max
+    return metric_stats, panel_mean, panel_ci, t_eval, x_eval, omega_max
 
 
 def _plot_write_metrics_csv(path: str, metric_stats: dict[str, tuple[np.ndarray, np.ndarray]], row_keys: tuple[str, ...]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        header = ["algorithm", "metric"] + [f"{x.short}_mean" for x in ACTION_DISTS] + [f"{x.short}_se" for x in ACTION_DISTS]
+        header = ["algorithm", "metric"] + [f"{x.short}_mean" for x in ACTION_DISTS] + [f"{x.short}_ci95" for x in ACTION_DISTS]
         writer.writerow(header)
         for algo in DA_ORDER:
             if algo not in metric_stats:
@@ -1663,7 +1636,7 @@ def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> 
     configure_matplotlib()
     output_dir.mkdir(parents=True, exist_ok=True)
     row_keys = _plot_resolve_row_keys(payloads)
-    metric_stats, panel_mean, panel_se, t_eval, x_eval, omega_max = _plot_aggregate_payloads(payloads, row_keys)
+    metric_stats, panel_mean, panel_ci, t_eval, x_eval, omega_max = _plot_aggregate_payloads(payloads, row_keys)
 
     metrics_png_base = str(output_dir / "distribution_analysis_metrics_combined.png")
     panels_png_base = str(output_dir / "distribution_analysis_panels.png")
@@ -1672,10 +1645,10 @@ def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> 
     metrics_csv = str(output_dir / "distribution_analysis_metrics_combined.csv")
 
     _plot_metric_tables(metric_stats, row_keys, metrics_png_base)
-    _plot_panels(panel_mean, panel_se, t_eval, x_eval, omega_max, panels_png_base)
+    _plot_panels(panel_mean, panel_ci, t_eval, x_eval, omega_max, panels_png_base)
     _plot_density_cdf_only_panels(
         panel_mean,
-        panel_se,
+        panel_ci,
         x_eval,
         panels_density_cdf_2x4_base,
         panels_density_cdf_4x2_base,
@@ -1743,6 +1716,17 @@ def plot_distribution_analysis_from_wandb(
     return {"num_runs": str(len(payloads)), "output_dir": str(output_dir), **out_paths}
 
 
+def _merge_parseval_histories(histories: list[dict[str, list[float]]]) -> dict[str, list]:
+    """Stack per-seed parseval series for CI shading (list-of-series per metric)."""
+    if not histories:
+        return {}
+    out = {"step": list(histories[0]["step"]), "cramer_l2_dirac": [], "cf_l2_w_dirac": []}
+    for h in histories:
+        out["cramer_l2_dirac"].append(list(h["cramer_l2_dirac"]))
+        out["cf_l2_w_dirac"].append(list(h["cf_l2_w_dirac"]))
+    return out
+
+
 def train_and_export(
     cfg: DAConfig,
     tag: str,
@@ -1750,135 +1734,185 @@ def train_and_export(
     *,
     figures_run_dir: Path,
     skip_plots: bool = False,
-) -> None:
-    figures_run_dir.mkdir(parents=True, exist_ok=True)
-    _write_yaml(figures_run_dir / "distribution_analysis_experiment_config.yaml", _config_for_logging(cfg))
+    skip_local_aggregate_plots: bool = False,
+    wandb_managed_externally: bool = False,
+) -> tuple[dict, dict[str, list[float]], dict]:
+    """Train one seed; returns (payload dict, parseval_history, pm)."""
+    local_wb = wb and not wandb_managed_externally
+    if local_wb:
+        import wandb
 
-    rng = jax.random.PRNGKey(cfg.seed)
-    ri, rd, rt, ru = jax.random.split(rng, 4)
-    print(f"Dataset... offset={cfg.dataset_seed_offset}", flush=True)
-    if cfg.close_to_theory:
-        print(
-            f"φTD CF: close_to_theory=True (Pareto ω, ω_min={cfg.omega_min_pareto}, unweighted CF MSE)",
-            flush=True,
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "Deep-CVI-Experiments"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            group=tag,
+            name=f"{tag}_seed{cfg.seed}",
+            tags=[tag],
+            config=_config_for_logging(cfg),
         )
-    else:
-        print(
-            "φTD CF: close_to_theory=False (half-Laplacian ω, CF MSE / ω²)",
-            flush=True,
+    try:
+        figures_run_dir.mkdir(parents=True, exist_ok=True)
+        cfg_yaml_name = (
+            "distribution_analysis_experiment_config.yaml"
+            if int(cfg.num_seeds) <= 1
+            else f"distribution_analysis_experiment_config_seed{cfg.seed}.yaml"
         )
-    ds = build_dataset(jax.random.fold_in(rd, cfg.dataset_seed_offset), cfg)
-    jax.tree.map(lambda x: x.block_until_ready(), ds)
-    sctd, sqtd, sphid, sphic, sphiq, *nets = create_train_states(ri, cfg)
-    parseval_eval, _, _ = _make_eval(cfg, *nets)
-    anchor_x = jax.random.normal(PANEL_ANCHOR_PRNG_KEY, (cfg.state_dim,), jnp.float32)
-    parseval_history: dict[str, list[float]] = {"step": [], "cramer_l2_dirac": [], "cf_l2_w_dirac": []}
-    run = make_train_chunk(cfg, *nets, ds)
-    pe = max(1, min(int(cfg.parseval_every), int(cfg.total_steps)))
-    if int(cfg.total_steps) % pe != 0:
-        raise ValueError(
-            f"total_steps ({cfg.total_steps}) must be divisible by parseval_every ({pe}) "
-            "so training chunks and parseval logs align; adjust parseval_every in YAML or CLI."
-        )
-    nc = int(cfg.total_steps) // pe
-    t0 = time.perf_counter()
-    rng = ru
-    last_losses: dict[str, float] | None = None
-    wandb_mod = None
-    if wb:
-        import wandb as _wandb
+        _write_yaml(figures_run_dir / cfg_yaml_name, _config_for_logging(cfg))
 
-        wandb_mod = _wandb
-    for c in range(nc):
-        tc = time.perf_counter()
-        sctd, sqtd, sphid, sphic, sphiq, rng, ls = run(sctd, sqtd, sphid, sphic, sphiq, rng)
-        jax.tree.map(lambda x: x.block_until_ready(), ls)
-        st = (c + 1) * pe
-        last_losses = {
-            "train/loss_ctd_final": float(ls[0][-1]),
-            "train/loss_qtd_final": float(ls[1][-1]),
-            "train/loss_dirac_final": float(ls[2][-1]),
-            "train/loss_phi_cat_final": float(ls[3][-1]),
-            "train/loss_phi_qt_final": float(ls[4][-1]),
-        }
-        last_losses["train/loss_qr_dqn_final"] = last_losses["train/loss_qtd_final"]
-        last_losses["train/loss_c51_final"] = last_losses["train/loss_ctd_final"]
-        if st % int(cfg.log_every) == 0 or st == int(cfg.total_steps) or c == 0:
+        rng = jax.random.PRNGKey(cfg.seed)
+        ri, rd, rt, ru = jax.random.split(rng, 4)
+        print(f"seed={cfg.seed}  Dataset... offset={cfg.dataset_seed_offset}", flush=True)
+        if cfg.close_to_theory:
             print(
-                f"  {st:>7}  ctd={last_losses['train/loss_ctd_final']:.4f} "
-                f"qtd={last_losses['train/loss_qtd_final']:.4f} "
-                f"dirac={last_losses['train/loss_dirac_final']:.4f} "
-                f"phi_cat={last_losses['train/loss_phi_cat_final']:.4f} "
-                f"phi_qt={last_losses['train/loss_phi_qt_final']:.4f}  {time.perf_counter()-tc:.1f}s",
+                f"φTD CF: close_to_theory=True (Pareto ω, ω_min={cfg.omega_min_pareto}, unweighted CF MSE)",
                 flush=True,
             )
+        else:
+            print(
+                "φTD CF: close_to_theory=False (half-Laplacian ω, CF MSE / ω²)",
+                flush=True,
+            )
+        ds = build_dataset(jax.random.fold_in(rd, cfg.dataset_seed_offset), cfg)
+        jax.tree.map(lambda x: x.block_until_ready(), ds)
+        sctd, sqtd, sphid, sphic, sphiq, *nets = create_train_states(ri, cfg)
+        parseval_eval, _, _ = _make_eval(cfg, *nets)
+        anchor_x = jax.random.normal(_panel_anchor_prng_key(), (cfg.state_dim,), jnp.float32)
+        parseval_history: dict[str, list[float]] = {"step": [], "cramer_l2_dirac": [], "cf_l2_w_dirac": []}
+        run = make_train_chunk(cfg, *nets, ds)
+        pe = max(1, min(int(cfg.parseval_every), int(cfg.total_steps)))
+        if int(cfg.total_steps) % pe != 0:
+            raise ValueError(
+                f"total_steps ({cfg.total_steps}) must be divisible by parseval_every ({pe}) "
+                "so training chunks and parseval logs align; adjust parseval_every in YAML or CLI."
+            )
+        nc = int(cfg.total_steps) // pe
+        t0 = time.perf_counter()
+        rng = ru
+        last_losses: dict[str, float] | None = None
+        for c in range(nc):
+            tc = time.perf_counter()
+            sctd, sqtd, sphid, sphic, sphiq, rng, ls = run(sctd, sqtd, sphid, sphic, sphiq, rng)
+            jax.tree.map(lambda x: x.block_until_ready(), ls)
+            st = (c + 1) * pe
+            last_losses = {
+                "train/loss_ctd_final": float(ls[0][-1]),
+                "train/loss_qtd_final": float(ls[1][-1]),
+                "train/loss_dirac_final": float(ls[2][-1]),
+                "train/loss_phi_cat_final": float(ls[3][-1]),
+                "train/loss_phi_qt_final": float(ls[4][-1]),
+            }
+            last_losses["train/loss_qr_dqn_final"] = last_losses["train/loss_qtd_final"]
+            last_losses["train/loss_c51_final"] = last_losses["train/loss_ctd_final"]
+            if st % int(cfg.log_every) == 0 or st == int(cfg.total_steps) or c == 0:
+                print(
+                    f"  {st:>7}  ctd={last_losses['train/loss_ctd_final']:.4f} "
+                    f"qtd={last_losses['train/loss_qtd_final']:.4f} "
+                    f"dirac={last_losses['train/loss_dirac_final']:.4f} "
+                    f"phi_cat={last_losses['train/loss_phi_cat_final']:.4f} "
+                    f"phi_qt={last_losses['train/loss_phi_qt_final']:.4f}  {time.perf_counter()-tc:.1f}s",
+                    flush=True,
+                )
 
-        pv = parseval_eval(
-            sctd.params,
-            sqtd.params,
-            sphid.params,
-            sphic.params,
-            sphiq.params,
-            anchor_x,
+            pv = parseval_eval(
+                sctd.params,
+                sqtd.params,
+                sphid.params,
+                sphic.params,
+                sphiq.params,
+                anchor_x,
+            )
+            jax.tree.map(lambda x: x.block_until_ready(), pv)
+            parseval_history["step"].append(float(st))
+            cr_m = float(jnp.mean(pv["cramer_l2_dirac"]))
+            cf_m = float(jnp.mean(pv["cf_l2_w_dirac"]))
+            parseval_history["cramer_l2_dirac"].append(cr_m)
+            parseval_history["cf_l2_w_dirac"].append(cf_m)
+            pv_log = {
+                "train/parseval/dirac/cramer_l2_anchor": cr_m,
+                "train/parseval/dirac/cf_l2_w_anchor": cf_m,
+            }
+            if wb:
+                import wandb
+
+                wandb.log(pv_log, step=st)
+
+        print(f"train seed={cfg.seed} {time.perf_counter()-t0:.1f}s", flush=True)
+        parseval_plot_paths = None
+        if not skip_plots and not skip_local_aggregate_plots:
+            parseval_plot_paths = _save_parseval_training_plot(cfg, tag, parseval_history, figures_run_dir)
+        xt = jax.random.fold_in(rt, cfg.test_seed_offset)
+        xv = jax.random.normal(xt, (cfg.n_test, cfg.state_dim), jnp.float32).at[0].set(
+            jax.random.normal(_panel_anchor_prng_key(), (cfg.state_dim,), jnp.float32)
         )
-        jax.tree.map(lambda x: x.block_until_ready(), pv)
-        parseval_history["step"].append(float(st))
-        cr_m = float(jnp.mean(pv["cramer_l2_dirac"]))
-        cf_m = float(jnp.mean(pv["cf_l2_w_dirac"]))
-        parseval_history["cramer_l2_dirac"].append(cr_m)
-        parseval_history["cf_l2_w_dirac"].append(cf_m)
-        pv_log = {
-            "train/parseval/dirac/cramer_l2_anchor": cr_m,
-            "train/parseval/dirac/cf_l2_w_anchor": cf_m,
-        }
-        if wb and wandb_mod is not None:
-            wandb_mod.log(pv_log, step=st)
+        er, te, xe = evaluate_test_set(
+            cfg,
+            tuple(nets),
+            (
+                sctd.params,
+                sqtd.params,
+                sphid.params,
+                sphic.params,
+                sphiq.params,
+            ),
+            xv,
+        )
+        jax.tree.map(lambda x: x.block_until_ready(), er)
+        payload, pm = _collect_eval_payload(cfg, tag, er, te, xe, panel_index=0)
+        save_msgpack(cfg, sctd.params, sqtd.params, sphid.params, sphic.params, sphiq.params)
+        payload_name = (
+            "distribution_analysis_payload.json"
+            if int(cfg.num_seeds) <= 1
+            else f"distribution_analysis_payload_seed{cfg.seed}.json"
+        )
+        payload_path = figures_run_dir / payload_name
+        payload_path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
+        if not skip_plots and not skip_local_aggregate_plots:
+            try:
+                plot_paths = plot_distribution_analysis_local([payload], figures_run_dir)
+                print(f"Saved figures: {plot_paths}", flush=True)
+            except Exception as exc:
+                print(f"warning: post-run plotting failed: {exc}", flush=True)
+        if wb:
+            import wandb
 
-    print(f"train {time.perf_counter()-t0:.1f}s", flush=True)
-    parseval_plot_paths = None
-    if not skip_plots:
-        parseval_plot_paths = _save_parseval_training_plot(cfg, tag, parseval_history, figures_run_dir)
-    xt = jax.random.fold_in(rt, cfg.test_seed_offset)
-    xv = jax.random.normal(xt, (cfg.n_test, cfg.state_dim), jnp.float32).at[0].set(
-        jax.random.normal(PANEL_ANCHOR_PRNG_KEY, (cfg.state_dim,), jnp.float32)
-    )
-    er, te, xe = evaluate_test_set(
+            if last_losses:
+                wandb.summary.update(last_losses)
+            if parseval_plot_paths:
+                for key, p in parseval_plot_paths.items():
+                    if key == "csv":
+                        continue
+                    wandb.save(p, policy="now")
+                wandb.summary["parseval_train_plot_png"] = parseval_plot_paths["png"]
+                wandb.summary["parseval_train_plot_pdf"] = parseval_plot_paths.get("pdf", "")
+                wandb.summary["parseval_train_metrics_csv"] = parseval_plot_paths["csv"]
+            _wandb_log_eval_metrics(pm, tag, step=cfg.total_steps)
+            _save_eval_payload_to_wandb(payload)
+            wandb.summary["distribution_analysis_artifacts_dir"] = str(figures_run_dir)
+
+        return payload, parseval_history, pm
+    finally:
+        if local_wb:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.finish()
+
+
+def _distribution_analysis_seed_worker(args: tuple[bytes, int, str, str, bool, bool]) -> tuple[dict, dict[str, list[float]], dict]:
+    """Picklable entry point for ProcessPoolExecutor (spawn)."""
+    cfg_blob, seed, run_dir_s, tag, wb, skip_plots = args
+    base: DAConfig = pickle.loads(cfg_blob)
+    cfg = replace(base, seed=int(seed), artifacts_dir=Path(run_dir_s))
+    payload, parseval_history, pm = train_and_export(
         cfg,
-        tuple(nets),
-        (
-            sctd.params,
-            sqtd.params,
-            sphid.params,
-            sphic.params,
-            sphiq.params,
-        ),
-        xv,
+        tag,
+        wb,
+        figures_run_dir=Path(run_dir_s),
+        skip_plots=skip_plots,
+        skip_local_aggregate_plots=True,
+        wandb_managed_externally=False,
     )
-    jax.tree.map(lambda x: x.block_until_ready(), er)
-    payload, pm = _collect_eval_payload(cfg, tag, er, te, xe, panel_index=0)
-    save_msgpack(cfg, sctd.params, sqtd.params, sphid.params, sphic.params, sphiq.params)
-    payload_path = figures_run_dir / "distribution_analysis_payload.json"
-    payload_path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
-    if not skip_plots:
-        try:
-            plot_paths = plot_distribution_analysis_local([payload], figures_run_dir)
-            print(f"Saved figures: {plot_paths}", flush=True)
-        except Exception as exc:
-            print(f"warning: post-run plotting failed: {exc}", flush=True)
-    if wb:
-        if last_losses:
-            wandb_mod.summary.update(last_losses)
-        if parseval_plot_paths:
-            for key, p in parseval_plot_paths.items():
-                if key == "csv":
-                    continue
-                wandb_mod.save(p, policy="now")
-            wandb_mod.summary["parseval_train_plot_png"] = parseval_plot_paths["png"]
-            wandb_mod.summary["parseval_train_plot_pdf"] = parseval_plot_paths.get("pdf", "")
-            wandb_mod.summary["parseval_train_metrics_csv"] = parseval_plot_paths["csv"]
-        _wandb_log_eval_metrics(pm, tag, step=cfg.total_steps)
-        _save_eval_payload_to_wandb(payload)
-        wandb_mod.summary["distribution_analysis_artifacts_dir"] = str(figures_run_dir)
+    return payload, parseval_history, pm
 
 
 def parse_args(a=None):
@@ -1893,6 +1927,13 @@ def parse_args(a=None):
     p.add_argument("--config", type=Path, default=None, help="YAML overriding defaults (default: package config/analysis/distribution_quick_5seeds.yaml).")
     p.add_argument("--figures-dir", type=Path, default=None, help="Root for run output (default: <repo>/figures/distribution_analysis).")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument(
+        "--num-seeds",
+        type=int,
+        default=None,
+        dest="num_seeds",
+        help="Independent runs with seeds seed, seed+1, ...; combined plots/CSV use 95%% Student CIs for the mean (default: DAConfig / YAML).",
+    )
     p.add_argument("--experiment-tag", default="DistAnalysis")
     p.add_argument("--total-steps", type=int)
     p.add_argument("--log-every", type=int)
@@ -1905,6 +1946,21 @@ def parse_args(a=None):
     p.add_argument("--dataset-size", type=int)
     p.add_argument("--omega-laplace-scale", type=float)
     p.add_argument("--num-qtd-quantiles", type=int)
+    p.add_argument(
+        "--phi-qt-same-arch-as-qtd",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="phi_qt_same_arch_as_qtd",
+        help="When true (default from DAConfig), φTD Quant and QTD use the same QTDNet(width, layers, M) "
+        "spec (separate weights). When false, φ Quant head width is phi_qt_num_quantiles (or num_tau).",
+    )
+    p.add_argument(
+        "--phi-qt-num-quantiles",
+        type=int,
+        default=None,
+        dest="phi_qt_num_quantiles",
+        help="φTD Quant output size when --no-phi-qt-same-arch-as-qtd (default: num_tau).",
+    )
     p.add_argument("--num-ctd-atoms", type=int)
     p.add_argument(
         "--num-dirac-components",
@@ -1934,6 +1990,11 @@ def parse_args(a=None):
         help="Lower truncation for Pareto ω when --close-to-theory (default 0.001).",
     )
     p.add_argument("--no-wandb", action="store_true", help="Disable W&B logging.")
+    p.add_argument(
+        "--parallel-seed-workers",
+        action="store_true",
+        help="When num_seeds>1, run each seed in a separate process (can CUDA OOM on one GPU; default is sequential).",
+    )
     p.add_argument("--no-plots", action="store_true", help="Skip matplotlib outputs (parseval + panel/metric figures).")
     p.add_argument("--wandb-project", default=None, help="W&B project (for --aggregate-from-wandb; else env WANDB_PROJECT).")
     p.add_argument("--wandb-entity", default=None, help="W&B entity (for --aggregate-from-wandb; else env WANDB_ENTITY).")
@@ -1964,6 +2025,7 @@ def main(a=None):
 
     overrides = {
         "seed": args.seed,
+        "num_seeds": args.num_seeds,
         "total_steps": args.total_steps,
         "log_every": args.log_every,
         "parseval_every": args.parseval_every,
@@ -1977,52 +2039,120 @@ def main(a=None):
         overrides["close_to_theory"] = args.close_to_theory
     if getattr(args, "omega_min_pareto", None) is not None:
         overrides["omega_min_pareto"] = args.omega_min_pareto
+    if getattr(args, "phi_qt_same_arch_as_qtd", None) is not None:
+        overrides["phi_qt_same_arch_as_qtd"] = args.phi_qt_same_arch_as_qtd
+    if getattr(args, "phi_qt_num_quantiles", None) is not None:
+        overrides["phi_qt_num_quantiles"] = args.phi_qt_num_quantiles
     cfg = load_da_config_yaml(args.config, overrides)
     cfg = replace(cfg, artifacts_dir=run_dir)
 
     use_wandb = not args.no_wandb
     tag = os.environ.get("WANDB_EXPERIMENT_TAG", args.experiment_tag)
-    if use_wandb:
-        import wandb
+    n_seeds = int(cfg.num_seeds)
 
-        wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "Deep-CVI-Experiments"),
-            entity=os.environ.get("WANDB_ENTITY"),
-            group=tag,
-            name=f"{tag}_seed{cfg.seed}",
-            tags=[tag],
-            config=_config_for_logging(cfg),
-        )
-    try:
-        train_and_export(cfg, tag, use_wandb, figures_run_dir=run_dir, skip_plots=args.no_plots)
-    finally:
+    if n_seeds <= 1:
         if use_wandb:
             import wandb
 
-            if wandb.run:
-                wandb.finish()
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "Deep-CVI-Experiments"),
+                entity=os.environ.get("WANDB_ENTITY"),
+                group=tag,
+                name=f"{tag}_seed{cfg.seed}",
+                tags=[tag],
+                config=_config_for_logging(cfg),
+            )
+        try:
+            train_and_export(
+                cfg,
+                tag,
+                use_wandb,
+                figures_run_dir=run_dir,
+                skip_plots=args.no_plots,
+                wandb_managed_externally=use_wandb,
+            )
+        finally:
+            if use_wandb:
+                import wandb
+
+                if wandb.run:
+                    wandb.finish()
+    else:
+        seeds = [int(cfg.seed) + i for i in range(n_seeds)]
+        parseval_histories: list[dict[str, list[float]]] = []
+        payloads: list[dict] = []
+
+        if args.parallel_seed_workers:
+            print(
+                f"Running {n_seeds} seeds in parallel (spawn); expect ~one JAX GPU context per worker — "
+                f"may OOM on a single GPU. base_seed={cfg.seed}",
+                flush=True,
+            )
+            cfg_blob = pickle.dumps(cfg)
+            worker_args = [(cfg_blob, s, str(run_dir), tag, use_wandb, args.no_plots) for s in seeds]
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=n_seeds, mp_context=ctx) as ex:
+                futures = [ex.submit(_distribution_analysis_seed_worker, a) for a in worker_args]
+                for fut in futures:
+                    payload, ph, _pm = fut.result()
+                    payloads.append(payload)
+                    parseval_histories.append(ph)
+        else:
+            print(
+                f"Running {n_seeds} seeds sequentially (one process / one GPU context); base_seed={cfg.seed}",
+                flush=True,
+            )
+            for s in seeds:
+                cfg_s = replace(cfg, seed=s)
+                payload, ph, _pm = train_and_export(
+                    cfg_s,
+                    tag,
+                    use_wandb,
+                    figures_run_dir=run_dir,
+                    skip_plots=args.no_plots,
+                    skip_local_aggregate_plots=True,
+                    wandb_managed_externally=False,
+                )
+                payloads.append(payload)
+                parseval_histories.append(ph)
+
+        if not args.no_plots:
+            merged_ph = _merge_parseval_histories(parseval_histories)
+            plot_cfg = replace(cfg, seed=int(cfg.seed))
+            _save_parseval_training_plot(plot_cfg, tag, merged_ph, run_dir)
+            try:
+                agg_paths = plot_distribution_analysis_local(payloads, run_dir)
+                print(f"Saved aggregate figures: {agg_paths}", flush=True)
+            except Exception as exc:
+                print(f"warning: aggregate plotting failed: {exc}", flush=True)
 
 
 def replot(figures_dir: Path | None = None) -> None:
-    """Re-generate plots from the most recent local payload without retraining."""
+    """Re-generate plots from the most recent local payload(s) without retraining."""
     figures_root = figures_dir if figures_dir is not None else (_REPO_ROOT / "figures" / "distribution_analysis")
     run_dirs = sorted([p for p in figures_root.iterdir() if p.is_dir()], key=lambda p: p.name)
     if not run_dirs:
         raise FileNotFoundError(f"No run directories found under: {figures_root}")
 
-    latest_with_payload = None
+    latest: tuple[Path, list[Path]] | None = None
     for run_dir in reversed(run_dirs):
-        payload_path = run_dir / "distribution_analysis_payload.json"
-        if payload_path.exists():
-            latest_with_payload = (run_dir, payload_path)
+        main_p = run_dir / "distribution_analysis_payload.json"
+        if main_p.exists():
+            latest = (run_dir, [main_p])
             break
-    if latest_with_payload is None:
-        raise FileNotFoundError(f"No distribution_analysis_payload.json found under: {figures_root}")
+        seed_ps = sorted(run_dir.glob("distribution_analysis_payload_seed*.json"))
+        if seed_ps:
+            latest = (run_dir, seed_ps)
+            break
+    if latest is None:
+        raise FileNotFoundError(
+            f"No distribution_analysis_payload.json or distribution_analysis_payload_seed*.json under: {figures_root}"
+        )
 
-    run_dir, payload_path = latest_with_payload
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    out = plot_distribution_analysis_local([payload], run_dir)
-    print(f"Replotted from payload: {payload_path}")
+    run_dir, paths = latest
+    payloads = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
+    out = plot_distribution_analysis_local(payloads, run_dir)
+    print(f"Replotted from: {[str(p) for p in paths]}")
     print(f"Output folder: {run_dir}")
     for k in ("metrics_png", "panels_png", "metrics_csv"):
         if k in out:

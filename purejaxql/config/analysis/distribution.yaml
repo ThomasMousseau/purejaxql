@@ -3,6 +3,7 @@
 # CLI flags override YAML. Metrics are not stored here (they appear in plots).
 
 seed: 0
+num_seeds: 1
 state_dim: 5
 dataset_size: 500000
 dataset_seed_offset: 1001
@@ -13,6 +14,10 @@ parseval_every: 1000
 batch_size: 1024
 
 num_tau: 51
+# QTD and φTD Quant: same QTDNet(hidden_dim, trunk_layers, num_tau) when true (two networks, same arch — like CTD vs φ Cat).
+phi_qt_same_arch_as_qtd: true
+# Only when phi_qt_same_arch_as_qtd is false: φ Quant output dim (omit or null → use num_tau).
+phi_qt_num_quantiles: null
 num_atoms: 51
 num_dirac_components: 51
 
@@ -28,7 +33,8 @@ omega_laplace_scale: 0.8
 cf_loss_omega_eps: 0.001
 sigma_min: 0.000001
 sigma_max: 20.0
-aux_mean_loss_weight: 0.1
+# φTD only: 0 = pure CF loss (fair vs CTD cross-entropy / QTD quantile Huber with no extra mean term).
+aux_mean_loss_weight: 0.0
 c51_v_min: -25.0
 c51_v_max: 25.0
 embed_dim: 64

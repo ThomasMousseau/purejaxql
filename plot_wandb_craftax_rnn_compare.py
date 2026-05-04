@@ -348,7 +348,7 @@ PHI_TD_CRAFTAX_WANDB_ALGO_TAGS: tuple[str, ...] = (
     "PHI_TD_CAUCHY_RNN",
     "PHI_TD_GAMMA_RNN",
     "PHI_TD_LAPLACE_RNN",
-    "PHI_TD_LOGISTIC_RNN",
+    # "PHI_TD_LOGISTIC_RNN",
 )
 
 # φ-sweep families only (no categorical / quantile heads) — e.g. one panel with **PQN** baseline.
@@ -737,29 +737,29 @@ def main() -> None:
         entity="fatty_data",
         phi_experiment_tag="Craftax-1B-phiTD-hLap-wOmega2",
         baseline_experiment_tag="Craftax-1B-5ALG",
-        phi_algo_tags=PHI_TD_CRAFTAX_WANDB_ALGO_TAGS_NO_CAT_QT,
+        phi_algo_tags=PHI_TD_CRAFTAX_WANDB_ALGO_TAGS, 
         baseline_algo_tags=("PQN_RNN",),
         out="figures/craftax_1b_rnn_phi_td_six_families_plus_pqn_hLap_wOmega2.png",
     )
     #! Panel 2: PQN, CTD, QTD, φ categorical, φ quantile — M=8 (fair-8 tag) vs M=51 (split tags).
-    plot_craftax_rnn_compare_multi_source(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        groups=build_craftax_rnn_pqn_ctd_qtd_phi_cat_qt_m8_m51_groups(
-            m8_fair_experiment_tag="Craftax-1B-RNN-fair8-4alg",
-            m51_experiment_tag_ctd_qtd="Craftax-1B-5ALG",
-            m51_experiment_tag_phi_cat_qt="Craftax-1B-phiTD-hLap-wOmega2",
-            pqn_m8_experiment_tag="Craftax-1B-5ALG",
-            pqn_m51_experiment_tag="Craftax-1B-5ALG",
-        ),
-        metric="returned_episode_returns",
-        step_metric="env_step",
-        out="figures/craftax_1b_rnn_pqn_ctd_qtd_phi_cat_qt_m8_m51.png",
-        grid_points=800,
-        max_runs=5000,
-        smooth_window=51,
-        env_name_filter=None,
-    )
+    # plot_craftax_rnn_compare_multi_source(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     groups=build_craftax_rnn_pqn_ctd_qtd_phi_cat_qt_m8_m51_groups(
+    #         m8_fair_experiment_tag="Craftax-1B-RNN-fair8-4alg",
+    #         m51_experiment_tag_ctd_qtd="Craftax-1B-5ALG",
+    #         m51_experiment_tag_phi_cat_qt="Craftax-1B-phiTD-hLap-wOmega2",
+    #         pqn_m8_experiment_tag="Craftax-1B-5ALG",
+    #         pqn_m51_experiment_tag="Craftax-1B-5ALG",
+    #     ),
+    #     metric="returned_episode_returns",
+    #     step_metric="env_step",
+    #     out="figures/craftax_1b_rnn_pqn_ctd_qtd_phi_cat_qt_m8_m51.png",
+    #     grid_points=800,
+    #     max_runs=5000,
+    #     smooth_window=51,
+    #     env_name_filter=None,
+    # )
     
     
 
