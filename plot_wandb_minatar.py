@@ -445,6 +445,33 @@ def _draw_algo_curves_on_ax(
         ax.set_ylim(bottom=bot, top=top)
 
 
+def _truncate_curve_series(
+    series: tuple[np.ndarray, np.ndarray],
+    max_step: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep only points with step ≤ ``max_step`` (inclusive) for fair comparison (e.g. 10M vs 20M runs)."""
+    if max_step is None or not np.isfinite(float(max_step)):
+        return series
+    steps, vals = series
+    if len(steps) == 0:
+        return series
+    cap = float(max_step)
+    mask = steps <= cap
+    if not np.any(mask):
+        return series
+    return steps[mask], vals[mask]
+
+
+def _unpack_extra_curve_spec(
+    spec: tuple[list[str], str] | tuple[list[str], str, float | None],
+) -> tuple[list[str], str, float | None]:
+    if len(spec) == 3:
+        a, b, c = spec
+        return a, b, c
+    a, b = spec
+    return a, b, None
+
+
 def _curve_mean_ci_on_grid(
     curves: list[tuple[np.ndarray, np.ndarray]],
     *,
@@ -493,8 +520,14 @@ def plot_episodic_return(
     multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
     phi_td_families_compare_legend: bool = False,
+    extra_curve_specs: list[tuple[list[str], str] | tuple[list[str], str, float | None]] | None = None,
 ) -> None:
     """Plot mean ± 95% CI episodic return from W&B.
+
+    ``extra_curve_specs`` adds curves whose runs match **all** tags in each tuple's first element,
+    grouped under the W&B algo tag given by the second element (e.g. pull **PQN** from
+    ``MinAtar_20M_Td_Lambda`` without requiring the primary ``experiment_tag``). An optional
+    third element caps the x-axis (``step_metric``): only points with step ≤ that value are kept.
 
     - **Legacy (single panel):** leave ``env_ids`` as ``None``. Optionally set ``experiment_tag`` to filter runs.
     - **One env, filtered by id:** ``env_ids=[\"Breakout-MinAtar\"]`` and ``experiment_tag`` if needed.
@@ -547,6 +580,25 @@ def plot_episodic_return(
                 multi_seed_tag=multi_seed_tag,
             ):
                 by_env_algo[eid][g].append(series)
+
+        if extra_curve_specs:
+            for spec in extra_curve_specs:
+                req_tags, algo_key, max_step = _unpack_extra_curve_spec(spec)
+                for run in runs:
+                    if not _run_matches_required(run, req_tags):
+                        continue
+                    eid = _get_run_env_id(run, use_run_name=use_run_name_for_env)
+                    if eid is None or eid not in env_ids:
+                        continue
+                    for series in curves_from_wandb_run(
+                        run,
+                        metric=metric,
+                        step_metric=step_metric,
+                        multi_seed_tag=multi_seed_tag,
+                    ):
+                        by_env_algo[eid][algo_key].append(
+                            _truncate_curve_series(series, max_step)
+                        )
 
         if not by_env_algo:
             raise RuntimeError(
@@ -605,6 +657,23 @@ def plot_episodic_return(
             multi_seed_tag=multi_seed_tag,
         ):
             by_algo[g].append(series)
+
+    if extra_curve_specs:
+        for spec in extra_curve_specs:
+            req_tags, algo_key, max_step = _unpack_extra_curve_spec(spec)
+            for run in runs:
+                if not _run_matches_required(run, req_tags):
+                    continue
+                if env_ids is not None and len(env_ids) == 1:
+                    if _get_run_env_id(run, use_run_name=use_run_name_for_env) != env_ids[0]:
+                        continue
+                for series in curves_from_wandb_run(
+                    run,
+                    metric=metric,
+                    step_metric=step_metric,
+                    multi_seed_tag=multi_seed_tag,
+                ):
+                    by_algo[algo_key].append(_truncate_curve_series(series, max_step))
 
     if not by_algo:
         raise RuntimeError(
@@ -1637,12 +1706,23 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     smooth_window: int = 41,
     multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
+    pqn_baseline_20m_exp1: bool = True,
+    pqn_baseline_experiment_tag: str = "MinAtar_20M_Td_Lambda",
+    pqn_baseline_max_steps: float | None = 10_000_000,
 ) -> None:
-    """MoG-PQN vs Phi-TD mixture CFs from ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh``.
+    """Phi-TD mixture CFs from ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh`` (default curves
+    omit ``MoG-PQN``; pass ``algo_tags`` to include it).
 
     Runs must include tags: ``experiment_tag``, ``multi_seed``, ``phi_mog_gamma_laplace_logistic``,
-    and exactly one of ``MoG-PQN``, ``PhiTD-MoG``, ``PhiTD-MoGamma``, ``PhiTD-Laplace``,
-    ``PhiTD-Logistic``.
+    and exactly one of ``PhiTD-MoG``, ``PhiTD-MoGamma``, ``PhiTD-Laplace``, ``PhiTD-Logistic`` (or
+    ``MoG-PQN`` if added via ``algo_tags``).
+
+    When ``pqn_baseline_20m_exp1`` (default), also plots **PQN** from
+    ``slurm/slurm_minatar_lambda_aux_sensitivity.sh`` experiment 1: same tag set as
+    :func:`plot_minatar_20m_td_lambda_aux_3exp` for Exp 1 (``pqn_baseline_experiment_tag``,
+    ``LAMBDA-0.0``, ``AUX_MEAN_LOSS_WEIGHT-0.0``, ``PQN``) — canonical dark blue in
+    :mod:`plot_colors`. Those runs train for 20M steps; ``pqn_baseline_max_steps`` (default 10M,
+    in ``step_metric`` units) trims the PQN curve so it matches the 10M φ-TD runs.
     """
     if env_ids is None:
         env_ids = [
@@ -1651,14 +1731,33 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
             "Freeway-MinAtar",
             "SpaceInvaders-MinAtar",
         ]
+    phi_algo_tags = [
+        "PhiTD-MoG",
+        "PhiTD-MoGamma",
+        "PhiTD-Laplace",
+        "PhiTD-Logistic",
+    ]
     if algo_tags is None:
-        algo_tags = [
-            "MoG-PQN",
-            "PhiTD-MoG",
-            "PhiTD-MoGamma",
-            "PhiTD-Laplace",
-            "PhiTD-Logistic",
-        ]
+        algo_tags = (["PQN", *phi_algo_tags] if pqn_baseline_20m_exp1 else phi_algo_tags)
+    elif pqn_baseline_20m_exp1 and "PQN" not in algo_tags:
+        algo_tags = ["PQN", *algo_tags]
+
+    extra_curve_specs: list[tuple[list[str], str] | tuple[list[str], str, float | None]] | None = None
+    if pqn_baseline_20m_exp1:
+        pqn_spec: tuple[list[str], str] | tuple[list[str], str, float | None] = (
+            (
+                [
+                    pqn_baseline_experiment_tag,
+                    "LAMBDA-0.0",
+                    "AUX_MEAN_LOSS_WEIGHT-0.0",
+                    "PQN",
+                ],
+                "PQN",
+            )
+        )
+        if pqn_baseline_max_steps is not None:
+            pqn_spec = (*pqn_spec, float(pqn_baseline_max_steps))
+        extra_curve_specs = [pqn_spec]
 
     plot_episodic_return(
         project=project,
@@ -1676,6 +1775,7 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         use_run_name_for_env=use_run_name_for_env,
         multi_env_y_top_margin=multi_env_y_top_margin,
         multi_seed_tag=multi_seed_tag,
+        extra_curve_specs=extra_curve_specs,
     )
 
 
@@ -1821,12 +1921,12 @@ if __name__ == "__main__":
     # )
     
     # #! CTD, QTD, Phi-TD (F_m / F_C,m / F_Q,m) — slurm_minatar_phi_families.sh
-    plot_minatar_10m_phi_td_families(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        out="figures/minatar_10m_phi_td_families.png",
-    )
-    # #! MoG-PQN vs Phi-TD MoG / Gamma / Laplace / Logistic — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
+    # plot_minatar_10m_phi_td_families(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     out="figures/minatar_10m_phi_td_families.png",
+    # )
+    # #! Phi-TD MoG / Gamma / Laplace / Logistic (+ optional PQN baseline) — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
     plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
