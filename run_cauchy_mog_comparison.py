@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare CF-loss fits across MoG / MoCauchy / MoGamma on a 2-step synthetic MDP."""
+"""Compare CF-loss fits across MoG / MoCauchy / MoGamma on a 2-step synthetic MDP.
+
+Training uses a fixed t grid. ``Config.close_to_theory`` switches unweighted CF MSE (theory / Cramér-style)
+vs MSE divided by ω², matching ``DAConfig.close_to_theory`` in ``run_distribution_analysis.py``.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import numpy as np
 import optax
 
 from paper_plots import configure_matplotlib, save_figure_png_and_pdf, style_axes_panel
+from plot_colors import algo_color
 
 jax_config.update("jax_enable_x64", True)
 configure_matplotlib()
@@ -44,6 +49,11 @@ class Config:
     num_x: int = 1200
     truth_samples: int = 300_000
     panel_samples: int = 12_000
+    # ``False`` → CF MSE / ω² on the fixed t grid (matches weighted φTD training).
+    # ``True`` → unweighted CF MSE on that grid (Cramér-type; same semantics as ``DAConfig.close_to_theory``).
+    close_to_theory: bool = False
+    # Reserved for parity with ``run_distribution_analysis.DAConfig`` (Pareto ω lower truncation).
+    omega_min_pareto: float = 0.001
     artifacts_dir: Path | None = None
 
 
@@ -285,8 +295,18 @@ TARGETS = {
 }
 
 MODEL_ORDER = ("mog", "moc", "mogamma")
-MODEL_NAME = {"mog": "MoG", "moc": "MoCauchy", "mogamma": "MoGamma"}
-MODEL_COLOR = {"truth": "#222222", "mog": "#4ecb8d", "moc": "#ff8c00", "mogamma": "#f1c40f"}
+# Match ``plot_colors.LEGEND_WANDB_TAG`` / distribution-analysis figures.
+MODEL_NAME = {
+    "mog": r"$\varphi\text{TD-Gaussian}$",
+    "moc": r"$\varphi\text{TD-Cauchy}$",
+    "mogamma": r"$\varphi\text{TD-Gamma}$",
+}
+MODEL_COLOR = {
+    "truth": "#0A0A0A",
+    "mog": algo_color("phitd_mog"),
+    "moc": algo_color("phitd_cauchy"),
+    "mogamma": algo_color("phitd_mogamma"),
+}
 MODEL_STYLE = {
     "truth": {"lw": 3.2, "ls": "-", "alpha": 0.95, "zorder": 1},
     "mog": {"lw": 1.55, "ls": "-", "alpha": 0.95, "zorder": 2},
@@ -403,6 +423,8 @@ def train_one_model(
             ph = model_phi_return(family, pp, t_grid)
             d = ph - target_phi
             num = jnp.real(d) ** 2 + jnp.imag(d) ** 2
+            if cfg.close_to_theory:
+                return 0.5 * jnp.mean(num)
             den = jnp.maximum(jnp.square(jnp.abs(t_grid)), jnp.float64(eps**2))
             return 0.5 * jnp.mean(num / den)
 
@@ -771,6 +793,17 @@ def make_panels_and_table(
 
 def run_experiment(cfg: Config, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.close_to_theory:
+        print(
+            f"CF loss: close_to_theory=True (unweighted CF MSE on t grid; ω_min_pareto={cfg.omega_min_pareto} unused here)",
+            flush=True,
+        )
+    else:
+        print(
+            "CF loss: close_to_theory=False (CF MSE / ω² on t grid, eps="
+            f"{cfg.cf_loss_omega_eps})",
+            flush=True,
+        )
     t_grid = jnp.linspace(-cfg.t_max, cfg.t_max, cfg.num_t, dtype=jnp.float64)
     x_grid = jnp.linspace(cfg.x_min, cfg.x_max, cfg.num_x, dtype=jnp.float64)
     key = jax.random.PRNGKey(cfg.seed)
@@ -815,7 +848,7 @@ def run_experiment(cfg: Config, output_dir: Path) -> None:
                 "metrics": metrics,
             }
             print(
-                f"[{target_name:15s}] {MODEL_NAME[model_name]:9s} "
+                f"[{target_name:15s}] {model_name:7s} "
                 f"W1={float(metrics['w1']):.4f}  "
                 f"Cramer={float(metrics['cramer_l2']):.4f}  "
                 f"CF-L2={float(metrics['cf_l2_w']):.4f}",
@@ -848,6 +881,21 @@ def parse_args(argv=None):
     p.add_argument("--num-x", type=int, default=None)
     p.add_argument("--truth-samples", type=int, default=None)
     p.add_argument("--panel-samples", type=int, default=None)
+    p.add_argument(
+        "--close-to-theory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="close_to_theory",
+        help="Unweighted CF MSE on the t grid (like DAConfig.close_to_theory). "
+        "Omit / --no-close-to-theory for CF MSE/ω² (default from YAML).",
+    )
+    p.add_argument(
+        "--omega-min-pareto",
+        type=float,
+        default=None,
+        dest="omega_min_pareto",
+        help="Lower truncation for Pareto ω in distribution_analysis; stored for config parity (unused in this script).",
+    )
     p.add_argument("--figures-dir", type=Path, default=None)
     return p.parse_args(argv)
 
@@ -871,6 +919,10 @@ def main(argv=None):
         "truth_samples": args.truth_samples,
         "panel_samples": args.panel_samples,
     }
+    if args.close_to_theory is not None:
+        overrides["close_to_theory"] = args.close_to_theory
+    if args.omega_min_pareto is not None:
+        overrides["omega_min_pareto"] = args.omega_min_pareto
     cfg = load_config_yaml(args.config, overrides)
     root = args.figures_dir if args.figures_dir is not None else _FIG_ROOT
     run_dir = root / dt.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")

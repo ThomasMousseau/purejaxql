@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""IQN, QTD, CTD, MoG-CQN offline bandit (self-contained).
+"""Offline bandit distribution benchmark: CTD, QTD, and φTD (Dirac / categorical / quantile).
+
+CTD uses categorical cross-entropy (C51-style); QTD uses quantile Huber (QR-DQN-style).
+The three φTD heads share the same Bellman CF target; ω sampling and CF loss scaling are set by
+``DAConfig.close_to_theory``: **False** → half-Laplacian ω and CF MSE divided by ``ω²``; **True** →
+truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and **unweighted** CF MSE (see
+``purejaxql.utils.mog_cf.sample_frequencies``). Representation differs only in ``build_*_cf``.
 
 Config: ``purejaxql/config/analysis/distribution.yaml`` (overridable via ``--config``).
-Each run writes under ``figures/distribution_analysis/<YYYY-mm-dd_HH:MM:SS>/`` (MoG-CQN
-parseval plot/CSV, panel/metric figures, payload JSON, checkpoints, resolved experiment YAML).
+Each run writes under ``figures/distribution_analysis/<YYYY-mm-dd_HH:MM:SS>/`` (parseval
+plot/CSV, panel/metric figures, payload JSON, checkpoints, resolved experiment YAML).
 """
 
 from __future__ import annotations
@@ -34,6 +40,12 @@ from paper_plots import (
     save_figure_png_and_pdf,
     style_axes_panel,
     style_axes_wandb_curve,
+)
+
+from purejaxql.utils.mog_cf import (
+    build_categorical_cf,
+    build_quantile_cf,
+    sample_frequencies,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -117,28 +129,12 @@ def entropic_risk_from_cdf(F: jax.Array, x_grid: jax.Array, beta: float) -> jax.
 
 
 def entropic_risk_mog(pi: jax.Array, mu: jax.Array, sigma: jax.Array, beta: float) -> jax.Array:
+    """Closed-form entropic risk for a Gaussian mixture (used for MoG ground-truth Bellman ER)."""
     dt = jnp.result_type(pi, mu, sigma)
     b = jnp.asarray(beta, dtype=dt)
     mgf = jnp.exp(b * mu + 0.5 * (b**2) * jnp.square(sigma))
     ee = jnp.maximum(jnp.sum(pi * mgf, axis=-1), jnp.finfo(dt).tiny)
     return jnp.where(jnp.abs(b) < 1e-8, jnp.sum(pi * mu, axis=-1), jnp.log(ee) / b)
-
-
-def exact_mog_cdf(x_grid: jax.Array, pi: jax.Array, mu: jax.Array, sigma: jax.Array) -> jax.Array:
-    z = (x_grid[:, None] - mu) / (sigma * jnp.sqrt(2.0))
-    return jnp.sum(pi * 0.5 * (1.0 + jax.scipy.special.erf(z)), axis=-1)
-
-
-def compose_mog_cf(omega_signed: jax.Array, pi: jax.Array, mu: jax.Array, sigma: jax.Array, *, dtype=jnp.complex128) -> jax.Array:
-    w = omega_signed[..., None]
-    if pi.ndim == omega_signed.ndim + 1:
-        pass
-    elif omega_signed.ndim == 1 and pi.ndim == 1:
-        pi, mu, sigma = pi[None, :], mu[None, :], sigma[None, :]
-    else:
-        pi, mu, sigma = pi[..., None, :], mu[..., None, :], sigma[..., None, :]
-    term = jnp.exp((1j * w * mu).astype(dtype) - 0.5 * jnp.square(w).astype(dtype) * jnp.square(sigma).astype(dtype))
-    return jnp.sum(pi.astype(dtype) * term, axis=-1)
 
 
 def project_delta_onto_c51_atoms(y: jax.Array, support: jax.Array) -> jax.Array:
@@ -169,10 +165,26 @@ def discrete_return_cf(probs: jax.Array, atoms: jax.Array, t: jax.Array) -> jax.
     return jnp.sum(probs[:, None] * jnp.exp(1j * atoms[:, None] * t[None, :].astype(jnp.complex128)), axis=0)
 
 
-def sample_frequencies_half_laplacian(key: jax.Array, num_samples: int, omega_max: jax.Array, scale: jax.Array) -> jax.Array:
-    u = jax.random.uniform(key, (num_samples,))
-    mcdf = 1.0 - jnp.exp(-omega_max / scale)
-    return -scale * jnp.log(1.0 - u * mcdf)
+def dirac_mixture_cf_batched(pi: jax.Array, mu: jax.Array, om: jax.Array) -> jax.Array:
+    """Mixture-of-Diracs CF; pi, mu (B, M), om (B, N) → (B, N) complex."""
+    return jnp.sum(pi[..., None, :] * jnp.exp(1j * om[..., None] * mu[..., None, :]), axis=-1)
+
+
+def phi_dirac_cf_on_grid(pi: jax.Array, mu: jax.Array, t_grid: jax.Array) -> jax.Array:
+    """π, μ over components (M,) and frequencies t_grid (T,) → φ(t) complex (T,)."""
+    return jnp.sum(pi[:, None] * jnp.exp(1j * t_grid[None, :] * mu[:, None]), axis=0)
+
+
+def mixture_dirac_cdf(x_grid: jax.Array, pi: jax.Array, mu: jax.Array) -> jax.Array:
+    return jnp.sum(pi[:, None] * (mu[:, None] <= x_grid[None, :]).astype(jnp.float64), axis=0)
+
+
+def entropic_risk_dirac(pi: jax.Array, mu: jax.Array, beta: float) -> jax.Array:
+    dt = jnp.result_type(pi, mu)
+    b = jnp.asarray(beta, dtype=dt)
+    ee = jnp.sum(pi * jnp.exp(b * mu))
+    tiny = jnp.finfo(dt).tiny
+    return jnp.where(jnp.abs(b) < jnp.float32(1e-8), jnp.sum(pi * mu), jnp.log(jnp.maximum(ee, tiny)) / b)
 
 
 NUM_ACTIONS = 4
@@ -365,8 +377,14 @@ def analytic_bellman_moments(
 DATASET_SEED_OFFSET = 1001
 PANEL_ANCHOR_PRNG_KEY = jax.random.PRNGKey(42_424_242)
 
-DA_ORDER = ("iqn", "qtd", "ctd", "mog_cqn")
-LEGACY_ALGO_ALIASES = {"qtd": "qr_dqn", "ctd": "c51"}
+DA_ORDER = ("ctd", "qtd", "dirac", "phi_cat", "phi_qt")
+LEGACY_ALGO_ALIASES = {
+    "qtd": "qr_dqn",
+    "ctd": "c51",
+    "phi_cat": "phitd_fcm",
+    "phi_qt": "phitd_fqm",
+    "dirac": "phitd_fm",
+}
 MK = ("phi_mse", "ks", "w1", "cramer_l2", "cf_l2_w", "cvar_err", "er_err", "mean_err", "var_err", "mv_err")
 
 
@@ -376,14 +394,14 @@ class DAConfig:
     state_dim: int = STATE_DIM
     dataset_size: int = 500_000
     dataset_seed_offset: int = DATASET_SEED_OFFSET
-    total_steps: int = 20_000 #100_000
+    total_steps: int = 20_000 
     log_every: int = 20_000
     # Gradient steps per JIT chunk; parseval / anchor metrics are logged after each chunk (use < total_steps for curves).
     parseval_every: int = 1_000
     batch_size: int = 1024
     num_tau: int = 51
     num_atoms: int = 51
-    num_mog_components: int = 17
+    num_dirac_components: int = 51
     num_omega: int = 32
     gamma: float = 0.9
     immediate_reward_std: float = 0.2
@@ -394,19 +412,14 @@ class DAConfig:
     omega_clip: float = 15.0
     omega_laplace_scale: float = 0.8
     cf_loss_omega_eps: float = 1e-3
-    sigma_min: float = 1e-6
-    sigma_max: float = 20.0
     aux_mean_loss_weight: float = 0.1
     c51_v_min: float = -25.0
     c51_v_max: float = 25.0
-    embed_dim: int = 64
     hidden_dim: int = 256
     trunk_layers: int = 2
     n_test: int = 10_000
     test_seed_offset: int = 7_777
     eval_chunk_size: int = 50
-    num_taus_iqn_eval: int = 2_000
-    eval_iqn_seed: int = 42
     eval_num_t: int = 201
     eval_x_min: float = -15.0
     eval_x_max: float = 15.0
@@ -419,6 +432,11 @@ class DAConfig:
     cvar_alpha: float = 0.05
     er_beta: float = 0.1
     mv_lambda: float = 0.1
+    # φTD CF losses only (Dirac / cat / quant): ``False`` → half-Laplacian ω on ``[0, omega_clip]`` and CF MSE
+    # scaled by ``1/ω²`` (weighted). ``True`` → truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and
+    # **unweighted** CF MSE (Cramér-type; matches ``phi_td_pqn_minatar`` with Pareto ω and no ``1/ω²``).
+    close_to_theory: bool = False
+    omega_min_pareto: float = 0.001
     # When set (e.g. figures/distribution_analysis/<timestamp>), checkpoints and local plots go here.
     artifacts_dir: Path | None = None
 
@@ -444,6 +462,8 @@ def load_da_config_yaml(path: Path | None, overrides: dict) -> DAConfig:
         container = OmegaConf.to_container(raw, resolve=True)
         if isinstance(container, dict):
             merged.update(container)
+    if "num_mog_components" in merged and "num_dirac_components" not in merged:
+        merged["num_dirac_components"] = merged["num_mog_components"]
     for k, v in overrides.items():
         if v is not None and k in known:
             merged[k] = v
@@ -527,24 +547,6 @@ def _dense_ln_relu(x: jax.Array, hidden_dim: int, name: str) -> jax.Array:
     return nn.relu(x)
 
 
-class IQNNet(nn.Module):
-    embed_dim: int
-    hidden_dim: int
-    trunk_layers: int
-
-    @nn.compact
-    def __call__(self, x, a_onehot, tau):
-        h = jnp.concatenate([x, a_onehot], -1)
-        for i in range(self.trunk_layers):
-            h = _dense_ln_relu(h, self.hidden_dim, f"t{i}")
-        tau_c = jnp.clip(tau, 1e-6, 1 - 1e-6)
-        idx = jnp.arange(1, self.embed_dim + 1, dtype=tau.dtype)
-        emb = jnp.cos(jnp.pi * tau_c[..., None] * idx)
-        emb = _dense_ln_relu(emb, self.hidden_dim, "tp")
-        m = _dense_ln_relu(h[:, None, :] * emb, self.hidden_dim, "pm")
-        return nn.Dense(1, name="hd")(m).squeeze(-1)
-
-
 class QTDNet(nn.Module):
     hidden_dim: int
     trunk_layers: int
@@ -575,23 +577,21 @@ class CTDNet(nn.Module):
 C51Net = CTDNet
 
 
-class MoGCQNNet(nn.Module):
+class PhiDiracNet(nn.Module):
+    """Mixture of Diracs (π, μ) per action — same head layout as MoG without σ."""
+
     hidden_dim: int
     trunk_layers: int
     num_components: int
-    sigma_min: float
-    sigma_max: float
 
     @nn.compact
     def __call__(self, x, a_onehot):
         h = jnp.concatenate([x, a_onehot], -1)
         for i in range(self.trunk_layers):
-            h = nn.relu(nn.Dense(self.hidden_dim, name=f"t{i}")(h))
+            h = _dense_ln_relu(h, self.hidden_dim, f"t{i}")
         pi = jax.nn.softmax(nn.Dense(self.num_components, name="pi")(h), -1)
         mu = nn.Dense(self.num_components, name="mu")(h)
-        rs = nn.Dense(self.num_components, name="sg")(h)
-        sg = jnp.minimum(nn.softplus(rs) + self.sigma_min, self.sigma_max)
-        return pi, mu, sg
+        return pi, mu
 
 
 def _opt(lr: float, clip: float):
@@ -599,21 +599,32 @@ def _opt(lr: float, clip: float):
 
 
 def create_train_states(rng: jax.Array, cfg: DAConfig):
-    ri, rq, r5, rm = jax.random.split(rng, 4)
-    iqn = IQNNet(cfg.embed_dim, cfg.hidden_dim, cfg.trunk_layers)
-    qtd = QTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_tau)
+    rctd, rqtd, rphid, rphic, rphiq = jax.random.split(rng, 5)
     ctd = CTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_atoms)
-    mog = MoGCQNNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_mog_components, cfg.sigma_min, cfg.sigma_max)
+    qtd = QTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_tau)
+    phi_d = PhiDiracNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_dirac_components)
+    phi_cat = CTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_atoms)
+    phi_qt = QTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_tau)
     x0, a0 = jnp.zeros((2, cfg.state_dim), jnp.float32), jnp.zeros((2, NUM_ACTIONS), jnp.float32)
-    tau0 = jnp.full((2, cfg.num_tau), 0.5, jnp.float32)
     tx = _opt(cfg.lr, cfg.max_grad_norm)
-    vi, vq, v5, vm = iqn.init(ri, x0, a0, tau0), qtd.init(rq, x0, a0), ctd.init(r5, x0, a0), mog.init(rm, x0, a0)
+    v5, vq, vd, vc, vqt = (
+        ctd.init(rctd, x0, a0),
+        qtd.init(rqtd, x0, a0),
+        phi_d.init(rphid, x0, a0),
+        phi_cat.init(rphic, x0, a0),
+        phi_qt.init(rphiq, x0, a0),
+    )
     return (
-        train_state.TrainState.create(apply_fn=iqn.apply, params=vi["params"], tx=tx),
-        train_state.TrainState.create(apply_fn=qtd.apply, params=vq["params"], tx=tx),
         train_state.TrainState.create(apply_fn=ctd.apply, params=v5["params"], tx=tx),
-        train_state.TrainState.create(apply_fn=mog.apply, params=vm["params"], tx=tx),
-        iqn, qtd, ctd, mog,
+        train_state.TrainState.create(apply_fn=qtd.apply, params=vq["params"], tx=tx),
+        train_state.TrainState.create(apply_fn=phi_d.apply, params=vd["params"], tx=tx),
+        train_state.TrainState.create(apply_fn=phi_cat.apply, params=vc["params"], tx=tx),
+        train_state.TrainState.create(apply_fn=phi_qt.apply, params=vqt["params"], tx=tx),
+        ctd,
+        qtd,
+        phi_d,
+        phi_cat,
+        phi_qt,
     )
 
 
@@ -628,102 +639,169 @@ def build_dataset(rng: jax.Array, cfg: DAConfig):
     return x, a, r, zn[a, jnp.arange(n)]
 
 
-def make_train_chunk(cfg: DAConfig, iqn: IQNNet, qtd: QTDNet, ctd: CTDNet, mog: MoGCQNNet, ds):
+def make_train_chunk(
+    cfg: DAConfig,
+    ctd: CTDNet,
+    qtd: QTDNet,
+    phi_d: PhiDiracNet,
+    phi_cat: CTDNet,
+    phi_qt: QTDNet,
+    ds,
+):
     xa, aa, ra, zn = ds
     n, aux_w = xa.shape[0], jnp.float32(cfg.aux_mean_loss_weight)
     g, atoms = jnp.float32(cfg.gamma), ctd_atoms(cfg)
     phis = [d.phi for d in ACTION_DISTS]
 
     def step(c, _):
-        si, sq, s5, sm, rng = c
+        sctd, sqtd, sphid, sphic, sphiq, rng = c
         rng, kb, kt, ko = jax.random.split(rng, 4)
         idx = jax.random.randint(kb, (cfg.batch_size,), 0, n)
         xb, ab, rb, znb = xa[idx], aa[idx], ra[idx], zn[idx]
         oh = jax.nn.one_hot(ab, NUM_ACTIONS, dtype=jnp.float32)
         tau = jax.random.uniform(kt, (cfg.batch_size, cfg.num_tau), jnp.float32)
         tauf = jnp.broadcast_to(fixed_qr_tau_grid(cfg.num_tau)[None, :], (cfg.batch_size, cfg.num_tau))
-        om = sample_frequencies_half_laplacian(
-            ko, cfg.batch_size * cfg.num_omega, jnp.asarray(cfg.omega_clip, jnp.float32), jnp.asarray(cfg.omega_laplace_scale, jnp.float32),
-        ).reshape(cfg.batch_size, cfg.num_omega)
+        if cfg.close_to_theory:
+            om = sample_frequencies(
+                ko,
+                cfg.batch_size * cfg.num_omega,
+                float(cfg.omega_clip),
+                scale=None,
+                distribution="pareto_1",
+                omega_min=float(cfg.omega_min_pareto),
+            ).reshape(cfg.batch_size, cfg.num_omega)
+        else:
+            om = sample_frequencies(
+                ko,
+                cfg.batch_size * cfg.num_omega,
+                float(cfg.omega_clip),
+                scale=float(cfg.omega_laplace_scale),
+                distribution="half_laplacian",
+            ).reshape(cfg.batch_size, cfg.num_omega)
         tgt = rb + g * znb
 
-        def li(pp):
-            return quantile_huber_loss_pairwise(iqn.apply({"params": pp}, xb, oh, tau), tgt, tau, cfg.huber_kappa)
+        gw = g * om
+        fr = jnp.exp(1j * om.astype(jnp.complex64) * rb[:, None].astype(jnp.complex64))
 
-        def lq(pp):
-            return quantile_huber_loss_pairwise(qtd.apply({"params": pp}, xb, oh), tgt, tauf, cfg.huber_kappa)
+        def ph1(ai, wi, xi):
+            return jax.lax.switch(ai, phis, wi.astype(jnp.float64), xi.astype(jnp.float64))
 
-        def l5(pp):
+        fz = jax.vmap(ph1)(ab, gw, xb).astype(jnp.complex64)
+        target_cf = fr * fz
+        if cfg.close_to_theory:
+
+            def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
+                e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
+                return 0.5 * jnp.mean(e2)
+
+        else:
+            w2 = jnp.maximum(jnp.square(om), jnp.float32(cfg.cf_loss_omega_eps**2))
+
+            def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
+                e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
+                return 0.5 * jnp.mean(e2 / w2)
+
+        def lctd(pp):
             lg = jax.nn.log_softmax(ctd.apply({"params": pp}, xb, oh))
             tp = project_delta_onto_c51_atoms(tgt, atoms)
             return -jnp.mean(jnp.sum(tp * lg, -1))
 
-        def lm(pp):
-            pi, mu, sg = mog.apply({"params": pp}, xb, oh)
-            pred = compose_mog_cf(om, pi, mu, sg, dtype=jnp.complex64)
-            gw = g * om
-            fr = jnp.exp(1j * om.astype(jnp.complex64) * rb[:, None].astype(jnp.complex64))
+        def lqtd(pp):
+            return quantile_huber_loss_pairwise(qtd.apply({"params": pp}, xb, oh), tgt, tauf, cfg.huber_kappa)
 
-            def ph1(ai, wi, xi):
-                return jax.lax.switch(ai, phis, wi.astype(jnp.float64), xi.astype(jnp.float64))
+        def lphid(pp):
+            pi, mu = phi_d.apply({"params": pp}, xb, oh)
+            pred = dirac_mixture_cf_batched(pi, mu, om)
+            d = pred - target_cf
+            mp = jnp.sum(pi * mu, axis=-1)
+            return cf_phi_mean(d) + aux_w * jnp.mean(_huber(mp - tgt, cfg.huber_kappa))
 
-            fz = jax.vmap(ph1)(ab, gw, xb).astype(jnp.complex64)
-            d = pred - fr * fz
-            w2 = jnp.maximum(jnp.square(om), jnp.float32(cfg.cf_loss_omega_eps**2))
-            cf = 0.5 * jnp.mean((jnp.real(d) ** 2 + jnp.imag(d) ** 2) / w2)
-            mp = jnp.sum(pi * mu, -1)
-            return cf + aux_w * jnp.mean(_huber(mp - tgt, cfg.huber_kappa))
+        def lphic(pp):
+            logits = phi_cat.apply({"params": pp}, xb, oh)
+            probs = jax.nn.softmax(logits, axis=-1)
 
-        vi, gi = jax.value_and_grad(li)(si.params)
-        vq, gq = jax.value_and_grad(lq)(sq.params)
-        v5, g5 = jax.value_and_grad(l5)(s5.params)
-        vm, gm = jax.value_and_grad(lm)(sm.params)
+            def row_cat(p, o):
+                return build_categorical_cf(p, atoms, o)
+
+            pred = jax.vmap(row_cat)(probs, om)
+            d = pred - target_cf
+            mexp = jnp.sum(probs * atoms, axis=-1)
+            return cf_phi_mean(d) + aux_w * jnp.mean(_huber(mexp - tgt, cfg.huber_kappa))
+
+        def lphiq(pp):
+            qv = phi_qt.apply({"params": pp}, xb, oh)
+
+            def row_qt(q, o):
+                return build_quantile_cf(q, o)
+
+            pred = jax.vmap(row_qt)(qv, om)
+            d = pred - target_cf
+            mq = jnp.mean(qv, axis=-1)
+            return cf_phi_mean(d) + aux_w * jnp.mean(_huber(mq - tgt, cfg.huber_kappa))
+
+        v5, g5 = jax.value_and_grad(lctd)(sctd.params)
+        vq, gq = jax.value_and_grad(lqtd)(sqtd.params)
+        vd, gd = jax.value_and_grad(lphid)(sphid.params)
+        vc, gc = jax.value_and_grad(lphic)(sphic.params)
+        vqt, gqt = jax.value_and_grad(lphiq)(sphiq.params)
         return (
-            si.apply_gradients(grads=gi),
-            sq.apply_gradients(grads=gq),
-            s5.apply_gradients(grads=g5),
-            sm.apply_gradients(grads=gm),
+            sctd.apply_gradients(grads=g5),
+            sqtd.apply_gradients(grads=gq),
+            sphid.apply_gradients(grads=gd),
+            sphic.apply_gradients(grads=gc),
+            sphiq.apply_gradients(grads=gqt),
             rng,
-        ), (vi, vq, v5, vm)
+        ), (v5, vq, vd, vc, vqt)
 
     scan_len = int(cfg.parseval_every)
 
     @jax.jit
-    def run(si, sq, s5, sm, rng):
-        (si, sq, s5, sm, rng), loss = jax.lax.scan(step, (si, sq, s5, sm, rng), None, scan_len)
-        return si, sq, s5, sm, rng, loss
+    def run(sctd, sqtd, sphid, sphic, sphiq, rng):
+        (sctd, sqtd, sphid, sphic, sphiq, rng), loss = jax.lax.scan(
+            step, (sctd, sqtd, sphid, sphic, sphiq, rng), None, scan_len
+        )
+        return sctd, sqtd, sphid, sphic, sphiq, rng, loss
 
     return run
 
 
-def _make_eval(cfg: DAConfig, iqn: IQNNet, qtd: QTDNet, ctd: CTDNet, mog: MoGCQNNet):
+def _make_eval(cfg: DAConfig, ctd: CTDNet, qtd: QTDNet, phi_d: PhiDiracNet, phi_cat: CTDNet, phi_qt: QTDNet):
     wm = cfg.omega_max
     te = jnp.linspace(-wm, wm, cfg.eval_num_t, jnp.float64)
     xe = jnp.linspace(cfg.eval_x_min, cfg.eval_x_max, cfg.eval_num_x, jnp.float64)
     xr = jnp.linspace(cfg.risk_x_min, cfg.risk_x_max, cfg.risk_num_x, jnp.float64)
     tp = jnp.linspace(cfg.gp_t_delta, wm, cfg.gp_num_t, jnp.float64)
     g64, rs64 = jnp.float64(cfg.gamma), jnp.float64(cfg.immediate_reward_std)
-    taue = jax.random.uniform(jax.random.PRNGKey(cfg.eval_iqn_seed), (cfg.num_taus_iqn_eval,), jnp.float32)
     atoms = ctd_atoms(cfg)
     phis = [d.phi for d in ACTION_DISTS]
 
-    def one(pi, pq, p5, pm, xs, k):
+    def one(p5, pq, pd, pc, pqt, xs, k):
         oh = jax.nn.one_hot(jnp.array(k), NUM_ACTIONS, dtype=jnp.float32)
         x1, a1 = xs[None, :].astype(jnp.float32), oh[None, :]
-        qs = iqn.apply({"params": pi}, x1, a1, taue[None, :])[0].astype(jnp.float64)
-        Fi, Fir = empirical_cdf(jnp.sort(qs), xe), empirical_cdf(jnp.sort(qs), xr)
-        phii = empirical_cf_from_samples(qs.astype(jnp.complex128), te.astype(jnp.complex128))
+
+        lc = ctd.apply({"params": p5}, x1, a1)[0]
+        ctd_probs = jax.nn.softmax(lc)
+        F5, F5r = discrete_return_cdf(ctd_probs, atoms, xe), discrete_return_cdf(ctd_probs, atoms, xr)
+        phi5 = discrete_return_cf(ctd_probs, atoms, te)
+
         qq = qtd.apply({"params": pq}, x1, a1)[0].astype(jnp.float64)
         Fq, Fqr = empirical_cdf(jnp.sort(qq), xe), empirical_cdf(jnp.sort(qq), xr)
         phiq = empirical_cf_from_samples(qq.astype(jnp.complex128), te.astype(jnp.complex128))
-        lc = ctd.apply({"params": p5}, x1, a1)[0]
-        pc = jax.nn.softmax(lc)
-        F5, F5r = discrete_return_cdf(pc, atoms, xe), discrete_return_cdf(pc, atoms, xr)
-        phi5 = discrete_return_cf(pc, atoms, te)
-        piv, mv, sv = mog.apply({"params": pm}, x1, a1)
-        pmv, mmv, smv = piv[0], mv[0], sv[0]
-        phim = compose_mog_cf(te, pmv, mmv, smv)
-        Fm, Fmr = exact_mog_cdf(xe, pmv, mmv, smv), exact_mog_cdf(xr, pmv, mmv, smv)
+
+        piv, mv = phi_d.apply({"params": pd}, x1, a1)
+        pmv, mmv = piv[0], mv[0]
+        phid = phi_dirac_cf_on_grid(pmv, mmv, te.astype(jnp.complex128))
+        Fd, Fdr = mixture_dirac_cdf(xe, pmv, mmv), mixture_dirac_cdf(xr, pmv, mmv)
+
+        lc2 = phi_cat.apply({"params": pc}, x1, a1)[0]
+        pc2 = jax.nn.softmax(lc2)
+        Fpc, Fpcr = discrete_return_cdf(pc2, atoms, xe), discrete_return_cdf(pc2, atoms, xr)
+        phipc = discrete_return_cf(pc2, atoms, te)
+
+        qq2 = phi_qt.apply({"params": pqt}, x1, a1)[0].astype(jnp.float64)
+        Fq2, Fq2r = empirical_cdf(jnp.sort(qq2), xe), empirical_cdf(jnp.sort(qq2), xr)
+        phiq2 = empirical_cf_from_samples(qq2.astype(jnp.complex128), te.astype(jnp.complex128))
+
         pr = jnp.exp(-0.5 * (rs64**2) * te**2)
         pz = jax.lax.switch(k, phis, g64 * te, xs.astype(jnp.float64))
         pt = pr * pz
@@ -735,115 +813,120 @@ def _make_eval(cfg: DAConfig, iqn: IQNNet, qtd: QTDNet, ctd: CTDNet, mog: MoGCQN
         Ftr = gil_pelaez_cdf(ptp, tp, xr)
         pdf_t = jnp.clip(jnp.gradient(Ft, xe), 0, None)
 
-        pdfi = jnp.clip(jnp.gradient(Fi, xe), 0, None)
-        pdfq = jnp.clip(jnp.gradient(Fq, xe), 0, None)
         pdf5 = jnp.clip(jnp.gradient(F5, xe), 0, None)
-        pdfm = jnp.clip(jnp.gradient(Fm, xe), 0, None)
-       # Get exact analytical truth for all 4 metrics!
+        pdfq = jnp.clip(jnp.gradient(Fq, xe), 0, None)
+        pdfd = jnp.clip(jnp.gradient(Fd, xe), 0, None)
+        pdfpc = jnp.clip(jnp.gradient(Fpc, xe), 0, None)
+        pdfq2 = jnp.clip(jnp.gradient(Fq2, xe), 0, None)
+
         mtn, vtn, mvtn, ertn = analytic_bellman_moments(
             k, xs, g64, rs64, jnp.float64(cfg.mv_lambda), jnp.float64(cfg.er_beta)
         )
-        
+
         cv_t = cvar_from_cdf(Ftr, xr, cfg.cvar_alpha)
-        
-        # Calculate errors against the exact analytical Entropic Risk (ertn)
-        er_m = entropic_risk_mog(pmv, mmv, smv, cfg.er_beta)
-        er_err_iqn = jnp.abs(entropic_risk_from_cdf(Fir, xr, cfg.er_beta) - ertn)
-        er_err_qr_dqn = jnp.abs(entropic_risk_from_cdf(Fqr, xr, cfg.er_beta) - ertn)
-        er_err_c51 = jnp.abs(entropic_risk_from_cdf(F5r, xr, cfg.er_beta) - ertn)
-        er_err_mog_cqn = jnp.abs(er_m - ertn)
-        er_undefined = k == 1
-        # if er_undefined:
-        #     er_err_iqn = jnp.float64(jnp.nan)
-        #     er_err_qr_dqn = jnp.float64(jnp.nan)
-        #     er_err_c51 = jnp.float64(jnp.nan)
-        #     er_err_mog_cqn = jnp.float64(jnp.nan)
-        # else:
-        #     er_t = entropic_risk_from_cdf(Ftr, xr, cfg.er_beta)
-        #     er_m = entropic_risk_mog(pmv, mmv, smv, cfg.er_beta)
-        #     er_err_iqn = jnp.abs(entropic_risk_from_cdf(Fir, xr, cfg.er_beta) - er_t)
-        #     er_err_qr_dqn = jnp.abs(entropic_risk_from_cdf(Fqr, xr, cfg.er_beta) - er_t)
-        #     er_err_c51 = jnp.abs(entropic_risk_from_cdf(F5r, xr, cfg.er_beta) - er_t)
-        #     er_err_mog_cqn = jnp.abs(er_m - er_t)
-        mi, mqi = jnp.mean(qs), jnp.mean(jnp.square(qs - jnp.mean(qs)))
+
+        er_dir = entropic_risk_dirac(pmv, mmv, cfg.er_beta)
+        er_err_ctd = jnp.abs(entropic_risk_from_cdf(F5r, xr, cfg.er_beta) - ertn)
+        er_err_qtd = jnp.abs(entropic_risk_from_cdf(Fqr, xr, cfg.er_beta) - ertn)
+        er_err_phi_dirac = jnp.abs(er_dir - ertn)
+        er_err_phi_cat = jnp.abs(entropic_risk_from_cdf(Fpcr, xr, cfg.er_beta) - ertn)
+        er_err_phi_qt = jnp.abs(entropic_risk_from_cdf(Fq2r, xr, cfg.er_beta) - ertn)
+
         mq, mqq = jnp.mean(qq), jnp.mean(jnp.square(qq - jnp.mean(qq)))
-        m5 = jnp.sum(pc * atoms)
-        v5 = jnp.sum(pc * atoms**2) - m5**2
-        mm = jnp.sum(pmv * mmv)
-        vm = jnp.sum(pmv * (smv**2 + mmv**2)) - mm**2
+        m5 = jnp.sum(ctd_probs * atoms)
+        v5 = jnp.sum(ctd_probs * atoms**2) - m5**2
+        md = jnp.sum(pmv * mmv)
+        vd = jnp.sum(pmv * mmv**2) - md**2
+        m5b = jnp.sum(pc2 * atoms)
+        v5b = jnp.sum(pc2 * atoms**2) - m5b**2
+        mq2, mqq2 = jnp.mean(qq2), jnp.mean(jnp.square(qq2 - jnp.mean(qq2)))
 
         def mer(mp, vp, mf, vf):
             return jnp.abs(mp - mf), jnp.abs(vp - vf), jnp.abs((mp - cfg.mv_lambda * vp) - mvtn)
 
-        mei = mer(mi, mqi, mtn, vtn)
         meq = mer(mq, mqq, mtn, vtn)
         me5 = mer(m5.astype(jnp.float64), v5.astype(jnp.float64), mtn, vtn)
-        mem = mer(mm.astype(jnp.float64), vm.astype(jnp.float64), mtn, vtn)
+        med = mer(md.astype(jnp.float64), vd.astype(jnp.float64), mtn, vtn)
+        mepc = mer(m5b.astype(jnp.float64), v5b.astype(jnp.float64), mtn, vtn)
+        meq2 = mer(mq2, mqq2, mtn, vtn)
 
-        cf_l2_iqn = cf_l2_sq_over_omega2(phii, pt, te, cfg.gp_t_delta)
-        cf_l2_qtd = cf_l2_sq_over_omega2(phiq, pt, te, cfg.gp_t_delta)
         cf_l2_ctd = cf_l2_sq_over_omega2(phi5, pt, te, cfg.gp_t_delta)
-        cf_l2_mog = cf_l2_sq_over_omega2(phim, pt, te, cfg.gp_t_delta)
+        cf_l2_qtd = cf_l2_sq_over_omega2(phiq, pt, te, cfg.gp_t_delta)
+        cf_l2_phi_dirac = cf_l2_sq_over_omega2(phid, pt, te, cfg.gp_t_delta)
+        cf_l2_phi_cat = cf_l2_sq_over_omega2(phipc, pt, te, cfg.gp_t_delta)
+        cf_l2_phi_qt = cf_l2_sq_over_omega2(phiq2, pt, te, cfg.gp_t_delta)
 
         out = {
-            "phi_mse_iqn": cf_mse_vs_truth(phii, pt),
-            "phi_mse_qtd": cf_mse_vs_truth(phiq, pt),
             "phi_mse_ctd": cf_mse_vs_truth(phi5, pt),
-            "phi_mse_mog_cqn": cf_mse_vs_truth(phim, pt),
-            "ks_iqn": ks_on_grid(Fi, Ft),
-            "ks_qtd": ks_on_grid(Fq, Ft),
+            "phi_mse_qtd": cf_mse_vs_truth(phiq, pt),
+            "phi_mse_dirac": cf_mse_vs_truth(phid, pt),
+            "phi_mse_phi_cat": cf_mse_vs_truth(phipc, pt),
+            "phi_mse_phi_qt": cf_mse_vs_truth(phiq2, pt),
             "ks_ctd": ks_on_grid(F5, Ft),
-            "ks_mog_cqn": ks_on_grid(Fm, Ft),
-            "w1_iqn": w1_cdf(Fi, Ft, xe),
-            "w1_qtd": w1_cdf(Fq, Ft, xe),
+            "ks_qtd": ks_on_grid(Fq, Ft),
+            "ks_dirac": ks_on_grid(Fd, Ft),
+            "ks_phi_cat": ks_on_grid(Fpc, Ft),
+            "ks_phi_qt": ks_on_grid(Fq2, Ft),
             "w1_ctd": w1_cdf(F5, Ft, xe),
-            "w1_mog_cqn": w1_cdf(Fm, Ft, xe),
-            "cramer_l2_iqn": cramer_l2_sq_cdf(Fi, Ft, xe),
-            "cramer_l2_qtd": cramer_l2_sq_cdf(Fq, Ft, xe),
+            "w1_qtd": w1_cdf(Fq, Ft, xe),
+            "w1_dirac": w1_cdf(Fd, Ft, xe),
+            "w1_phi_cat": w1_cdf(Fpc, Ft, xe),
+            "w1_phi_qt": w1_cdf(Fq2, Ft, xe),
             "cramer_l2_ctd": cramer_l2_sq_cdf(F5, Ft, xe),
-            "cramer_l2_mog_cqn": cramer_l2_sq_cdf(Fm, Ft, xe),
-            "cf_l2_w_iqn": cf_l2_iqn,
-            "cf_l2_w_qtd": cf_l2_qtd,
+            "cramer_l2_qtd": cramer_l2_sq_cdf(Fq, Ft, xe),
+            "cramer_l2_dirac": cramer_l2_sq_cdf(Fd, Ft, xe),
+            "cramer_l2_phi_cat": cramer_l2_sq_cdf(Fpc, Ft, xe),
+            "cramer_l2_phi_qt": cramer_l2_sq_cdf(Fq2, Ft, xe),
             "cf_l2_w_ctd": cf_l2_ctd,
-            "cf_l2_w_mog_cqn": cf_l2_mog,
-            "cvar_err_iqn": jnp.abs(cvar_from_cdf(Fir, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_qtd": jnp.abs(cvar_from_cdf(Fqr, xr, cfg.cvar_alpha) - cv_t),
+            "cf_l2_w_qtd": cf_l2_qtd,
+            "cf_l2_w_dirac": cf_l2_phi_dirac,
+            "cf_l2_w_phi_cat": cf_l2_phi_cat,
+            "cf_l2_w_phi_qt": cf_l2_phi_qt,
             "cvar_err_ctd": jnp.abs(cvar_from_cdf(F5r, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_mog_cqn": jnp.abs(cvar_from_cdf(Fmr, xr, cfg.cvar_alpha) - cv_t),
-            "er_err_iqn": er_err_iqn,
-            "er_err_qtd": er_err_qr_dqn,
-            "er_err_ctd": er_err_c51,
-            "er_err_mog_cqn": er_err_mog_cqn,
-            "phi_iqn": phii,
-            "phi_qtd": phiq,
+            "cvar_err_qtd": jnp.abs(cvar_from_cdf(Fqr, xr, cfg.cvar_alpha) - cv_t),
+            "cvar_err_dirac": jnp.abs(cvar_from_cdf(Fdr, xr, cfg.cvar_alpha) - cv_t),
+            "cvar_err_phi_cat": jnp.abs(cvar_from_cdf(Fpcr, xr, cfg.cvar_alpha) - cv_t),
+            "cvar_err_phi_qt": jnp.abs(cvar_from_cdf(Fq2r, xr, cfg.cvar_alpha) - cv_t),
+            "er_err_ctd": er_err_ctd,
+            "er_err_qtd": er_err_qtd,
+            "er_err_dirac": er_err_phi_dirac,
+            "er_err_phi_cat": er_err_phi_cat,
+            "er_err_phi_qt": er_err_phi_qt,
             "phi_ctd": phi5,
-            "phi_mog_cqn": phim,
+            "phi_qtd": phiq,
+            "phi_dirac": phid,
+            "phi_phi_cat": phipc,
+            "phi_phi_qt": phiq2,
             "phi_true": pt,
-            "F_iqn": Fi,
-            "F_qtd": Fq,
             "F_ctd": F5,
-            "F_mog_cqn": Fm,
+            "F_qtd": Fq,
+            "F_dirac": Fd,
+            "F_phi_cat": Fpc,
+            "F_phi_qt": Fq2,
             "F_true": Ft,
             "pdf_true": pdf_t,
-            "pdf_iqn": pdfi,
-            "pdf_qtd": pdfq,
             "pdf_ctd": pdf5,
-            "pdf_mog_cqn": pdfm,
-            "mean_err_iqn": mei[0],
-            "mean_err_qtd": meq[0],
+            "pdf_qtd": pdfq,
+            "pdf_dirac": pdfd,
+            "pdf_phi_cat": pdfpc,
+            "pdf_phi_qt": pdfq2,
             "mean_err_ctd": me5[0],
-            "mean_err_mog_cqn": mem[0],
-            "var_err_iqn": mei[1],
-            "var_err_qtd": meq[1],
+            "mean_err_qtd": meq[0],
+            "mean_err_dirac": med[0],
+            "mean_err_phi_cat": mepc[0],
+            "mean_err_phi_qt": meq2[0],
             "var_err_ctd": me5[1],
-            "var_err_mog_cqn": mem[1],
-            "mv_err_iqn": mei[2],
-            "mv_err_qtd": meq[2],
+            "var_err_qtd": meq[1],
+            "var_err_dirac": med[1],
+            "var_err_phi_cat": mepc[1],
+            "var_err_phi_qt": meq2[1],
             "mv_err_ctd": me5[2],
-            "mv_err_mog_cqn": mem[2],
+            "mv_err_qtd": meq[2],
+            "mv_err_dirac": med[2],
+            "mv_err_phi_cat": mepc[2],
+            "mv_err_phi_qt": meq2[2],
         }
 
-        # Legacy aliases for existing scripts/plots expecting QR-DQN/C51 keys.
         out.update(
             {
                 "phi_qr_dqn": out["phi_qtd"],
@@ -857,12 +940,15 @@ def _make_eval(cfg: DAConfig, iqn: IQNNet, qtd: QTDNet, ctd: CTDNet, mog: MoGCQN
         for m in MK:
             out[f"{m}_qr_dqn"] = out[f"{m}_qtd"]
             out[f"{m}_c51"] = out[f"{m}_ctd"]
+            out[f"{m}_phitd_fcm"] = out[f"{m}_phi_cat"]
+            out[f"{m}_phitd_fqm"] = out[f"{m}_phi_qt"]
+            out[f"{m}_phitd_fm"] = out[f"{m}_dirac"]
 
         return out
 
     @jax.jit
-    def ev(pi, pq, p5, pm, xs):
-        P = [one(pi, pq, p5, pm, xs, kk) for kk in range(NUM_ACTIONS)]
+    def ev(p5, pq, pd, pc, pqt, xs):
+        P = [one(p5, pq, pd, pc, pqt, xs, kk) for kk in range(NUM_ACTIONS)]
         return {k: jnp.stack([p[k] for p in P]) for k in P[0]}
 
     return ev, te, xe
@@ -870,7 +956,7 @@ def _make_eval(cfg: DAConfig, iqn: IQNNet, qtd: QTDNet, ctd: CTDNet, mog: MoGCQN
 
 def evaluate_test_set(cfg: DAConfig, nets, params, xt):
     ev, te, xe = _make_eval(cfg, *nets)
-    ech = jax.jit(jax.vmap(ev, (None, None, None, None, 0)))
+    ech = jax.jit(jax.vmap(ev, (None, None, None, None, None, 0)))
     n, cs = xt.shape[0], cfg.eval_chunk_size
     assert n % cs == 0
     ch = xt.reshape(n // cs, cs, -1)
@@ -918,25 +1004,28 @@ def _wandb_log_eval_metrics(pm: dict, tag: str, *, step: int) -> None:
 PANEL_EXPORT_KEYS = (
     "pdf_true",
     "phi_true",
-    "phi_iqn",
-    "phi_qtd",
     "phi_ctd",
+    "phi_qtd",
+    "phi_dirac",
+    "phi_phi_cat",
+    "phi_phi_qt",
     "phi_qr_dqn",
     "phi_c51",
-    "phi_mog_cqn",
     "F_true",
-    "F_iqn",
-    "F_qtd",
     "F_ctd",
+    "F_qtd",
+    "F_dirac",
+    "F_phi_cat",
+    "F_phi_qt",
     "F_qr_dqn",
     "F_c51",
-    "F_mog_cqn",
-    "pdf_iqn",
-    "pdf_qtd",
     "pdf_ctd",
+    "pdf_qtd",
+    "pdf_dirac",
+    "pdf_phi_cat",
+    "pdf_phi_qt",
     "pdf_qr_dqn",
     "pdf_c51",
-    "pdf_mog_cqn",
 )
 
 
@@ -986,7 +1075,7 @@ def _save_eval_payload_to_wandb(payload: dict) -> None:
 def _save_parseval_training_plot(
     cfg: DAConfig, tag: str, history: dict[str, list[float]], output_dir: Path
 ) -> dict[str, str] | None:
-    """Plot / CSV for MoG-CQN only (Cramér vs CF on the parseval anchor)."""
+    """Plot / CSV: Cramér vs CF on the parseval anchor (φTD Dirac / mixture-of-Diracs head)."""
     if not history.get("step"):
         return None
 
@@ -997,7 +1086,7 @@ def _save_parseval_training_plot(
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = output_dir / f"distribution_analysis_parseval_training_mog_cqn_seed{cfg.seed}"
+    stem = output_dir / f"distribution_analysis_parseval_training_dirac_seed{cfg.seed}"
     csv_path = stem.with_suffix(".csv")
 
     steps = np.asarray(history["step"], dtype=np.float64)
@@ -1010,8 +1099,8 @@ def _save_parseval_training_plot(
             return arr
         raise ValueError(f"Expected 1D or 2D parseval history, got shape {arr.shape}.")
 
-    cr_matrix = _as_seed_matrix(history["cramer_l2_mog_cqn"])
-    cf_matrix = _as_seed_matrix(history["cf_l2_w_mog_cqn"])
+    cr_matrix = _as_seed_matrix(history["cramer_l2_dirac"])
+    cf_matrix = _as_seed_matrix(history["cf_l2_w_dirac"])
     y_cr = np.clip(np.nan_to_num(np.nanmean(cr_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
     y_cf = np.clip(np.nan_to_num(np.nanmean(cf_matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
     y_cr_std = np.nan_to_num(np.nanstd(cr_matrix, axis=0, ddof=0), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1040,10 +1129,10 @@ def _save_parseval_training_plot(
 
     fieldnames = (
         "step",
-        "cramer_l2_mog_cqn",
-        "cf_l2_w_mog_cqn",
-        "cramer_l2_mog_cqn_std",
-        "cf_l2_w_mog_cqn_std",
+        "cramer_l2_dirac",
+        "cf_l2_w_dirac",
+        "cramer_l2_dirac_std",
+        "cf_l2_w_dirac_std",
     )
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1052,10 +1141,10 @@ def _save_parseval_training_plot(
             writer.writerow(
                 {
                     "step": st,
-                    "cramer_l2_mog_cqn": y_cr[i],
-                    "cf_l2_w_mog_cqn": y_cf[i],
-                    "cramer_l2_mog_cqn_std": y_cr_std[i],
-                    "cf_l2_w_mog_cqn_std": y_cf_std[i],
+                    "cramer_l2_dirac": y_cr[i],
+                    "cf_l2_w_dirac": y_cf[i],
+                    "cramer_l2_dirac_std": y_cr_std[i],
+                    "cf_l2_w_dirac_std": y_cf_std[i],
                 }
             )
 
@@ -1064,25 +1153,35 @@ def _save_parseval_training_plot(
 
 def save_msgpack(cfg: DAConfig, *params):
     os.makedirs(os.path.dirname(cfg.msgpack_filename()), exist_ok=True)
-    iqn_p, qtd_p, ctd_p, mog_p = params
+    ctd_p, qtd_p, dirac_p, phi_cat_p, phi_qt_p = params
     with open(cfg.msgpack_filename(), "wb") as f:
         f.write(
             flax.serialization.to_bytes(
                 {
-                    "iqn": iqn_p,
-                    "qtd": qtd_p,
                     "ctd": ctd_p,
-                    "mog_cqn": mog_p,
+                    "qtd": qtd_p,
+                    "dirac": dirac_p,
+                    "phi_cat": phi_cat_p,
+                    "phi_qt": phi_qt_p,
                     "qr_dqn": qtd_p,
                     "c51": ctd_p,
+                    "phitd_fm": dirac_p,
+                    "phitd_fcm": phi_cat_p,
+                    "phitd_fqm": phi_qt_p,
                 }
             )
         )
 
 
 # --- Figures (merged from plot_distribution_analysis.py) ---------------------------------
-PLOT_DA_TITLES = {"iqn": "IQN", "qtd": "QTD", "ctd": "CTD", "mog_cqn": "MoG-CQN"}
-PLOT_VISIBLE_ALGOS = ("qtd", "ctd", "mog_cqn")
+PLOT_DA_TITLES = {
+    "ctd": "CTD",
+    "qtd": "QTD",
+    "dirac": r"$\varphi$TD Dirac",
+    "phi_cat": r"$\varphi$TD Cat",
+    "phi_qt": r"$\varphi$TD Quant",
+}
+PLOT_VISIBLE_ALGOS = ("ctd", "qtd", "dirac", "phi_cat", "phi_qt")
 PLOT_ROW_LBL = {
     "phi_mse": r"$\varphi$-MSE $\downarrow$",
     "ks": r"KS $\downarrow$",
@@ -1098,14 +1197,24 @@ PLOT_ROW_LBL = {
 PLOT_WIN_BG = "#D2F4D9"
 PLOT_COLORS = {
     "truth": "#0A0A0A",
-    "iqn": algo_color("iqn"),
     "qtd": algo_color("qtd"),
     "ctd": algo_color("ctd"),
-    "mog_cqn": algo_color("mog_cqn"),
+    "dirac": algo_color("phitd_fm"),
+    "phi_cat": algo_color("phitd_fcm"),
+    "phi_qt": algo_color("phitd_fqm"),
     "qr_dqn": algo_color("qr_dqn"),
     "c51": algo_color("c51"),
 }
-PLOT_LW = {"truth": 2.15, "iqn": 1.05, "qtd": 1.08, "ctd": 1.12, "mog_cqn": 1.2, "qr_dqn": 1.08, "c51": 1.12}
+PLOT_LW = {
+    "truth": 2.15,
+    "qtd": 1.08,
+    "ctd": 1.12,
+    "dirac": 1.14,
+    "phi_cat": 1.14,
+    "phi_qt": 1.14,
+    "qr_dqn": 1.08,
+    "c51": 1.12,
+}
 
 
 def _plot_minimal_style(ax) -> None:
@@ -1228,19 +1337,25 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
         (("panel_phi_true",), "truth", "Truth"),
         (("panel_phi_qtd", "panel_phi_qr_dqn"), "qtd", "QTD"),
         (("panel_phi_ctd", "panel_phi_c51"), "ctd", "CTD"),
-        (("panel_phi_mog_cqn",), "mog_cqn", "MoG-CQN"),
+        (("panel_phi_dirac",), "dirac", r"$\varphi$TD Dir"),
+        (("panel_phi_phi_cat",), "phi_cat", r"$\varphi$TD Cat"),
+        (("panel_phi_phi_qt",), "phi_qt", r"$\varphi$TD Quant"),
     )
     pdf_series = (
         (("panel_pdf_true",), "truth", "Truth"),
         (("panel_pdf_qtd", "panel_pdf_qr_dqn"), "qtd", "QTD"),
         (("panel_pdf_ctd", "panel_pdf_c51"), "ctd", "CTD"),
-        (("panel_pdf_mog_cqn",), "mog_cqn", "MoG-CQN"),
+        (("panel_pdf_dirac",), "dirac", r"$\varphi$TD Dir"),
+        (("panel_pdf_phi_cat",), "phi_cat", r"$\varphi$TD Cat"),
+        (("panel_pdf_phi_qt",), "phi_qt", r"$\varphi$TD Quant"),
     )
     cdf_series = (
         (("panel_F_true",), "truth", "Truth"),
         (("panel_F_qtd", "panel_F_qr_dqn"), "qtd", "QTD"),
         (("panel_F_ctd", "panel_F_c51"), "ctd", "CTD"),
-        (("panel_F_mog_cqn",), "mog_cqn", "MoG-CQN"),
+        (("panel_F_dirac",), "dirac", r"$\varphi$TD Dir"),
+        (("panel_F_phi_cat",), "phi_cat", r"$\varphi$TD Cat"),
+        (("panel_F_phi_qt",), "phi_qt", r"$\varphi$TD Quant"),
     )
 
     fig, axes = plt.subplots(len(ACTION_DISTS), 4, figsize=(13.5, 2.45 * len(ACTION_DISTS)))
@@ -1274,9 +1389,12 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             pkey = _plot_resolve_panel_key(mean_p, candidates)
             if pkey is None:
                 continue
-            if ckey == "ctd":
-                # CTD is a discrete distribution: render it as Dirac-like spikes from CDF jumps.
-                cdf_key = _plot_resolve_panel_key(mean_p, ("panel_F_ctd", "panel_F_c51"))
+            if ckey in ("ctd", "phi_cat"):
+                # Categorical heads: Dirac-like spikes from CDF jumps.
+                cdf_candidates = (
+                    ("panel_F_ctd", "panel_F_c51") if ckey == "ctd" else ("panel_F_phi_cat",)
+                )
+                cdf_key = _plot_resolve_panel_key(mean_p, cdf_candidates)
                 if cdf_key is None:
                     continue
                 cdf_vals = np.asarray(mean_p[cdf_key][row], dtype=np.float64)
@@ -1323,8 +1441,16 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
                 continue
             y = mean_p[pkey][row]
             ys = se_p.get(pkey, np.zeros_like(mean_p[pkey]))[row]
-            axc.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0, step="post" if ckey == "ctd" else None)
-            if ckey == "ctd":
+            axc.fill_between(
+                xe[xmask],
+                (y - ys)[xmask],
+                (y + ys)[xmask],
+                color=PLOT_COLORS[ckey],
+                alpha=0.2,
+                lw=0,
+                step="post" if ckey in ("ctd", "phi_cat") else None,
+            )
+            if ckey in ("ctd", "phi_cat"):
                 axc.step(xe[xmask], y[xmask], where="post", color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
             else:
                 axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
@@ -1338,7 +1464,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], se_p: dict[str, np.ndarray], te:
             legend = axc.get_legend_handles_labels()
 
     if legend:
-        fig.legend(*legend, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=4, frameon=False, fontsize=8)
+        fig.legend(*legend, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=3, frameon=False, fontsize=7)
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.3, hspace=0.42)
     _plot_save_fig(fig, path)
     plt.close(fig)
@@ -1361,7 +1487,9 @@ def _plot_density_cdf_only_panels(
         (("panel_F_true",), "truth", "Truth"),
         (("panel_F_qtd", "panel_F_qr_dqn"), "qtd", "QTD"),
         (("panel_F_ctd", "panel_F_c51"), "ctd", "CTD"),
-        (("panel_F_mog_cqn",), "mog_cqn", "MoG-CQN"),
+        (("panel_F_dirac",), "dirac", r"$\varphi$TD Dir"),
+        (("panel_F_phi_cat",), "phi_cat", r"$\varphi$TD Cat"),
+        (("panel_F_phi_qt",), "phi_qt", r"$\varphi$TD Quant"),
     )
 
     # Layout A: 2x4 (top row Density, bottom row CDF)
@@ -1629,13 +1757,23 @@ def train_and_export(
     rng = jax.random.PRNGKey(cfg.seed)
     ri, rd, rt, ru = jax.random.split(rng, 4)
     print(f"Dataset... offset={cfg.dataset_seed_offset}", flush=True)
+    if cfg.close_to_theory:
+        print(
+            f"φTD CF: close_to_theory=True (Pareto ω, ω_min={cfg.omega_min_pareto}, unweighted CF MSE)",
+            flush=True,
+        )
+    else:
+        print(
+            "φTD CF: close_to_theory=False (half-Laplacian ω, CF MSE / ω²)",
+            flush=True,
+        )
     ds = build_dataset(jax.random.fold_in(rd, cfg.dataset_seed_offset), cfg)
     jax.tree.map(lambda x: x.block_until_ready(), ds)
-    si, sq, s5, sm, *nets = create_train_states(ri, cfg)
-    parseval_eval, _, _ = _make_eval(cfg, nets[0], nets[1], nets[2], nets[3])
+    sctd, sqtd, sphid, sphic, sphiq, *nets = create_train_states(ri, cfg)
+    parseval_eval, _, _ = _make_eval(cfg, *nets)
     anchor_x = jax.random.normal(PANEL_ANCHOR_PRNG_KEY, (cfg.state_dim,), jnp.float32)
-    parseval_history: dict[str, list[float]] = {"step": [], "cramer_l2_mog_cqn": [], "cf_l2_w_mog_cqn": []}
-    run = make_train_chunk(cfg, nets[0], nets[1], nets[2], nets[3], ds)
+    parseval_history: dict[str, list[float]] = {"step": [], "cramer_l2_dirac": [], "cf_l2_w_dirac": []}
+    run = make_train_chunk(cfg, *nets, ds)
     pe = max(1, min(int(cfg.parseval_every), int(cfg.total_steps)))
     if int(cfg.total_steps) % pe != 0:
         raise ValueError(
@@ -1653,36 +1791,45 @@ def train_and_export(
         wandb_mod = _wandb
     for c in range(nc):
         tc = time.perf_counter()
-        si, sq, s5, sm, rng, ls = run(si, sq, s5, sm, rng)
+        sctd, sqtd, sphid, sphic, sphiq, rng, ls = run(sctd, sqtd, sphid, sphic, sphiq, rng)
         jax.tree.map(lambda x: x.block_until_ready(), ls)
         st = (c + 1) * pe
         last_losses = {
-            "train/loss_iqn_final": float(ls[0][-1]),
+            "train/loss_ctd_final": float(ls[0][-1]),
             "train/loss_qtd_final": float(ls[1][-1]),
-            "train/loss_ctd_final": float(ls[2][-1]),
-            "train/loss_mog_cqn_final": float(ls[3][-1]),
+            "train/loss_dirac_final": float(ls[2][-1]),
+            "train/loss_phi_cat_final": float(ls[3][-1]),
+            "train/loss_phi_qt_final": float(ls[4][-1]),
         }
         last_losses["train/loss_qr_dqn_final"] = last_losses["train/loss_qtd_final"]
         last_losses["train/loss_c51_final"] = last_losses["train/loss_ctd_final"]
         if st % int(cfg.log_every) == 0 or st == int(cfg.total_steps) or c == 0:
             print(
-                f"  {st:>7}  iqn={last_losses['train/loss_iqn_final']:.4f} "
+                f"  {st:>7}  ctd={last_losses['train/loss_ctd_final']:.4f} "
                 f"qtd={last_losses['train/loss_qtd_final']:.4f} "
-                f"ctd={last_losses['train/loss_ctd_final']:.4f} "
-                f"mog={last_losses['train/loss_mog_cqn_final']:.4f}  {time.perf_counter()-tc:.1f}s",
+                f"dirac={last_losses['train/loss_dirac_final']:.4f} "
+                f"phi_cat={last_losses['train/loss_phi_cat_final']:.4f} "
+                f"phi_qt={last_losses['train/loss_phi_qt_final']:.4f}  {time.perf_counter()-tc:.1f}s",
                 flush=True,
             )
 
-        pv = parseval_eval(si.params, sq.params, s5.params, sm.params, anchor_x)
+        pv = parseval_eval(
+            sctd.params,
+            sqtd.params,
+            sphid.params,
+            sphic.params,
+            sphiq.params,
+            anchor_x,
+        )
         jax.tree.map(lambda x: x.block_until_ready(), pv)
         parseval_history["step"].append(float(st))
-        cr_m = float(jnp.mean(pv["cramer_l2_mog_cqn"]))
-        cf_m = float(jnp.mean(pv["cf_l2_w_mog_cqn"]))
-        parseval_history["cramer_l2_mog_cqn"].append(cr_m)
-        parseval_history["cf_l2_w_mog_cqn"].append(cf_m)
+        cr_m = float(jnp.mean(pv["cramer_l2_dirac"]))
+        cf_m = float(jnp.mean(pv["cf_l2_w_dirac"]))
+        parseval_history["cramer_l2_dirac"].append(cr_m)
+        parseval_history["cf_l2_w_dirac"].append(cf_m)
         pv_log = {
-            "train/parseval/mog_cqn/cramer_l2_anchor": cr_m,
-            "train/parseval/mog_cqn/cf_l2_w_anchor": cf_m,
+            "train/parseval/dirac/cramer_l2_anchor": cr_m,
+            "train/parseval/dirac/cf_l2_w_anchor": cf_m,
         }
         if wb and wandb_mod is not None:
             wandb_mod.log(pv_log, step=st)
@@ -1695,10 +1842,21 @@ def train_and_export(
     xv = jax.random.normal(xt, (cfg.n_test, cfg.state_dim), jnp.float32).at[0].set(
         jax.random.normal(PANEL_ANCHOR_PRNG_KEY, (cfg.state_dim,), jnp.float32)
     )
-    er, te, xe = evaluate_test_set(cfg, tuple(nets), (si.params, sq.params, s5.params, sm.params), xv)
+    er, te, xe = evaluate_test_set(
+        cfg,
+        tuple(nets),
+        (
+            sctd.params,
+            sqtd.params,
+            sphid.params,
+            sphic.params,
+            sphiq.params,
+        ),
+        xv,
+    )
     jax.tree.map(lambda x: x.block_until_ready(), er)
     payload, pm = _collect_eval_payload(cfg, tag, er, te, xe, panel_index=0)
-    save_msgpack(cfg, si.params, sq.params, s5.params, sm.params)
+    save_msgpack(cfg, sctd.params, sqtd.params, sphid.params, sphic.params, sphiq.params)
     payload_path = figures_run_dir / "distribution_analysis_payload.json"
     payload_path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
     if not skip_plots:
@@ -1725,7 +1883,7 @@ def train_and_export(
 
 def parse_args(a=None):
     p = argparse.ArgumentParser(
-        description="Offline distribution analysis: train IQN/QTD/CTD/MoG-CQN, save artifacts, plot locally.",
+        description="Offline distribution analysis: CTD, QTD, φTD (Dirac/cat/quant), save artifacts, plot locally.",
     )
     p.add_argument(
         "--aggregate-from-wandb",
@@ -1748,7 +1906,33 @@ def parse_args(a=None):
     p.add_argument("--omega-laplace-scale", type=float)
     p.add_argument("--num-qtd-quantiles", type=int)
     p.add_argument("--num-ctd-atoms", type=int)
-    p.add_argument("--num-mog-components", type=int)
+    p.add_argument(
+        "--num-dirac-components",
+        type=int,
+        dest="num_dirac_components",
+        help="Mixture size M for the φTD Dirac head (alias: --num-mog-components).",
+    )
+    p.add_argument(
+        "--num-mog-components",
+        type=int,
+        dest="num_dirac_components",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--close-to-theory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="close_to_theory",
+        help="φTD only: Pareto(α=1) ω on [omega_min_pareto, omega_clip] + unweighted CF MSE. "
+        "Use --no-close-to-theory or omit for half-Laplacian ω + CF MSE/ω² (default from YAML).",
+    )
+    p.add_argument(
+        "--omega-min-pareto",
+        type=float,
+        default=None,
+        dest="omega_min_pareto",
+        help="Lower truncation for Pareto ω when --close-to-theory (default 0.001).",
+    )
     p.add_argument("--no-wandb", action="store_true", help="Disable W&B logging.")
     p.add_argument("--no-plots", action="store_true", help="Skip matplotlib outputs (parseval + panel/metric figures).")
     p.add_argument("--wandb-project", default=None, help="W&B project (for --aggregate-from-wandb; else env WANDB_PROJECT).")
@@ -1787,8 +1971,12 @@ def main(a=None):
         "omega_laplace_scale": args.omega_laplace_scale,
         "num_tau": args.num_qtd_quantiles,
         "num_atoms": args.num_ctd_atoms,
-        "num_mog_components": args.num_mog_components,
+        "num_dirac_components": args.num_dirac_components,
     }
+    if getattr(args, "close_to_theory", None) is not None:
+        overrides["close_to_theory"] = args.close_to_theory
+    if getattr(args, "omega_min_pareto", None) is not None:
+        overrides["omega_min_pareto"] = args.omega_min_pareto
     cfg = load_da_config_yaml(args.config, overrides)
     cfg = replace(cfg, artifacts_dir=run_dir)
 

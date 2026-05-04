@@ -10,14 +10,14 @@ COLOR_GREEN_MOG = "#4ecb8d"  # MoG / MoG-CQN
 COLOR_DARK_BLUE_PQN = "#003a7d"  # PQN
 
 # φTD Dirac / Categorical / Quantile — contrast with CTD pink & QTD purple on the same figure
-COLOR_PHITD_FM = "#0f766e"  # teal (Dirac / F_m)
+COLOR_PHITD_FM = "#00ffff"  # cyan (Dirac / F_m)
 COLOR_PHITD_FCM = "#ea580c"  # orange (Categorical / F_{C,m})
 COLOR_PHITD_FQM = "#16a34a"  # green (Quantile / F_{Q,m})
 
 # φTD mixture CF variants (distinct, stable across experiments)
-COLOR_PHITD_MOG = "#d97706"  # Gaussian / MoG
+COLOR_PHITD_MOG =  "#ff0000" #d97706"  # Gaussian / MoG
 COLOR_PHITD_MOGAMMA = "#f59e0b"
-COLOR_PHITD_LAPLACE = "#0891b2"
+COLOR_PHITD_LAPLACE = "#008dff"
 COLOR_PHITD_LOGISTIC = "#a855f7"
 COLOR_PHITD_CAUCHY = "#92400e"
 

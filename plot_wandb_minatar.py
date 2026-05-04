@@ -1821,17 +1821,17 @@ if __name__ == "__main__":
     # )
     
     # #! CTD, QTD, Phi-TD (F_m / F_C,m / F_Q,m) — slurm_minatar_phi_families.sh
-    # plot_minatar_10m_phi_td_families(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     out="figures/minatar_10m_phi_td_families.png",
-    # )
+    plot_minatar_10m_phi_td_families(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        out="figures/minatar_10m_phi_td_families.png",
+    )
     # #! MoG-PQN vs Phi-TD MoG / Gamma / Laplace / Logistic — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
-    # plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
-    #     project="Deep-CVI-Experiments",
-    #     entity="fatty_data",
-    #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
-    # )
+    plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+    )
     
     #m#! CTD vs F_C,m - QTD vs F_Q,m - Fm (Pareto distribution, no weighted CF)
     # plot_minatar_10m_phi_td_families(
@@ -1850,16 +1850,16 @@ if __name__ == "__main__":
     
     # Exp 1 (λ=0, aux=0): baseline ``MinAtar_20M_Td_Lambda_WeightedCF_MoG`` vs φTD-MoG mimic
     # (``slurm/slurm_minatar_phi_td_mog_mimic_weighted_cf_exp1.sh``).
-    plot_minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        metric="charts/episodic_return",
-        step_metric="global_step",
-        baseline_experiment_tag="MinAtar_20M_Td_Lambda_WeightedCF_MoG",
-        phi_mimic_experiment_tag="MinAtar_20M_PhiTD_MoG_Mimic_WeightedCF",
-        out="figures/minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic.png",
-        max_runs=600,
-        max_runs_per_group=5,
-        display_titles=False,
-    )
+    # plot_minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     metric="charts/episodic_return",
+    #     step_metric="global_step",
+    #     baseline_experiment_tag="MinAtar_20M_Td_Lambda_WeightedCF_MoG",
+    #     phi_mimic_experiment_tag="MinAtar_20M_PhiTD_MoG_Mimic_WeightedCF",
+    #     out="figures/minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic.png",
+    #     max_runs=600,
+    #     max_runs_per_group=5,
+    #     display_titles=False,
+    # )
 

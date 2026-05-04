@@ -1,21 +1,14 @@
-# Offline distribution-learning benchmark (CTD, QTD, φTD Dirac / categorical / quantile).
-# Fields map 1:1 to DAConfig in run_distribution_analysis.py.
-# CLI flags override YAML. Metrics are not stored here (they appear in plots).
-
 seed: 0
 state_dim: 5
 dataset_size: 500000
 dataset_seed_offset: 1001
 total_steps: 20000
 log_every: 20000
-# Parseval / Dirac anchor metrics (and JIT chunk size): must divide total_steps. Smaller => more CSV/plot points.
 parseval_every: 1000
 batch_size: 1024
-
 num_tau: 51
 num_atoms: 51
 num_dirac_components: 51
-
 num_omega: 32
 gamma: 0.9
 immediate_reward_std: 0.2
@@ -26,19 +19,14 @@ max_grad_norm: 10.0
 omega_clip: 15.0
 omega_laplace_scale: 0.8
 cf_loss_omega_eps: 0.001
-sigma_min: 0.000001
-sigma_max: 20.0
 aux_mean_loss_weight: 0.1
 c51_v_min: -25.0
 c51_v_max: 25.0
-embed_dim: 64
 hidden_dim: 256
 trunk_layers: 2
 n_test: 10000
 test_seed_offset: 7777
 eval_chunk_size: 50
-num_taus_iqn_eval: 2000
-eval_iqn_seed: 42
 eval_num_t: 201
 eval_x_min: -15.0
 eval_x_max: 15.0
@@ -51,7 +39,4 @@ gp_num_t: 2001
 cvar_alpha: 0.05
 er_beta: 0.1
 mv_lambda: 0.1
-
-# φTD heads only: false → half-Laplacian ω + CF MSE / ω²; true → Pareto(α=1) on [omega_min_pareto, omega_clip] + plain CF MSE.
-close_to_theory: false
-omega_min_pareto: 0.001
+artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/distribution_analysis/2026-05-03_21:59:32"
