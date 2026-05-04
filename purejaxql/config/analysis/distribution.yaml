@@ -18,6 +18,8 @@ num_tau: 51
 phi_qt_same_arch_as_qtd: true
 # Only when phi_qt_same_arch_as_qtd is false: φ Quant output dim (omit or null → use num_tau).
 phi_qt_num_quantiles: null
+# φTD Quant: blend in QTD's quantile-Huber loss so φ Quant tracks QTD (tune 0.1–1.0; 0 = CF-only).
+phi_qt_aux_qtd_huber_weight: 0.0
 num_atoms: 51
 num_dirac_components: 51
 
@@ -59,5 +61,5 @@ er_beta: 0.1
 mv_lambda: 0.1
 
 # φTD heads only: false → half-Laplacian ω + CF MSE / ω²; true → Pareto(α=1) on [omega_min_pareto, omega_clip] + plain CF MSE.
-close_to_theory: false
-omega_min_pareto: 0.001
+close_to_theory: true
+omega_min_pareto: 0.0001

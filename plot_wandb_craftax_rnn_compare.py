@@ -343,7 +343,7 @@ def plot_craftax_rnn_compare_multi_source(
 PHI_TD_CRAFTAX_WANDB_ALGO_TAGS: tuple[str, ...] = (
     "PHI_TD_CATEGORICAL_RNN",
     "PHI_TD_QUANTILE_RNN",
-    "PHI_TD_DIRAC_RNN",
+    # "PHI_TD_DIRAC_RNN",
     "PHI_TD_MOG_RNN",
     "PHI_TD_CAUCHY_RNN",
     "PHI_TD_GAMMA_RNN",

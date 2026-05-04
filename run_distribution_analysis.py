@@ -6,11 +6,15 @@ The three φTD heads use the same sampled Bellman target as CTD/QTD (sample-only
 ``target = r + gamma * z_sample`` and ``phi_target(omega)=exp(i*omega*target)``. ω sampling and CF
 loss scaling are set by ``DAConfig.close_to_theory``: **False** → half-Laplacian ω and CF MSE divided
 by ``ω²``; **True** → truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and **unweighted**
-CF MSE (see ``purejaxql.utils.mog_cf.sample_frequencies``). Representation differs only in ``build_*_cf``.
+CF MSE (see ``purejaxql.utils.mog_cf.sample_frequencies``). Both φTD CF branches multiply by ``1/(2π)``
+to match eval ``cf_l2_w`` (same Parseval factor as ``cf_l2_sq_over_omega2``). Representation differs only
+in ``build_*_cf``.
 Optional ``aux_mean_loss_weight`` adds a Huber penalty on predicted vs sampled mean return for φTD only;
 default **0** keeps the comparison CE (CTD) / quantile Huber (QTD) vs **pure CF** (φTD).
 ``phi_qt_same_arch_as_qtd`` (default **True**) builds QTD and φTD Quant from the same ``QTDNet`` constructor
 (two parameter sets), mirroring CTD vs φ Cat.
+``phi_qt_aux_qtd_huber_weight`` mixes in the same quantile-Huber loss as QTD so φ Quant tracks QTD training
+(0 = CF-only for φ Quant).
 
 Config: ``purejaxql/config/analysis/distribution.yaml`` (overridable via ``--config``).
 ``num_seeds`` (default 1 in ``DAConfig``; YAML may override) runs independent RNG seeds **sequentially in one process** by default
@@ -130,7 +134,9 @@ def quantile_huber_loss_pairwise(q_preds: jax.Array, rewards: jax.Array, taus: j
     u = rewards[:, None] - q_preds
     hub = _huber(u, kappa)
     ind = (u < 0).astype(q_preds.dtype)
-    return jnp.mean(jnp.abs(taus - ind) * hub / kappa)
+    # Match standard QR-DQN reduction used elsewhere in this repo:
+    # sum over quantile heads, then average over batch.
+    return jnp.mean(jnp.sum(jnp.abs(taus - ind) * hub / kappa, axis=-1))
 
 
 def gil_pelaez_cdf(phi_positive: jax.Array, t_pos: jax.Array, x_grid: jax.Array) -> jax.Array:
@@ -145,12 +151,16 @@ def cramer_l2_sq_cdf(f_hat: jax.Array, f_true: jax.Array, x_grid: jax.Array) -> 
     return jnp.trapezoid(jnp.square(f_hat - f_true), x_grid)
 
 
+# Same factor as in ``cf_l2_sq_over_omega2``: Parseval / Gil-Pelaez CF metric uses (1 / 2π) on the ω integral.
+_INVERSE_2PI = 1.0 / (2.0 * float(np.pi))
+
+
 def cf_l2_sq_over_omega2(phi_hat: jax.Array, phi_t: jax.Array, omega_grid: jax.Array, omega_eps: float) -> jax.Array:
     d = phi_hat - phi_t
     num = jnp.real(d) ** 2 + jnp.imag(d) ** 2
     den = jnp.maximum(jnp.square(jnp.abs(omega_grid)), jnp.float64(omega_eps**2))
     # Parseval-Plancherel normalization for CDF L2: (1 / 2π) ∫ |Δφ(ω)|² / ω² dω.
-    return jnp.trapezoid(num / den, omega_grid) / (2.0 * jnp.pi)
+    return jnp.trapezoid(num / den, omega_grid) * _INVERSE_2PI
 
 
 def w1_cdf(f_hat: jax.Array, f_true: jax.Array, x_grid: jax.Array) -> jax.Array:
@@ -480,6 +490,8 @@ class DAConfig:
     phi_qt_same_arch_as_qtd: bool = True
     # Used only when ``phi_qt_same_arch_as_qtd`` is ``False``; if ``None``, defaults to ``num_tau``.
     phi_qt_num_quantiles: int | None = None
+    # φTD Quant only: add ``weight * quantile_huber_loss`` (same as QTD) to pull φ Quant metrics toward QTD; 0 = CF-only.
+    phi_qt_aux_qtd_huber_weight: float = 0.0
     # When set (e.g. figures/distribution_analysis/<timestamp>), checkpoints and local plots go here.
     artifacts_dir: Path | None = None
 
@@ -647,6 +659,13 @@ def _build_qtd_net(cfg: DAConfig, *, num_quantiles: int | None = None) -> QTDNet
     return QTDNet(cfg.hidden_dim, cfg.trunk_layers, nq)
 
 
+def _phi_qt_output_dim(cfg: DAConfig) -> int:
+    """Output width of the φTD Quant head (matches ``num_tau`` when ``phi_qt_same_arch_as_qtd``)."""
+    if cfg.phi_qt_same_arch_as_qtd:
+        return int(cfg.num_tau)
+    return int(cfg.phi_qt_num_quantiles if cfg.phi_qt_num_quantiles is not None else cfg.num_tau)
+
+
 def create_train_states(rng: jax.Array, cfg: DAConfig):
     rctd, rqtd, rphid, rphic, rphiq = jax.random.split(rng, 5)
     ctd = CTDNet(cfg.hidden_dim, cfg.trunk_layers, cfg.num_atoms)
@@ -704,6 +723,9 @@ def make_train_chunk(
     xa, aa, ra, zn = ds
     n, aux_w = xa.shape[0], jnp.float32(cfg.aux_mean_loss_weight)
     g, atoms = jnp.float32(cfg.gamma), ctd_atoms(cfg)
+    m_phi = _phi_qt_output_dim(cfg)
+    tauf_phi = jnp.broadcast_to(fixed_qr_tau_grid(m_phi)[None, :], (cfg.batch_size, m_phi))
+    qtd_align_w = jnp.float32(cfg.phi_qt_aux_qtd_huber_weight)
 
     def step(c, _):
         sctd, sqtd, sphid, sphic, sphiq, rng = c
@@ -739,14 +761,15 @@ def make_train_chunk(
 
             def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
                 e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
-                return 0.5 * jnp.mean(e2)
+                # Match eval ``cf_l2_w`` (``cf_l2_sq_over_omega2``): include 1/(2π) Parseval scale.
+                return 0.5 * jnp.mean(e2) * _INVERSE_2PI
 
         else:
             w2 = jnp.maximum(jnp.square(om), jnp.float32(cfg.cf_loss_omega_eps**2))
 
             def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
                 e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
-                return 0.5 * jnp.mean(e2 / w2)
+                return 0.5 * jnp.mean(e2 / w2) * _INVERSE_2PI
 
         def lctd(pp):
             lg = jax.nn.log_softmax(ctd.apply({"params": pp}, xb, oh))
@@ -784,7 +807,9 @@ def make_train_chunk(
             pred = jax.vmap(row_qt)(qv, om)
             d = pred - target_cf
             mq = jnp.mean(qv, axis=-1)
-            return cf_phi_mean(d) + aux_w * jnp.mean(_huber(mq - tgt, cfg.huber_kappa))
+            loss_cf = cf_phi_mean(d) + aux_w * jnp.mean(_huber(mq - tgt, cfg.huber_kappa))
+            hub_qtd = quantile_huber_loss_pairwise(qv, tgt, tauf_phi, cfg.huber_kappa)
+            return loss_cf + qtd_align_w * hub_qtd
 
         v5, g5 = jax.value_and_grad(lctd)(sctd.params)
         vq, gq = jax.value_and_grad(lqtd)(sqtd.params)
@@ -1961,6 +1986,13 @@ def parse_args(a=None):
         dest="phi_qt_num_quantiles",
         help="φTD Quant output size when --no-phi-qt-same-arch-as-qtd (default: num_tau).",
     )
+    p.add_argument(
+        "--phi-qt-aux-qtd-huber-weight",
+        type=float,
+        default=None,
+        dest="phi_qt_aux_qtd_huber_weight",
+        help="Add weight×QTD quantile-Huber loss to φTD Quant (0=CF only). Aligns eval metrics with QTD.",
+    )
     p.add_argument("--num-ctd-atoms", type=int)
     p.add_argument(
         "--num-dirac-components",
@@ -2043,6 +2075,8 @@ def main(a=None):
         overrides["phi_qt_same_arch_as_qtd"] = args.phi_qt_same_arch_as_qtd
     if getattr(args, "phi_qt_num_quantiles", None) is not None:
         overrides["phi_qt_num_quantiles"] = args.phi_qt_num_quantiles
+    if getattr(args, "phi_qt_aux_qtd_huber_weight", None) is not None:
+        overrides["phi_qt_aux_qtd_huber_weight"] = args.phi_qt_aux_qtd_huber_weight
     cfg = load_da_config_yaml(args.config, overrides)
     cfg = replace(cfg, artifacts_dir=run_dir)
 

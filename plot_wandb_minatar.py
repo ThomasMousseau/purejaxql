@@ -1711,7 +1711,7 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     pqn_baseline_max_steps: float | None = 10_000_000,
 ) -> None:
     """Phi-TD mixture CFs from ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh`` (default curves
-    omit ``MoG-PQN``; pass ``algo_tags`` to include it).
+    omit ``MoG-PQN`` and ``PhiTD-Logistic``; pass ``algo_tags`` to include either).
 
     Runs must include tags: ``experiment_tag``, ``multi_seed``, ``phi_mog_gamma_laplace_logistic``,
     and exactly one of ``PhiTD-MoG``, ``PhiTD-MoGamma``, ``PhiTD-Laplace``, ``PhiTD-Logistic`` (or
@@ -1735,7 +1735,6 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         "PhiTD-MoG",
         "PhiTD-MoGamma",
         "PhiTD-Laplace",
-        "PhiTD-Logistic",
     ]
     if algo_tags is None:
         algo_tags = (["PQN", *phi_algo_tags] if pqn_baseline_20m_exp1 else phi_algo_tags)

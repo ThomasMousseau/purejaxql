@@ -42,6 +42,7 @@ from run_distribution_analysis import (
     MK,
     NUM_ACTIONS,
     PANEL_ANCHOR_PRNG_KEY,
+    _INVERSE_2PI,
     _config_for_logging,
     _huber,
     _dense_ln_relu,
@@ -232,14 +233,14 @@ def make_train_chunk_fp(
 
             def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
                 e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
-                return 0.5 * jnp.mean(e2)
+                return 0.5 * jnp.mean(e2) * _INVERSE_2PI
 
         else:
             w2 = jnp.maximum(jnp.square(om), jnp.float32(cfg.cf_loss_omega_eps**2))
 
             def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
                 e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
-                return 0.5 * jnp.mean(e2 / w2)
+                return 0.5 * jnp.mean(e2 / w2) * _INVERSE_2PI
 
         def lphimog(pp):
             lg, mu, ls = phi_mog.apply({"params": pp}, xb, oh)
