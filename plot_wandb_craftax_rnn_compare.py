@@ -341,11 +341,11 @@ def plot_craftax_rnn_compare_multi_source(
 # W&B algo tags from ``phi_td_pqn_rnn_craftax`` (``config.ALG_NAME.upper()``); order matches
 # ``slurm/slurm_craftax_rnn_1b_phi_td_compare.sh`` HYDRA_ALG.
 PHI_TD_CRAFTAX_WANDB_ALGO_TAGS: tuple[str, ...] = (
-    "PHI_TD_CATEGORICAL_RNN",
-    "PHI_TD_QUANTILE_RNN",
+    # "PHI_TD_CATEGORICAL_RNN",
+    # "PHI_TD_QUANTILE_RNN",
     # "PHI_TD_DIRAC_RNN",
     "PHI_TD_MOG_RNN",
-    "PHI_TD_CAUCHY_RNN",
+    # "PHI_TD_CAUCHY_RNN",
     "PHI_TD_GAMMA_RNN",
     "PHI_TD_LAPLACE_RNN",
     # "PHI_TD_LOGISTIC_RNN",
