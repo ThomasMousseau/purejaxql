@@ -1,27 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=minatar-phi-mog-gl
-#SBATCH --gres=gpu:rtx8000:1
+#SBATCH --job-name=minatar-phi-4fam
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1
-#SBATCH --array=0-19%20
+#SBATCH --array=0-15%16
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mem=16G
 #SBATCH --time=1:00:00
 
 ################################################################################
-# MinAtar 10M — five algorithms × four envs = 20 Slurm tasks.
+# MinAtar 10M — four Phi-TD distributional families × four envs = 16 Slurm tasks.
 #
-#   MoG-PQN (``mog_pqn_minatar``: MoG CF + TD(λ) aux)
-#   Phi-TD MoG (``phi_td_minatar_mog``: same Gaussian heads, CF Bellman only)
-#   Phi-TD Gamma / Laplace / Logistic mixture CFs (``phi_td_pqn_minatar``)
+#   ``phi_td_pqn_minatar`` + ``+alg=phi_td_minatar_*``:
+#   Categorical, Quantile, Dirac, Cauchy (CF Bellman only; no TD(λ) mean aux).
 #
-# TID → env_idx = TID/5, algo_idx = TID%5
+# TID → env_idx = TID/4, algo_idx = TID%4
 #
 # Submit from repo root:  sbatch slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh
 ################################################################################
 
-#SBATCH --gres=gpu:l40s:1
-#SBATCH --gres=gpu:rtx8000:1
 
 set -euo pipefail
 
@@ -34,11 +31,11 @@ HYDRA_CONFIG_DIR="${ROOT}/purejaxql/config"
 export WANDB_PROJECT="${WANDB_PROJECT:-Deep-CVI-Experiments}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-EXPERIMENT_TAG="MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic_v2"
+EXPERIMENT_TAG="MinAtar_10M_PhiTD_Categorical_Quantile_Dirac_Cauchy"
 
 TID="${SLURM_ARRAY_TASK_ID:?}"
-ENV_IDX=$((TID / 5))
-ALGO_IDX=$((TID % 5))
+ENV_IDX=$((TID / 4))
+ALGO_IDX=$((TID % 4))
 
 ENV_IDS=(
     "Asterix-MinAtar"
@@ -48,25 +45,22 @@ ENV_IDS=(
 )
 
 PY_MODULES=(
-    "purejaxql.mog_pqn_minatar"
     "purejaxql.phi_td_pqn_minatar"
     "purejaxql.phi_td_pqn_minatar"
     "purejaxql.phi_td_pqn_minatar"
     "purejaxql.phi_td_pqn_minatar"
 )
 HYDRA_ALG=(
-    "mog_pqn_minatar"
-    "phi_td_minatar_mog"
-    "phi_td_minatar_gamma"
-    "phi_td_minatar_laplace"
-    "phi_td_minatar_logistic"
+    "phi_td_minatar_categorical"
+    "phi_td_minatar_quantile"
+    "phi_td_minatar_dirac"
+    "phi_td_minatar_cauchy"
 )
 WANDB_ALGO_TAGS=(
-    "MoG-PQN"
-    "PhiTD-MoG"
-    "PhiTD-MoGamma"
-    "PhiTD-Laplace"
-    "PhiTD-Logistic"
+    "PhiTD-Categorical"
+    "PhiTD-Quantile"
+    "PhiTD-Dirac"
+    "PhiTD-Cauchy"
 )
 
 ENV_ID="${ENV_IDS[$ENV_IDX]}"
@@ -77,7 +71,7 @@ WANDB_TAG_ALGO="${WANDB_ALGO_TAGS[$ALGO_IDX]}"
 RUN_NAME="${ENV_ID}__${WANDB_TAG_ALGO}__s5"
 
 echo "=========================================="
-echo "MinAtar 10M — MoG-PQN vs Phi-TD MoG/Gamma/Laplace/Logistic (5 × 4 envs)"
+echo "MinAtar 10M — Phi-TD Categorical / Quantile / Dirac / Cauchy (4 × 4 envs)"
 echo "=========================================="
 echo "Task:     ${TID} (env ${ENV_IDX}, algo ${ALGO_IDX})"
 echo "Module:   ${PY_MODULE}"
@@ -100,7 +94,7 @@ uv run --no-sync python -m "${PY_MODULE}" \
   "NUM_SEEDS=5" \
   "alg.WANDB_LOG_ALL_SEEDS=true" \
   "+alg.EXPERIMENT_TAG=${EXPERIMENT_TAG}" \
-  "+alg.WANDB_EXTRA_TAGS=[\"${WANDB_TAG_ALGO}\",\"multi_seed\",\"phi_mog_gamma_laplace_logistic\"]" \
+  "+alg.WANDB_EXTRA_TAGS=[\"${WANDB_TAG_ALGO}\",\"multi_seed\",\"phi_td_cat_quant_dirac_cauchy\"]" \
   "+alg.NAME=${RUN_NAME}" \
   "alg.TOTAL_TIMESTEPS=10_000_000" \
   "alg.TOTAL_TIMESTEPS_DECAY=10_000_000" \

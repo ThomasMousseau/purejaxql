@@ -29,7 +29,7 @@ multiple curves so mean ± 95% CI matches multi-run aggregation.
 ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh``): use
 :func:`plot_minatar_10m_phi_td_families` and :func:`plot_minatar_10m_phi_td_mog_gamma_laplace_logistic`
 with the experiment tags and algo tags emitted by those scripts (plus ``phi_family_compare`` /
-``phi_mog_gamma_laplace_logistic`` on runs).
+``phi_mog_gamma_laplace_logistic`` or ``phi_td_cat_quant_dirac_cauchy`` on runs).
 
 **φTD-MoG vs MoG-PQN weighted CF (Exp 1):** train with
 ``slurm/slurm_minatar_phi_td_mog_mimic_weighted_cf_exp1.sh`` and compare to historical
@@ -133,6 +133,12 @@ def _get_run_env_id(run, *, use_run_name: bool = True) -> str | None:
 def _run_matches_required(run, required: list[str]) -> bool:
     tags = set(run.tags or [])
     return all(t in tags for t in required)
+
+
+def _run_matches_any_alternative(run, alternative_groups: list[list[str]]) -> bool:
+    """True if the run's tags satisfy **all** tags in **any** inner list (OR across groups)."""
+    tags = set(run.tags or [])
+    return any(all(t in tags for t in group) for group in alternative_groups)
 
 
 def _algo_group(run, algo_tags: list[str]) -> str | None:
@@ -521,6 +527,7 @@ def plot_episodic_return(
     multi_seed_tag: str = "multi_seed",
     phi_td_families_compare_legend: bool = False,
     extra_curve_specs: list[tuple[list[str], str] | tuple[list[str], str, float | None]] | None = None,
+    required_alternatives: list[list[str]] | None = None,
 ) -> None:
     """Plot mean ± 95% CI episodic return from W&B.
 
@@ -528,6 +535,11 @@ def plot_episodic_return(
     grouped under the W&B algo tag given by the second element (e.g. pull **PQN** from
     ``MinAtar_20M_Td_Lambda`` without requiring the primary ``experiment_tag``). An optional
     third element caps the x-axis (``step_metric``): only points with step ≤ that value are kept.
+
+    ``required_alternatives`` (optional): if set and non-empty, a run matches the primary filter
+    when **any** inner list is fully satisfied (OR across groups; AND within each group). When
+    this is set, ``required_tag`` and ``experiment_tag`` are ignored for primary matching (use the
+    inner lists to pin experiment tags, sweep tags, ``multi_seed``, etc.).
 
     - **Legacy (single panel):** leave ``env_ids`` as ``None``. Optionally set ``experiment_tag`` to filter runs.
     - **One env, filtered by id:** ``env_ids=[\"Breakout-MinAtar\"]`` and ``experiment_tag`` if needed.
@@ -549,9 +561,17 @@ def plot_episodic_return(
     if algo_tags is None:
         algo_tags = ["MoG", "dqn", "C51", "QR-DQN", "IQN", "FQF"]
 
-    required_effective = list(required_tag)
-    if experiment_tag:
-        required_effective.append(experiment_tag)
+    if required_alternatives:
+        def run_matches_primary(run) -> bool:
+            return _run_matches_any_alternative(run, required_alternatives)
+
+    else:
+        required_effective = list(required_tag)
+        if experiment_tag:
+            required_effective.append(experiment_tag)
+
+        def run_matches_primary(run) -> bool:
+            return _run_matches_required(run, required_effective)
 
     api = wandb.Api()
     path = _wandb_path(entity, project)
@@ -565,7 +585,7 @@ def plot_episodic_return(
     if env_ids is not None and len(env_ids) > 1:
         by_env_algo: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
         for run in runs:
-            if not _run_matches_required(run, required_effective):
+            if not run_matches_primary(run):
                 continue
             eid = _get_run_env_id(run, use_run_name=use_run_name_for_env)
             if eid is None or eid not in env_ids:
@@ -642,7 +662,7 @@ def plot_episodic_return(
     # ----- Single panel -----
     by_algo: dict[str, list] = defaultdict(list)
     for run in runs:
-        if not _run_matches_required(run, required_effective):
+        if not run_matches_primary(run):
             continue
         if env_ids is not None and len(env_ids) == 1:
             if _get_run_env_id(run, use_run_name=use_run_name_for_env) != env_ids[0]:
@@ -1694,7 +1714,10 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     *,
     project: str = "Deep-CVI-Experiments",
     entity: str | None = None,
-    experiment_tag: str = "MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic",
+    mixture_experiment_tag: str = "MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic",
+    four_family_experiment_tag: str = "MinAtar_10M_PhiTD_Categorical_Quantile_Dirac_Cauchy",
+    mixture_wandb_tag: str = "phi_mog_gamma_laplace_logistic",
+    four_family_wandb_tag: str = "phi_td_cat_quant_dirac_cauchy",
     out: str = "figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
     env_ids: list[str] | None = None,
     algo_tags: list[str] | None = None,
@@ -1702,7 +1725,7 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     metric: str = "charts/episodic_return",
     step_metric: str = "global_step",
     grid_points: int = 800,
-    max_runs: int = 3000,
+    max_runs: int = 4000,
     smooth_window: int = 41,
     multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     multi_seed_tag: str = "multi_seed",
@@ -1710,19 +1733,21 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     pqn_baseline_experiment_tag: str = "MinAtar_20M_Td_Lambda",
     pqn_baseline_max_steps: float | None = 10_000_000,
 ) -> None:
-    """Phi-TD mixture CFs from ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh`` (default curves
-    omit ``MoG-PQN`` and ``PhiTD-Logistic``; pass ``algo_tags`` to include either).
+    """φ-TD MinAtar 10M — **two** Slurm sweeps on one figure.
 
-    Runs must include tags: ``experiment_tag``, ``multi_seed``, ``phi_mog_gamma_laplace_logistic``,
-    and exactly one of ``PhiTD-MoG``, ``PhiTD-MoGamma``, ``PhiTD-Laplace``, ``PhiTD-Logistic`` (or
-    ``MoG-PQN`` if added via ``algo_tags``).
+    **Mixture CF families** (historical): ``mixture_experiment_tag`` + ``mixture_wandb_tag``
+    (``phi_mog_gamma_laplace_logistic`` on runs): ``PhiTD-MoG``, ``PhiTD-MoGamma``, ``PhiTD-Laplace``,
+    ``PhiTD-Logistic``.
 
-    When ``pqn_baseline_20m_exp1`` (default), also plots **PQN** from
-    ``slurm/slurm_minatar_lambda_aux_sensitivity.sh`` experiment 1: same tag set as
-    :func:`plot_minatar_20m_td_lambda_aux_3exp` for Exp 1 (``pqn_baseline_experiment_tag``,
-    ``LAMBDA-0.0``, ``AUX_MEAN_LOSS_WEIGHT-0.0``, ``PQN``) — canonical dark blue in
-    :mod:`plot_colors`. Those runs train for 20M steps; ``pqn_baseline_max_steps`` (default 10M,
-    in ``step_metric`` units) trims the PQN curve so it matches the 10M φ-TD runs.
+    **Categorical / Quantile / Dirac / Cauchy** (current ``slurm/slurm_minatar_phi_mog_gamma_laplace_logistic.sh``):
+    ``four_family_experiment_tag`` + ``four_family_wandb_tag`` (``phi_td_cat_quant_dirac_cauchy``):
+    ``PhiTD-Categorical``, ``PhiTD-Quantile``, ``PhiTD-Dirac``, ``PhiTD-Cauchy``.
+
+    Each run must match ``multi_seed`` plus **one** of the two OR-groups above, and carry exactly one
+    corresponding ``PhiTD-*`` algo tag.
+
+    When ``pqn_baseline_20m_exp1`` (default), also plots **PQN** via ``extra_curve_specs`` (same as
+    before): Exp 1 tags under ``pqn_baseline_experiment_tag``, trimmed by ``pqn_baseline_max_steps``.
     """
     if env_ids is None:
         env_ids = [
@@ -1735,11 +1760,21 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         "PhiTD-MoG",
         "PhiTD-MoGamma",
         "PhiTD-Laplace",
+        # "PhiTD-Logistic",
+        "PhiTD-Categorical",
+        "PhiTD-Quantile",
+        "PhiTD-Dirac",
+        "PhiTD-Cauchy",
     ]
     if algo_tags is None:
         algo_tags = (["PQN", *phi_algo_tags] if pqn_baseline_20m_exp1 else phi_algo_tags)
     elif pqn_baseline_20m_exp1 and "PQN" not in algo_tags:
         algo_tags = ["PQN", *algo_tags]
+
+    required_alternatives = [
+        [mixture_experiment_tag, mixture_wandb_tag, multi_seed_tag],
+        [four_family_experiment_tag, four_family_wandb_tag, multi_seed_tag],
+    ]
 
     extra_curve_specs: list[tuple[list[str], str] | tuple[list[str], str, float | None]] | None = None
     if pqn_baseline_20m_exp1:
@@ -1761,7 +1796,7 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     plot_episodic_return(
         project=project,
         entity=entity,
-        required_tag=["phi_mog_gamma_laplace_logistic"],
+        required_tag=None,
         algo_tags=algo_tags,
         metric=metric,
         step_metric=step_metric,
@@ -1769,12 +1804,13 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         grid_points=grid_points,
         max_runs=max_runs,
         smooth_window=smooth_window,
-        experiment_tag=experiment_tag,
+        experiment_tag=None,
         env_ids=env_ids,
         use_run_name_for_env=use_run_name_for_env,
         multi_env_y_top_margin=multi_env_y_top_margin,
         multi_seed_tag=multi_seed_tag,
         extra_curve_specs=extra_curve_specs,
+        required_alternatives=required_alternatives,
     )
 
 
@@ -1925,12 +1961,6 @@ if __name__ == "__main__":
     #     entity="fatty_data",
     #     out="figures/minatar_10m_phi_td_families.png",
     # )
-    # #! Phi-TD MoG / Gamma / Laplace / Logistic (+ optional PQN baseline) — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
-    plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
-        project="Deep-CVI-Experiments",
-        entity="fatty_data",
-        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
-    )
     
     #m#! CTD vs F_C,m - QTD vs F_Q,m - Fm (Pareto distribution, no weighted CF)
     # plot_minatar_10m_phi_td_families(
@@ -1942,7 +1972,7 @@ if __name__ == "__main__":
     # #! Gaussian, Laplace, Gamme (Pareto distribution, no weighted CF)
     # plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
     #     project="Deep-CVI-Experiments",
-    #     experiment_tag="MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic_v2",
+    #     mixture_experiment_tag="MinAtar_10M_MoG_PhiTD_Gamma_Laplace_Logistic_v2",
     #     entity="fatty_data",
     #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic_v2.png",
     # )
@@ -1961,4 +1991,13 @@ if __name__ == "__main__":
     #     max_runs_per_group=5,
     #     display_titles=False,
     # )
+    
+    #? FINAL REPORT PLOTS
+    #! Phi-TD MoG / Gamma / Laplace / Logistic (+ optional PQN baseline) — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
+    plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+        project="Deep-CVI-Experiments",
+        entity="fatty_data",
+        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+    )
+
 

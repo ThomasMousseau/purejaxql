@@ -10,7 +10,7 @@ COLOR_GREEN_MOG = "#4ecb8d"  # MoG / MoG-CQN
 COLOR_DARK_BLUE_PQN = "#003a7d"  # PQN
 
 # φTD Dirac / Categorical / Quantile — contrast with CTD pink & QTD purple on the same figure
-COLOR_PHITD_FM = "#00ffff"  # cyan (Dirac / F_m)
+COLOR_PHITD_FM = "#a855f7"  # purple (Dirac / F_m)
 COLOR_PHITD_FCM = "#ea580c"  # orange (Categorical / F_{C,m})
 COLOR_PHITD_FQM = "#16a34a"  # green (Quantile / F_{Q,m})
 
@@ -18,7 +18,7 @@ COLOR_PHITD_FQM = "#16a34a"  # green (Quantile / F_{Q,m})
 COLOR_PHITD_MOG =  "#ff0000" #d97706"  # Gaussian / MoG
 COLOR_PHITD_MOGAMMA = "#f59e0b"
 COLOR_PHITD_LAPLACE = "#008dff"
-COLOR_PHITD_LOGISTIC = "#a855f7"
+COLOR_PHITD_LOGISTIC = "#4e4e4c" # grey 
 COLOR_PHITD_CAUCHY = "#92400e"
 
 # --- Exact W&B algo tags → hex (canonical paper colors) ---
@@ -42,6 +42,9 @@ _WANDB_TAG_HEX: dict[str, str] = {
     "PhiTD-Fm": COLOR_PHITD_FM,
     "PhiTD-FCm": COLOR_PHITD_FCM,
     "PhiTD-FQm": COLOR_PHITD_FQM,
+    "PhiTD-Categorical": COLOR_PHITD_FCM,
+    "PhiTD-Quantile": COLOR_PHITD_FQM,
+    "PhiTD-Dirac": COLOR_PHITD_FM,
     "PhiTD-MoG": COLOR_PHITD_MOG,
     # MoG-PQN weighted-CF sweep (``plot_minatar_20m_td_lambda_aux_3exp`` / mimic vs baseline)
     "MoG-WeightedCF": "#ff0000",
@@ -88,6 +91,9 @@ _ALGO_KEY_TO_COLOR = {
     "phitd_fm": COLOR_PHITD_FM,
     "phitd_fcm": COLOR_PHITD_FCM,
     "phitd_fqm": COLOR_PHITD_FQM,
+    "phitd_categorical": COLOR_PHITD_FCM,
+    "phitd_quantile": COLOR_PHITD_FQM,
+    "phitd_dirac": COLOR_PHITD_FM,
     "phitd_mog": COLOR_PHITD_MOG,
     "phitd_mogamma": COLOR_PHITD_MOGAMMA,
     "phitd_laplace": COLOR_PHITD_LAPLACE,
@@ -97,6 +103,9 @@ _ALGO_KEY_TO_COLOR = {
 
 # Default legend strings (φ via mathtext). Mixture tags: TD-Gaussian, TD-Gamma (word), etc.
 LEGEND_WANDB_TAG: dict[str, str] = {
+    "PhiTD-Categorical": r"$\varphi\text{TD-Categorical}$",
+    "PhiTD-Quantile": r"$\varphi\text{TD-Quantile}$",
+    "PhiTD-Dirac": r"$\varphi\text{TD-Dirac}$",
     "PhiTD-Fm": r"$\varphi\text{TD-Dirac}$",
     "PhiTD-FCm": r"$\varphi\text{TD-Categorical}$",
     "PhiTD-FQm": r"$\varphi\text{TD-Quantile}$",

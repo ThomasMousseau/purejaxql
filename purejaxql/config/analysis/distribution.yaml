@@ -3,7 +3,7 @@
 # CLI flags override YAML. Metrics are not stored here (they appear in plots).
 
 seed: 0
-num_seeds: 1
+num_seeds: 5
 state_dim: 5
 dataset_size: 500000
 dataset_seed_offset: 1001
@@ -62,4 +62,4 @@ mv_lambda: 0.1
 
 # φTD heads only: false → half-Laplacian ω + CF MSE / ω²; true → Pareto(α=1) on [omega_min_pareto, omega_clip] + plain CF MSE.
 close_to_theory: true
-omega_min_pareto: 0.0001
+omega_min_pareto: 0.001
