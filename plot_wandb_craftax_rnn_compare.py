@@ -86,6 +86,10 @@ def _plot_curves_multi_groups(
     smooth_window: int,
     metric: str,
     step_metric: str,
+    axis_label_fontsize: float | None = None,
+    axis_label_bold: bool = False,
+    tick_label_fontsize: float | None = None,
+    legend_fontsize: float | None = None,
 ) -> None:
     """
     Same mean / 95% CI / smoothing as ``_draw_algo_curves_on_ax``, but one pooled curve per group
@@ -128,10 +132,23 @@ def _plot_curves_multi_groups(
         ax.plot(grid, mean, color=color, linewidth=2.0, linestyle=linestyle, label=label)
         ax.fill_between(grid, lower, upper, color=color, alpha=0.2)
 
-    ax.set_xlabel(_pretty_step_label(step_metric))
-    ax.set_ylabel(_pretty_metric_label(metric))
+    xl = _pretty_step_label(step_metric)
+    yl = _pretty_metric_label(metric)
+    label_kw: dict = {}
+    if axis_label_fontsize is not None:
+        label_kw["fontsize"] = axis_label_fontsize
+    if axis_label_bold:
+        label_kw["fontweight"] = "bold"
+    if label_kw:
+        ax.set_xlabel(xl, **label_kw)
+        ax.set_ylabel(yl, **label_kw)
+    else:
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", which="major", labelsize=tick_label_fontsize)
     n_leg = len(groups)
-    leg_fs = 6 if n_leg > 6 else 8
+    leg_fs = legend_fontsize if legend_fontsize is not None else (6 if n_leg > 6 else 8)
     style_axes_wandb_curve(ax)
     ax.legend(fontsize=leg_fs, loc="best")
 
@@ -253,6 +270,13 @@ def plot_craftax_rnn_compare_multi_source(
     max_runs: int,
     smooth_window: int,
     env_name_filter: str | None,
+    figsize: tuple[float, float] = (10, 6),
+    show_title: bool = True,
+    title_fontsize: float = 12,
+    axis_label_fontsize: float | None = None,
+    axis_label_bold: bool = False,
+    tick_label_fontsize: float | None = None,
+    legend_fontsize: float | None = None,
 ) -> None:
     """
     Plot compare curves when the same algo tag should appear multiple times
@@ -319,7 +343,7 @@ def plot_craftax_rnn_compare_multi_source(
     if parts:
         print("Curves:", "; ".join(parts))
 
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
     _plot_curves_multi_groups(
         ax,
         groups=groups,
@@ -328,8 +352,13 @@ def plot_craftax_rnn_compare_multi_source(
         smooth_window=smooth_window,
         metric=metric,
         step_metric=step_metric,
+        axis_label_fontsize=axis_label_fontsize,
+        axis_label_bold=axis_label_bold,
+        tick_label_fontsize=tick_label_fontsize,
+        legend_fontsize=legend_fontsize,
     )
-    ax.set_title(_figure_title_craftax(env_name_filter), fontsize=12)
+    if show_title:
+        ax.set_title(_figure_title_craftax(env_name_filter), fontsize=title_fontsize)
 
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     fig.tight_layout()
@@ -581,6 +610,13 @@ def plot_craftax_phi_td_with_baselines(
     fair_m8_experiment_tag: str | None = None,
     fair_m51_experiment_tag: str | None = None,
     fair_comparison_algo_tags: tuple[str, ...] = FAIR_4ALG_CRAFTAX_WANDB_TAGS,
+    figsize: tuple[float, float] = (10, 6),
+    show_title: bool = True,
+    title_fontsize: float = 12,
+    axis_label_fontsize: float | None = None,
+    axis_label_bold: bool = False,
+    tick_label_fontsize: float | None = None,
+    legend_fontsize: float | None = None,
 ) -> None:
     """
     One figure; **three** ways to choose curves (first match wins):
@@ -672,6 +708,13 @@ def plot_craftax_phi_td_with_baselines(
         max_runs=max_runs,
         smooth_window=smooth_window,
         env_name_filter=env_name_filter,
+        figsize=figsize,
+        show_title=show_title,
+        title_fontsize=title_fontsize,
+        axis_label_fontsize=axis_label_fontsize,
+        axis_label_bold=axis_label_bold,
+        tick_label_fontsize=tick_label_fontsize,
+        legend_fontsize=legend_fontsize,
     )
 
 
@@ -758,9 +801,15 @@ def main() -> None:
         entity="fatty_data",
         phi_experiment_tag="Craftax-1B-phiTD-hLap-wOmega2",
         baseline_experiment_tag="Craftax-1B-5ALG",
-        phi_algo_tags=PHI_TD_CRAFTAX_WANDB_ALGO_TAGS, 
+        phi_algo_tags=PHI_TD_CRAFTAX_WANDB_ALGO_TAGS,
         baseline_algo_tags=("PQN_RNN",),
         out="figures/craftax_1b_rnn_phi_td_six_families_plus_pqn_hLap_wOmega2.png",
+        figsize=(14, 8),
+        show_title=False,
+        axis_label_fontsize=14,
+        axis_label_bold=True,
+        tick_label_fontsize=12,
+        legend_fontsize=14,
     )
     
     

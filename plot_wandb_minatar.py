@@ -372,9 +372,13 @@ def _pretty_step_label(step_metric: str) -> str:
     return xlabel_for_step_metric(step_metric)
 
 
-def _pretty_env_title(env_id: str) -> str:
+def _pretty_env_title(env_id: str, *, omit_minatar: bool = False) -> str:
     if env_id.endswith("-MinAtar"):
-        return env_id.replace("-MinAtar", " MinAtar").replace("-", " ")
+        stem = env_id[: -len("-MinAtar")]
+        pretty = stem.replace("-", " ").replace("_", " ")
+        if omit_minatar:
+            return pretty
+        return f"{pretty} MinAtar"
     return env_id.replace("-", " ").replace("_", " ").title()
 
 
@@ -393,6 +397,11 @@ def _draw_algo_curves_on_ax(
     y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
     y_bottom: float | None = 0.0,
     phi_td_families_compare_legend: bool = False,
+    axis_label_fontsize: float | None = None,
+    axis_label_fontweight: str | None = None,
+    tick_label_fontsize: float | None = None,
+    legend_fontsize: float | None = None,
+    show_legend: bool = True,
 ) -> None:
     """If ``autoscale_y``, y-limits use a small pad (``y_top_margin`` × span of the band)."""
     ymax_track = -np.inf
@@ -431,12 +440,22 @@ def _draw_algo_curves_on_ax(
         ax.plot(grid, mean, color=c, linewidth=2.0, label=label)
         ax.fill_between(grid, lower, upper, color=c, alpha=0.2)
 
-    ax.set_xlabel(_pretty_step_label(step_metric))
+    axis_label_kw: dict = {}
+    if axis_label_fontsize is not None:
+        axis_label_kw["fontsize"] = axis_label_fontsize
+    if axis_label_fontweight is not None:
+        axis_label_kw["fontweight"] = axis_label_fontweight
+    ax.set_xlabel(_pretty_step_label(step_metric), **axis_label_kw)
     if show_ylabel:
-        ax.set_ylabel(_pretty_metric_label(metric))
+        ax.set_ylabel(_pretty_metric_label(metric), **axis_label_kw)
+    if tick_label_fontsize is not None:
+        ax.tick_params(axis="both", labelsize=tick_label_fontsize)
     leg_fs = 6 if len(algo_tags) > 6 else 8
+    if legend_fontsize is not None:
+        leg_fs = legend_fontsize
     style_axes_wandb_curve(ax)
-    ax.legend(fontsize=leg_fs, loc="best")
+    if show_legend:
+        ax.legend(fontsize=leg_fs, loc="best")
 
     if autoscale_y and np.isfinite(ymax_track) and ymax_track > 0:
         span = max(float(ymax_track - ymin_track), 1e-6)
@@ -528,6 +547,18 @@ def plot_episodic_return(
     phi_td_families_compare_legend: bool = False,
     extra_curve_specs: list[tuple[list[str], str] | tuple[list[str], str, float | None]] | None = None,
     required_alternatives: list[list[str]] | None = None,
+    omit_minatar_in_env_title: bool = False,
+    multi_env_subplot_width: float = 3.2,
+    multi_env_subplot_height: float = 4.2,
+    multi_env_title_fontsize: float = 10,
+    multi_env_axis_label_fontsize: float | None = None,
+    multi_env_tick_label_fontsize: float | None = None,
+    multi_env_legend_fontsize: float | None = None,
+    multi_env_legend_first_panel_only: bool = False,
+    multi_env_fig_width_min: float = 14,
+    multi_env_wspace: float | None = None,
+    multi_env_title_bold: bool = False,
+    multi_env_axis_label_bold: bool = False,
 ) -> None:
     """Plot mean ± 95% CI episodic return from W&B.
 
@@ -626,13 +657,20 @@ def plot_episodic_return(
             )
 
         n = len(env_ids)
-        fig_w = max(14, 3.2 * n)
-        fig, axes = plt.subplots(1, n, figsize=(fig_w, 4.2), sharey=False, squeeze=False)
+        fig_w = max(multi_env_fig_width_min, multi_env_subplot_width * n)
+        fig, axes = plt.subplots(
+            1,
+            n,
+            figsize=(fig_w, multi_env_subplot_height),
+            sharey=False,
+            squeeze=False,
+        )
         ax_flat = axes[0]
 
         for j, eid in enumerate(env_ids):
             ax = ax_flat[j]
             by_algo = by_env_algo.get(eid, {})
+            legend_this_panel = (not multi_env_legend_first_panel_only) or (j == 0)
             if not any(len(by_algo.get(t, [])) > 0 for t in algo_tags):
                 ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
             else:
@@ -650,10 +688,21 @@ def plot_episodic_return(
                     y_top_margin=multi_env_y_top_margin,
                     y_bottom=0.0,
                     phi_td_families_compare_legend=phi_td_families_compare_legend,
+                    axis_label_fontsize=multi_env_axis_label_fontsize,
+                    axis_label_fontweight=("bold" if multi_env_axis_label_bold else None),
+                    tick_label_fontsize=multi_env_tick_label_fontsize,
+                    legend_fontsize=multi_env_legend_fontsize,
+                    show_legend=legend_this_panel,
                 )
-            ax.set_title(_pretty_env_title(eid), fontsize=10)
+            ax.set_title(
+                _pretty_env_title(eid, omit_minatar=omit_minatar_in_env_title),
+                fontsize=multi_env_title_fontsize,
+                fontweight="bold" if multi_env_title_bold else "normal",
+            )
 
         fig.tight_layout(rect=[0, 0, 1, 1])
+        if multi_env_wspace is not None:
+            fig.subplots_adjust(wspace=multi_env_wspace)
         png_path, pdf_path = save_figure_png_and_pdf(fig, out, dpi_png=150, dpi_pdf=300)
         plt.close(fig)
         print(f"Wrote {png_path}\n      {pdf_path}")
@@ -1811,6 +1860,17 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         multi_seed_tag=multi_seed_tag,
         extra_curve_specs=extra_curve_specs,
         required_alternatives=required_alternatives,
+        omit_minatar_in_env_title=True,
+        multi_env_legend_first_panel_only=True,
+        multi_env_fig_width_min=22,
+        multi_env_subplot_width=5.75,
+        multi_env_subplot_height=5.2,
+        multi_env_title_fontsize=14,
+        multi_env_axis_label_fontsize=12,
+        multi_env_tick_label_fontsize=11,
+        multi_env_legend_fontsize=10,
+        multi_env_title_bold=True,
+        multi_env_axis_label_bold=True,
     )
 
 
