@@ -28,11 +28,11 @@ V_MIN: 0.0
 V_MAX: 200.0
 
 # CF ω (same defaults as ``phi_td_minatar_categorical``; unweighted MSE).
-IS_DIVIDED_BY_OMEGA_SQUARED: False
+IS_DIVIDED_BY_OMEGA_SQUARED: True
 NUM_OMEGA_SAMPLES: 128
 OMEGA_MAX: 1.0
 OMEGA_MIN: 0.01
-OMEGA_SAMPLING_DISTRIBUTION: "pareto_1"
+OMEGA_SAMPLING_DISTRIBUTION: "half_laplace"
 
 LR: 0.0003
 MAX_GRAD_NORM: 0.5

@@ -22,6 +22,8 @@ c: 1.0 # singularclip singular value bound, clips into [1/c, c]
 LR_LINEAR_DECAY: True
 GAMMA: 0.99
 LAMBDA: 0.65
+IS_DIVIDED_BY_OMEGA_SQUARED: True
+OMEGA_SAMPLING_DISTRIBUTION: "half_laplace"
 
 SEQUENCE_LENGTH: 4
 

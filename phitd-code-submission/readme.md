@@ -79,3 +79,8 @@ uv run python -m purejaxql.phi_td_pqn_rnn_craftax +alg=phi_td_rnn_craftax_laplac
 uv run python -m purejaxql.phi_td_pqn_rnn_craftax +alg=phi_td_rnn_craftax_logistic
 ```
 
+## Naming note (Half-Laplace vs Exponential)
+
+In this project, a Half-Laplace distribution with parameters `(mu, b)` (with `mu = 0`) is equivalent to an Exponential distribution with rate `lambda = 1 / b`.
+Some code paths still use names like `Half-Laplacian` or `Half-Laplace` due to older experiments. We originally wanted a distribution spanning both `R+` and `R-`, then used conjugate symmetry of the characteristic function instead, so we no longer needed to sample from both sides. The naming stayed for backward compatibility.
+

@@ -26,11 +26,11 @@ LR_LINEAR_DECAY: True
 M_PARTICLES: 51
 
 # CF ω sampling (distinct from Gamma component shape α): truncated Pareto α=1; no 1/ω² loss weight.
-IS_DIVIDED_BY_OMEGA_SQUARED: False
+IS_DIVIDED_BY_OMEGA_SQUARED: True
 NUM_OMEGA_SAMPLES: 128
 OMEGA_MAX: 1.0
 OMEGA_MIN: 0.01
-OMEGA_SAMPLING_DISTRIBUTION: "pareto_1"
+OMEGA_SAMPLING_DISTRIBUTION: "half_laplace"
 
 REW_SCALE: 1.0
 GAMMA: 0.99
