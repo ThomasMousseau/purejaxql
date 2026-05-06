@@ -4,6 +4,19 @@
 uv sync
 ```
 
+## Weights & Biases (optional)
+
+To log curves to W&B, edit `purejaxql/config/config.yaml`:
+
+- Set your W&B workspace info:
+  - `ENTITY: "your-entity"`
+  - `PROJECT: "your-project"`
+- Enable logging:
+  - Set `WANDB_MODE: "online"` in `purejaxql/config/config.yaml`
+  - If an algorithm YAML also defines `WANDB_MODE`, set it to `online` there too
+
+By default, this submission is configured for offline-safe runs (`WANDB_MODE: disabled`).
+
 ## Distribution analysis
 
 Run from YAML config:
