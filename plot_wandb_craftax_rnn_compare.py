@@ -806,9 +806,9 @@ def main() -> None:
         out="figures/craftax_1b_rnn_phi_td_six_families_plus_pqn_hLap_wOmega2.png",
         figsize=(14, 8),
         show_title=False,
-        axis_label_fontsize=14,
+        axis_label_fontsize=20,
         axis_label_bold=True,
-        tick_label_fontsize=12,
+        tick_label_fontsize=16,
         legend_fontsize=14,
     )
     
