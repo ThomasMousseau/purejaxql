@@ -1330,6 +1330,9 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
 
+    panel_colors = dict(PLOT_COLORS)
+    panel_colors["dirac"] = "#00ffff"
+
     cf_series = (
         (("panel_phi_true",), "truth", "Truth"),
         (("panel_phi_qtd", "panel_phi_qr_dqn"), "qtd", "QTD"),
@@ -1362,7 +1365,7 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
         xmask = (xe >= dist.plot_x_min) & (xe <= dist.plot_x_max)
         if "panel_pdf_true" in mean_p:
             y_truth = np.asarray(mean_p["panel_pdf_true"][row], dtype=np.float64)
-            axd.plot(xe[xmask], y_truth[xmask], color=PLOT_COLORS["truth"], lw=PLOT_LW["truth"])
+            axd.plot(xe[xmask], y_truth[xmask], color=panel_colors["truth"], lw=PLOT_LW["truth"])
         _plot_minimal_style(axd)
         axd.set_xlim(dist.plot_x_min, dist.plot_x_max)
         if row == 0:
@@ -1375,8 +1378,8 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
                 continue
             y = np.real(mean_p[pkey][row])
             ys = np.real(ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row])
-            axcf.fill_between(te[tmask], (y - ys)[tmask], (y + ys)[tmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
-            axcf.plot(te[tmask], y[tmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+            axcf.fill_between(te[tmask], (y - ys)[tmask], (y + ys)[tmask], color=panel_colors[ckey], alpha=0.2, lw=0)
+            axcf.plot(te[tmask], y[tmask], color=panel_colors[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axcf)
         axcf.set_xlim(-cf_hw, cf_hw)
         if row == 0:
@@ -1405,19 +1408,19 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
                 keep = (atom_x >= dist.plot_x_min) & (atom_x <= dist.plot_x_max) & (jumps > 1e-6)
                 if np.any(keep):
                     segs = [((x, 0.0), (x, h)) for x, h in zip(atom_x[keep], jumps[keep])]
-                    axp.add_collection(LineCollection(segs, colors=PLOT_COLORS[ckey], linewidths=PLOT_LW[ckey], alpha=0.95))
+                    axp.add_collection(LineCollection(segs, colors=panel_colors[ckey], linewidths=PLOT_LW[ckey], alpha=0.95))
                     if np.any(jump_se[keep] > 0):
                         axp.errorbar(
                             atom_x[keep],
                             jumps[keep],
                             yerr=jump_se[keep],
                             fmt="none",
-                            ecolor=PLOT_COLORS[ckey],
+                            ecolor=panel_colors[ckey],
                             elinewidth=0.8,
                             alpha=0.35,
                             capsize=0,
                         )
-                    axp.plot([], [], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+                    axp.plot([], [], color=panel_colors[ckey], lw=PLOT_LW[ckey], label=label)
                 continue
             if ckey == "truth":
                 y = np.asarray(mean_p[pkey][row], dtype=np.float64)
@@ -1425,8 +1428,8 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
             else:
                 y = _plot_smooth_curve(mean_p[pkey][row])
                 ys = _plot_smooth_curve(ci_p.get(pkey, np.zeros_like(mean_p[pkey]))[row], passes=1)
-            axp.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=PLOT_COLORS[ckey], alpha=0.2, lw=0)
-            axp.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+            axp.fill_between(xe[xmask], (y - ys)[xmask], (y + ys)[xmask], color=panel_colors[ckey], alpha=0.2, lw=0)
+            axp.plot(xe[xmask], y[xmask], color=panel_colors[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axp)
         axp.set_xlim(dist.plot_x_min, dist.plot_x_max)
         if row == 0:
@@ -1442,15 +1445,15 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
                 xe[xmask],
                 (y - ys)[xmask],
                 (y + ys)[xmask],
-                color=PLOT_COLORS[ckey],
+                color=panel_colors[ckey],
                 alpha=0.2,
                 lw=0,
                 step="post" if ckey in ("ctd", "phi_cat") else None,
             )
             if ckey in ("ctd", "phi_cat"):
-                axc.step(xe[xmask], y[xmask], where="post", color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+                axc.step(xe[xmask], y[xmask], where="post", color=panel_colors[ckey], lw=PLOT_LW[ckey], label=label)
             else:
-                axc.plot(xe[xmask], y[xmask], color=PLOT_COLORS[ckey], lw=PLOT_LW[ckey], label=label)
+                axc.plot(xe[xmask], y[xmask], color=panel_colors[ckey], lw=PLOT_LW[ckey], label=label)
         _plot_minimal_style(axc)
         axc.set_xlim(dist.plot_x_min, dist.plot_x_max)
         if row == 0:
@@ -1461,8 +1464,21 @@ def _plot_panels(mean_p: dict[str, np.ndarray], ci_p: dict[str, np.ndarray], te:
             legend = axc.get_legend_handles_labels()
 
     if legend:
-        fig.legend(*legend, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=3, frameon=False, fontsize=7)
-    fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.09, wspace=0.3, hspace=0.42)
+        _, legend_labels = legend
+        fig.legend(
+            *legend,
+            loc="lower left",
+            bbox_to_anchor=(0.06, 0.015, 0.88, 0.035),
+            ncol=max(1, len(legend_labels)),
+            mode="expand",
+            frameon=False,
+            fontsize=12,
+            handlelength=1.4,
+            handletextpad=0.35,
+            columnspacing=0.55,
+            borderaxespad=0.0,
+        )
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.115, wspace=0.3, hspace=0.42)
     _plot_save_fig(fig, path)
     plt.close(fig)
 
@@ -2194,5 +2210,5 @@ def replot(figures_dir: Path | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
-    # replot()
+    # main(sys.argv[1:])
+    replot()
