@@ -1,28 +1,8 @@
-#!/usr/bin/env python3
-"""Offline bandit distribution benchmark: CTD, QTD, and φTD (Dirac / categorical / quantile).
+"""Offline distribution benchmark (CTD, QTD, φTD Dirac/Cat/Quant).
 
-CTD uses categorical cross-entropy (C51-style); QTD uses quantile Huber (QR-DQN-style).
-The three φTD heads use the same sampled Bellman target as CTD/QTD (sample-only supervision):
-``target = r + gamma * z_sample`` and ``phi_target(omega)=exp(i*omega*target)``. ω sampling and CF
-loss scaling are set by ``DAConfig.close_to_theory``: **False** → half-Laplacian ω and CF MSE divided
-by ``ω²``; **True** → truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and **unweighted**
-CF MSE (see ``purejaxql.utils.mog_cf.sample_frequencies``). Both φTD CF branches multiply by ``1/(2π)``
-to match eval ``cf_l2_w`` (same Parseval factor as ``cf_l2_sq_over_omega2``). Representation differs only
-in ``build_*_cf``.
-Optional ``aux_mean_loss_weight`` adds a Huber penalty on predicted vs sampled mean return for φTD only;
-default **0** keeps the comparison CE (CTD) / quantile Huber (QTD) vs **pure CF** (φTD).
-``phi_qt_same_arch_as_qtd`` (default **True**) builds QTD and φTD Quant from the same ``QTDNet`` constructor
-(two parameter sets), mirroring CTD vs φ Cat.
-``phi_qt_aux_qtd_huber_weight`` mixes in the same quantile-Huber loss as QTD so φ Quant tracks QTD training
-(0 = CF-only for φ Quant).
-
-Config: ``purejaxql/config/analysis/distribution.yaml`` (overridable via ``--config``).
-``num_seeds`` (default 1 in ``DAConfig``; YAML may override) runs independent RNG seeds **sequentially in one process** by default
-(one GPU context; avoids multi-process CUDA OOM). Use ``--parallel-seed-workers`` only if you can
-afford one JAX process per seed (e.g. multiple GPUs / tuned memory limits). Combined outputs use
-95% CIs for the mean across seeds (Student t). Metrics: ``w1``, ``cramer_l2``, ``cf_l2_w``.
-Each run writes under ``figures/distribution_analysis/<YYYY-mm-dd_HH:MM:SS>/`` (parseval
-plot/CSV, panel/metric figures, payload JSON, checkpoints, resolved experiment YAML).
+- Config comes from ``purejaxql/config/analysis/distribution.yaml``.
+- Train: ``python run_distribution_analysis.py``.
+- Replot latest run: ``python run_distribution_analysis.py --replot``.
 """
 
 from __future__ import annotations
@@ -31,13 +11,9 @@ import argparse
 import csv
 import datetime as dt
 import json
-import multiprocessing as mp
 import os
-import pickle
 import sys
-import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable
@@ -58,7 +34,7 @@ from paper_plots import (
     style_axes_wandb_curve,
 )
 
-from purejaxql.utils.mog_cf import (
+from purejaxql.utils.phi_td_cf import (
     build_categorical_cf,
     build_quantile_cf,
     sample_frequencies,
@@ -175,15 +151,6 @@ def empirical_cdf(sorted_samples: jax.Array, x_grid: jax.Array) -> jax.Array:
 
 def empirical_cf_from_samples(samples: jax.Array, t_grid: jax.Array) -> jax.Array:
     return jnp.mean(jnp.exp(1j * t_grid[:, None] * samples[None, :]), axis=1)
-
-
-def entropic_risk_mog(pi: jax.Array, mu: jax.Array, sigma: jax.Array, beta: float) -> jax.Array:
-    """Closed-form entropic risk for a Gaussian mixture (used for MoG ground-truth Bellman ER)."""
-    dt = jnp.result_type(pi, mu, sigma)
-    b = jnp.asarray(beta, dtype=dt)
-    mgf = jnp.exp(b * mu + 0.5 * (b**2) * jnp.square(sigma))
-    ee = jnp.maximum(jnp.sum(pi * mgf, axis=-1), jnp.finfo(dt).tiny)
-    return jnp.where(jnp.abs(b) < 1e-8, jnp.sum(pi * mu, axis=-1), jnp.log(ee) / b)
 
 
 def project_delta_onto_c51_atoms(y: jax.Array, support: jax.Array) -> jax.Array:
@@ -372,49 +339,6 @@ ACTION_DISTS = (
 )
 
 
-def analytic_bellman_moments(
-    k: int, x_state: jax.Array, g: jax.Array, sr: jax.Array, lam: jax.Array, beta: jax.Array
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Returns Mean, Variance, Mean-Variance, and Entropic Risk for the Bellman target."""
-    xs = x_state.astype(jnp.float64)
-    
-    if k == 0: # Gaussian Baseline
-        mn, vn = xs[0], jnp.float64(GAUSS_SIGMA**2)
-        mz, vz = g * mn, sr**2 + g**2 * vn
-        # Exact ER for Gaussian: mu + 0.5 * beta * sigma^2
-        er_z = mz + 0.5 * beta * vz
-        return mz, vz, mz - lam * vz, er_z
-        
-    elif k == 1: # Cauchy (All moments undefined)
-        n = jnp.float64(jnp.nan)
-        return n, n, n, n
-        
-    elif k == 2: # MoG (Bimodal)
-        sm = _mog_sigma(xs)
-        vn = sm**2 + jnp.float64(MOG_MU**2)
-        mz, vz = g * jnp.float64(0.0), sr**2 + g**2 * vn
-        
-        # Exact ER for the Bellman MoG target
-        pi_z = jnp.array([0.5, 0.5], dtype=jnp.float64)
-        mu_z = jnp.array([-g * MOG_MU, g * MOG_MU], dtype=jnp.float64)
-        sig_z = jnp.array([jnp.sqrt(sr**2 + g**2 * sm**2)] * 2, dtype=jnp.float64)
-        er_z = entropic_risk_mog(pi_z, mu_z, sig_z, beta)
-        return mz, vz, mz - lam * vz, er_z
-        
-    else:  # k == 3 (Gamma next-return)
-        th = _gamma_scale(xs)
-        a = jnp.float64(GAMMA_SHAPE)
-        mn, vn = a * th, a * th**2
-        mz, vz = g * mn, sr**2 + g**2 * vn
-        b = beta
-        bgth = b * g * th
-        mgf_ok = bgth < 1.0 - 1e-9
-        mgf = jnp.exp(0.5 * sr**2 * b**2) * jnp.power(jnp.maximum(1.0 - bgth, jnp.float64(1e-300)), -a)
-        er_z = jnp.where(jnp.abs(b) < 1e-10, mz, jnp.log(mgf) / b)
-        er_z = jnp.where(mgf_ok, er_z, jnp.float64(jnp.nan))
-        return mz, vz, mz - lam * vz, er_z
-
-
 DATASET_SEED_OFFSET = 1001
 _PANEL_ANCHOR_PRNG_SEED = 42_424_242
 
@@ -443,7 +367,7 @@ class DAConfig:
     dataset_seed_offset: int = DATASET_SEED_OFFSET
     total_steps: int = 20_000 
     log_every: int = 20_000
-    # Gradient steps per JIT chunk; parseval / anchor metrics are logged after each chunk (use < total_steps for curves).
+    # Gradient steps per JIT chunk.
     parseval_every: int = 1_000
     batch_size: int = 1024
     num_tau: int = 51
@@ -459,7 +383,7 @@ class DAConfig:
     omega_clip: float = 15.0
     omega_laplace_scale: float = 0.8
     cf_loss_omega_eps: float = 1e-3
-    # Optional φTD-only auxiliary Huber on mean return (0 ⇒ pure CF loss vs CE/Huber for CTD/QTD).
+    # φTD-only auxiliary Huber on mean return.
     aux_mean_loss_weight: float = 0.0
     c51_v_min: float = -25.0
     c51_v_max: float = 25.0
@@ -480,17 +404,14 @@ class DAConfig:
     cvar_alpha: float = 0.05
     er_beta: float = 0.1
     mv_lambda: float = 0.1
-    # φTD CF losses only (Dirac / cat / quant): ``False`` → half-Laplacian ω on ``[0, omega_clip]`` and CF MSE
-    # scaled by ``1/ω²`` (weighted). ``True`` → truncated Pareto (α=1) on ``[omega_min_pareto, omega_clip]`` and
-    # **unweighted** CF MSE (Cramér-type; matches ``phi_td_pqn_minatar`` with Pareto ω and no ``1/ω²``).
+    # φTD CF mode: False -> half-Laplacian + 1/ω² weighting; True -> Pareto + unweighted.
     close_to_theory: bool = False
     omega_min_pareto: float = 0.001
-    # ``True``: φTD Quant uses the same ``QTDNet(hidden_dim, trunk_layers, num_tau)`` factory as QTD (two separate
-    # instances / weights, same architecture as CTD vs φ Cat). ``False``: φ Quant uses ``phi_qt_num_quantiles``.
+    # True: φTD Quant uses QTDNet(num_tau). False: uses phi_qt_num_quantiles.
     phi_qt_same_arch_as_qtd: bool = True
-    # Used only when ``phi_qt_same_arch_as_qtd`` is ``False``; if ``None``, defaults to ``num_tau``.
+    # Used only when phi_qt_same_arch_as_qtd is False.
     phi_qt_num_quantiles: int | None = None
-    # φTD Quant only: add ``weight * quantile_huber_loss`` (same as QTD) to pull φ Quant metrics toward QTD; 0 = CF-only.
+    # φTD Quant: add weight * quantile_huber_loss (0 = CF-only).
     phi_qt_aux_qtd_huber_weight: float = 0.0
     # When set (e.g. figures/distribution_analysis/<timestamp>), checkpoints and local plots go here.
     artifacts_dir: Path | None = None
@@ -761,7 +682,7 @@ def make_train_chunk(
 
             def cf_phi_mean(residual: jnp.ndarray) -> jnp.ndarray:
                 e2 = jnp.real(residual) ** 2 + jnp.imag(residual) ** 2
-                # Match eval ``cf_l2_w`` (``cf_l2_sq_over_omega2``): include 1/(2π) Parseval scale.
+                # Match eval cf_l2_w (cf_l2_sq_over_omega2) to include 1/(2π) Parseval scale.
                 return 0.5 * jnp.mean(e2) * _INVERSE_2PI
 
         else:
@@ -1085,7 +1006,7 @@ def _save_parseval_training_plot(
 
     try:
         import matplotlib.pyplot as plt
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc: 
         print(f"warning: parseval plot skipped (matplotlib import failed: {exc})", flush=True)
         return None
 
@@ -1651,24 +1572,6 @@ def _plot_write_metrics_csv(path: str, metric_stats: dict[str, tuple[np.ndarray,
                 writer.writerow([algo, row_key, *[float(x) for x in mm[row_idx]], *[float(x) for x in sm[row_idx]]])
 
 
-def _plot_download_run_payload(run, root_dir: str) -> dict | None:
-    try:
-        remote_file = run.file("distribution_analysis_payload.json")
-        downloaded = remote_file.download(root=root_dir, replace=True)
-    except Exception:
-        return None
-
-    local_path = Path(getattr(downloaded, "name", Path(root_dir) / "distribution_analysis_payload.json"))
-    if not local_path.exists():
-        fallback = Path(root_dir) / "distribution_analysis_payload.json"
-        if fallback.exists():
-            local_path = fallback
-        else:
-            return None
-    with local_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> dict[str, str]:
     import matplotlib.pyplot as plt
 
@@ -1707,54 +1610,6 @@ def plot_distribution_analysis_local(payloads: list[dict], output_dir: Path) -> 
         "panels_density_cdf_4x2_pdf": str(pdf_path_for_png_stem(Path(panels_density_cdf_4x2_base).with_suffix(""))),
         "metrics_csv": metrics_csv,
     }
-
-
-def plot_distribution_analysis_from_wandb(
-    experiment_tag: str, *, project: str, entity: str | None, figures_dir: str
-) -> dict[str, str]:
-    """Aggregate finished W&B runs by tag and write figures under figures_dir/<timestamp>."""
-    import matplotlib.pyplot as plt
-    import wandb
-
-    configure_matplotlib()
-
-    api = wandb.Api()
-    final_entity = entity or os.environ.get("WANDB_ENTITY") or getattr(api, "default_entity", None)
-    if not final_entity:
-        raise ValueError("Missing W&B entity. Set --entity or WANDB_ENTITY.")
-
-    runs = api.runs(
-        f"{final_entity}/{project}",
-        filters={"tags": {"$in": [experiment_tag]}, "state": {"$in": ["finished", "crashed", "failed"]}},
-    )
-    payloads = []
-    with tempfile.TemporaryDirectory(prefix="dist_analysis_payloads_") as tmp_dir:
-        for run in runs:
-            payload = _plot_download_run_payload(run, tmp_dir)
-            if payload is not None and payload.get("experiment_tag") == experiment_tag:
-                payloads.append(payload)
-
-    if not payloads:
-        raise FileNotFoundError(
-            f"No runs found with payload file 'distribution_analysis_payload.json' for experiment tag '{experiment_tag}'."
-        )
-
-    now = dt.datetime.now()
-    timestamp_str = now.strftime("%Y-%m-%d_%H:%M:%S")
-    output_dir = Path(figures_dir) / timestamp_str
-    out_paths = plot_distribution_analysis_local(payloads, output_dir)
-    meta = {
-        "generated_at_local": now.isoformat(),
-        "experiment_tag": experiment_tag,
-        "project": project,
-        "entity": final_entity,
-        "num_runs": len(payloads),
-        "figures_root": figures_dir,
-        "output_dir": str(output_dir),
-        "files": out_paths,
-    }
-    _write_yaml(output_dir / "distribution_analysis_wandb_aggregate.yaml", meta)
-    return {"num_runs": str(len(payloads)), "output_dir": str(output_dir), **out_paths}
 
 
 def _merge_parseval_histories(histories: list[dict[str, list[float]]]) -> dict[str, list]:
@@ -1939,131 +1794,24 @@ def train_and_export(
                 wandb.finish()
 
 
-def _distribution_analysis_seed_worker(args: tuple[bytes, int, str, str, bool, bool]) -> tuple[dict, dict[str, list[float]], dict]:
-    """Picklable entry point for ProcessPoolExecutor (spawn)."""
-    cfg_blob, seed, run_dir_s, tag, wb, skip_plots = args
-    base: DAConfig = pickle.loads(cfg_blob)
-    cfg = replace(base, seed=int(seed), artifacts_dir=Path(run_dir_s))
-    payload, parseval_history, pm = train_and_export(
-        cfg,
-        tag,
-        wb,
-        figures_run_dir=Path(run_dir_s),
-        skip_plots=skip_plots,
-        skip_local_aggregate_plots=True,
-        wandb_managed_externally=False,
-    )
-    return payload, parseval_history, pm
-
-
 def parse_args(a=None):
     p = argparse.ArgumentParser(
-        description="Offline distribution analysis: CTD, QTD, φTD (Dirac/cat/quant), save artifacts, plot locally.",
+        description="Offline distribution analysis. Configuration is loaded from distribution.yaml; only --replot is supported.",
     )
     p.add_argument(
-        "--aggregate-from-wandb",
+        "--replot",
         action="store_true",
-        help="Skip training; download W&B runs by --experiment-tag and write aggregate figures.",
+        help="Re-generate plots from the most recent local run payload(s) and exit.",
     )
-    p.add_argument("--config", type=Path, default=None, help="YAML overriding defaults (default: package config/analysis/distribution_quick_5seeds.yaml).")
-    p.add_argument("--figures-dir", type=Path, default=None, help="Root for run output (default: <repo>/figures/distribution_analysis).")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument(
-        "--num-seeds",
-        type=int,
-        default=None,
-        dest="num_seeds",
-        help="Independent runs with seeds seed, seed+1, ...; combined plots/CSV use 95%% Student CIs for the mean (default: DAConfig / YAML).",
-    )
-    p.add_argument("--experiment-tag", default="DistAnalysis")
-    p.add_argument("--total-steps", type=int)
-    p.add_argument("--log-every", type=int)
-    p.add_argument(
-        "--parseval-every",
-        type=int,
-        default=None,
-        help="Gradient steps between parseval snapshots (must divide --total-steps); also JIT chunk size.",
-    )
-    p.add_argument("--dataset-size", type=int)
-    p.add_argument("--omega-laplace-scale", type=float)
-    p.add_argument("--num-qtd-quantiles", type=int)
-    p.add_argument(
-        "--phi-qt-same-arch-as-qtd",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        dest="phi_qt_same_arch_as_qtd",
-        help="When true (default from DAConfig), φTD Quant and QTD use the same QTDNet(width, layers, M) "
-        "spec (separate weights). When false, φ Quant head width is phi_qt_num_quantiles (or num_tau).",
-    )
-    p.add_argument(
-        "--phi-qt-num-quantiles",
-        type=int,
-        default=None,
-        dest="phi_qt_num_quantiles",
-        help="φTD Quant output size when --no-phi-qt-same-arch-as-qtd (default: num_tau).",
-    )
-    p.add_argument(
-        "--phi-qt-aux-qtd-huber-weight",
-        type=float,
-        default=None,
-        dest="phi_qt_aux_qtd_huber_weight",
-        help="Add weight×QTD quantile-Huber loss to φTD Quant (0=CF only). Aligns eval metrics with QTD.",
-    )
-    p.add_argument("--num-ctd-atoms", type=int)
-    p.add_argument(
-        "--num-dirac-components",
-        type=int,
-        dest="num_dirac_components",
-        help="Mixture size M for the φTD Dirac head (alias: --num-mog-components).",
-    )
-    p.add_argument(
-        "--num-mog-components",
-        type=int,
-        dest="num_dirac_components",
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument(
-        "--close-to-theory",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        dest="close_to_theory",
-        help="φTD only: Pareto(α=1) ω on [omega_min_pareto, omega_clip] + unweighted CF MSE. "
-        "Use --no-close-to-theory or omit for half-Laplacian ω + CF MSE/ω² (default from YAML).",
-    )
-    p.add_argument(
-        "--omega-min-pareto",
-        type=float,
-        default=None,
-        dest="omega_min_pareto",
-        help="Lower truncation for Pareto ω when --close-to-theory (default 0.001).",
-    )
-    p.add_argument("--no-wandb", action="store_true", help="Disable W&B logging.")
-    p.add_argument(
-        "--parallel-seed-workers",
-        action="store_true",
-        help="When num_seeds>1, run each seed in a separate process (can CUDA OOM on one GPU; default is sequential).",
-    )
-    p.add_argument("--no-plots", action="store_true", help="Skip matplotlib outputs (parseval + panel/metric figures).")
-    p.add_argument("--wandb-project", default=None, help="W&B project (for --aggregate-from-wandb; else env WANDB_PROJECT).")
-    p.add_argument("--wandb-entity", default=None, help="W&B entity (for --aggregate-from-wandb; else env WANDB_ENTITY).")
     return p.parse_args(a)
 
 
 def main(a=None):
     args = parse_args(a)
-    figures_root = args.figures_dir if args.figures_dir is not None else (_REPO_ROOT / "figures" / "distribution_analysis")
-
-    if args.aggregate_from_wandb:
-        tag = os.environ.get("WANDB_EXPERIMENT_TAG", args.experiment_tag)
-        project = args.wandb_project or os.environ.get("WANDB_PROJECT", "Deep-CVI-Experiments")
-        entity = args.wandb_entity or os.environ.get("WANDB_ENTITY")
-        out = plot_distribution_analysis_from_wandb(tag, project=project, entity=entity, figures_dir=str(figures_root))
-        print(f"Runs aggregated: {out['num_runs']}")
-        print(f"Output folder: {out['output_dir']}")
-        for k in ("metrics_png", "panels_png", "metrics_csv"):
-            if k in out:
-                print(f"  {k}: {out[k]}")
+    if args.replot:
+        replot()
         return
+    figures_root = _REPO_ROOT / "figures" / "distribution_analysis"
 
     now = dt.datetime.now()
     timestamp_str = now.strftime("%Y-%m-%d_%H:%M:%S")
@@ -2071,33 +1819,11 @@ def main(a=None):
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run artifacts and figures: {run_dir}", flush=True)
 
-    overrides = {
-        "seed": args.seed,
-        "num_seeds": args.num_seeds,
-        "total_steps": args.total_steps,
-        "log_every": args.log_every,
-        "parseval_every": args.parseval_every,
-        "dataset_size": args.dataset_size,
-        "omega_laplace_scale": args.omega_laplace_scale,
-        "num_tau": args.num_qtd_quantiles,
-        "num_atoms": args.num_ctd_atoms,
-        "num_dirac_components": args.num_dirac_components,
-    }
-    if getattr(args, "close_to_theory", None) is not None:
-        overrides["close_to_theory"] = args.close_to_theory
-    if getattr(args, "omega_min_pareto", None) is not None:
-        overrides["omega_min_pareto"] = args.omega_min_pareto
-    if getattr(args, "phi_qt_same_arch_as_qtd", None) is not None:
-        overrides["phi_qt_same_arch_as_qtd"] = args.phi_qt_same_arch_as_qtd
-    if getattr(args, "phi_qt_num_quantiles", None) is not None:
-        overrides["phi_qt_num_quantiles"] = args.phi_qt_num_quantiles
-    if getattr(args, "phi_qt_aux_qtd_huber_weight", None) is not None:
-        overrides["phi_qt_aux_qtd_huber_weight"] = args.phi_qt_aux_qtd_huber_weight
-    cfg = load_da_config_yaml(args.config, overrides)
+    cfg = load_da_config_yaml(None, {})
     cfg = replace(cfg, artifacts_dir=run_dir)
 
-    use_wandb = not args.no_wandb
-    tag = os.environ.get("WANDB_EXPERIMENT_TAG", args.experiment_tag)
+    use_wandb = True
+    tag = os.environ.get("WANDB_EXPERIMENT_TAG", "DistAnalysis")
     n_seeds = int(cfg.num_seeds)
 
     if n_seeds <= 1:
@@ -2118,7 +1844,7 @@ def main(a=None):
                 tag,
                 use_wandb,
                 figures_run_dir=run_dir,
-                skip_plots=args.no_plots,
+                skip_plots=False,
                 wandb_managed_externally=use_wandb,
             )
         finally:
@@ -2132,49 +1858,32 @@ def main(a=None):
         parseval_histories: list[dict[str, list[float]]] = []
         payloads: list[dict] = []
 
-        if args.parallel_seed_workers:
-            print(
-                f"Running {n_seeds} seeds in parallel (spawn); expect ~one JAX GPU context per worker — "
-                f"may OOM on a single GPU. base_seed={cfg.seed}",
-                flush=True,
+        print(
+            f"Running {n_seeds} seeds sequentially (one process / one GPU context); base_seed={cfg.seed}",
+            flush=True,
+        )
+        for s in seeds:
+            cfg_s = replace(cfg, seed=s)
+            payload, ph, _pm = train_and_export(
+                cfg_s,
+                tag,
+                use_wandb,
+                figures_run_dir=run_dir,
+                skip_plots=False,
+                skip_local_aggregate_plots=True,
+                wandb_managed_externally=False,
             )
-            cfg_blob = pickle.dumps(cfg)
-            worker_args = [(cfg_blob, s, str(run_dir), tag, use_wandb, args.no_plots) for s in seeds]
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=n_seeds, mp_context=ctx) as ex:
-                futures = [ex.submit(_distribution_analysis_seed_worker, a) for a in worker_args]
-                for fut in futures:
-                    payload, ph, _pm = fut.result()
-                    payloads.append(payload)
-                    parseval_histories.append(ph)
-        else:
-            print(
-                f"Running {n_seeds} seeds sequentially (one process / one GPU context); base_seed={cfg.seed}",
-                flush=True,
-            )
-            for s in seeds:
-                cfg_s = replace(cfg, seed=s)
-                payload, ph, _pm = train_and_export(
-                    cfg_s,
-                    tag,
-                    use_wandb,
-                    figures_run_dir=run_dir,
-                    skip_plots=args.no_plots,
-                    skip_local_aggregate_plots=True,
-                    wandb_managed_externally=False,
-                )
-                payloads.append(payload)
-                parseval_histories.append(ph)
+            payloads.append(payload)
+            parseval_histories.append(ph)
 
-        if not args.no_plots:
-            merged_ph = _merge_parseval_histories(parseval_histories)
-            plot_cfg = replace(cfg, seed=int(cfg.seed))
-            _save_parseval_training_plot(plot_cfg, tag, merged_ph, run_dir)
-            try:
-                agg_paths = plot_distribution_analysis_local(payloads, run_dir)
-                print(f"Saved aggregate figures: {agg_paths}", flush=True)
-            except Exception as exc:
-                print(f"warning: aggregate plotting failed: {exc}", flush=True)
+        merged_ph = _merge_parseval_histories(parseval_histories)
+        plot_cfg = replace(cfg, seed=int(cfg.seed))
+        _save_parseval_training_plot(plot_cfg, tag, merged_ph, run_dir)
+        try:
+            agg_paths = plot_distribution_analysis_local(payloads, run_dir)
+            print(f"Saved aggregate figures: {agg_paths}", flush=True)
+        except Exception as exc:
+            print(f"warning: aggregate plotting failed: {exc}", flush=True)
 
 
 def replot(figures_dir: Path | None = None) -> None:
@@ -2210,5 +1919,4 @@ def replot(figures_dir: Path | None = None) -> None:
 
 
 if __name__ == "__main__":
-    # main(sys.argv[1:])
-    replot()
+    main(sys.argv[1:])

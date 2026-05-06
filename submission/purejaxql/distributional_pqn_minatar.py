@@ -12,8 +12,8 @@ learning uses the same long-horizon scalar target as the PQN and MoG-PQN
 comparisons.
 
 For CTD only, ``DIST_LOSS`` is ``cross_entropy`` (default) or ``weighted_cf``
-(characteristic-function MSE vs the same projected Bellman target; optional 1/ω²
-weight). See ``purejaxql.utils.mog_cf``.
+(characteristic-function MSE vs the same projected Bellman target; configurable 1/ω²
+weight). See ``purejaxql.utils.phi_td_cf``.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from gymnax.wrappers.purerl import LogWrapper
 from omegaconf import OmegaConf
 
-from purejaxql.utils.mog_cf import (
+from purejaxql.utils.phi_td_cf import (
     categorical_cf_weighted_mse,
     normalize_dist_loss_name,
     sample_frequencies,
@@ -47,44 +47,62 @@ from purejaxql.utils.mog_cf import (
 
 
 def centered_cramer_categorical(
-    probs_old: jnp.ndarray,
+    probs_reference: jnp.ndarray,
     support: jnp.ndarray,
-    probs_new: jnp.ndarray,
+    probs_candidate: jnp.ndarray,
     *,
     grid_size: int = 1000,
 ) -> jnp.ndarray:
-    mean_old = jnp.sum(probs_old * support[None, :], axis=-1, keepdims=True)
-    mean_new = jnp.sum(probs_new * support[None, :], axis=-1, keepdims=True)
-    z_old = support[None, :] - mean_old
-    z_new = support[None, :] - mean_new
+    mean_reference = jnp.sum(probs_reference * support[None, :], axis=-1, keepdims=True)
+    mean_candidate = jnp.sum(probs_candidate * support[None, :], axis=-1, keepdims=True)
+    centered_support_reference = support[None, :] - mean_reference
+    centered_support_candidate = support[None, :] - mean_candidate
     radius = jnp.maximum(
         1.0,
-        jnp.maximum(jnp.max(jnp.abs(z_old), axis=-1), jnp.max(jnp.abs(z_new), axis=-1)),
+        jnp.maximum(
+            jnp.max(jnp.abs(centered_support_reference), axis=-1),
+            jnp.max(jnp.abs(centered_support_candidate), axis=-1),
+        ),
     )
-    x = radius[:, None] * jnp.linspace(-1.0, 1.0, grid_size, dtype=probs_old.dtype)[None, :]
+    x = radius[:, None] * jnp.linspace(-1.0, 1.0, grid_size, dtype=probs_reference.dtype)[None, :]
     dx = jnp.maximum(1e-6, (2.0 * radius) / jnp.maximum(grid_size - 1, 1))
-    cdf_old = jnp.sum(probs_old[:, None, :] * (x[:, :, None] >= z_old[:, None, :]), axis=-1)
-    cdf_new = jnp.sum(probs_new[:, None, :] * (x[:, :, None] >= z_new[:, None, :]), axis=-1)
-    return jnp.mean(jnp.sum(jnp.square(cdf_old - cdf_new), axis=-1) * dx)
+    cdf_reference = jnp.sum(
+        probs_reference[:, None, :] * (x[:, :, None] >= centered_support_reference[:, None, :]),
+        axis=-1,
+    )
+    cdf_candidate = jnp.sum(
+        probs_candidate[:, None, :] * (x[:, :, None] >= centered_support_candidate[:, None, :]),
+        axis=-1,
+    )
+    return jnp.mean(jnp.sum(jnp.square(cdf_reference - cdf_candidate), axis=-1) * dx)
 
 
 def centered_cramer_quantile(
-    quantiles_old: jnp.ndarray,
-    quantiles_new: jnp.ndarray,
+    quantiles_reference: jnp.ndarray,
+    quantiles_candidate: jnp.ndarray,
     *,
     grid_size: int = 500,
 ) -> jnp.ndarray:
-    q_old = quantiles_old - quantiles_old.mean(axis=-1, keepdims=True)
-    q_new = quantiles_new - quantiles_new.mean(axis=-1, keepdims=True)
+    centered_reference = quantiles_reference - quantiles_reference.mean(axis=-1, keepdims=True)
+    centered_candidate = quantiles_candidate - quantiles_candidate.mean(axis=-1, keepdims=True)
     radius = jnp.maximum(
         1.0,
-        jnp.maximum(jnp.max(jnp.abs(q_old), axis=-1), jnp.max(jnp.abs(q_new), axis=-1)),
+        jnp.maximum(
+            jnp.max(jnp.abs(centered_reference), axis=-1),
+            jnp.max(jnp.abs(centered_candidate), axis=-1),
+        ),
     )
-    x = radius[:, None] * jnp.linspace(-1.0, 1.0, grid_size, dtype=quantiles_old.dtype)[None, :]
+    x = radius[:, None] * jnp.linspace(-1.0, 1.0, grid_size, dtype=quantiles_reference.dtype)[None, :]
     dx = jnp.maximum(1e-6, (2.0 * radius) / jnp.maximum(grid_size - 1, 1))
-    cdf_old = jnp.mean((x[:, :, None] >= q_old[:, None, :]).astype(quantiles_old.dtype), axis=-1)
-    cdf_new = jnp.mean((x[:, :, None] >= q_new[:, None, :]).astype(quantiles_new.dtype), axis=-1)
-    return jnp.mean(jnp.sum(jnp.square(cdf_old - cdf_new), axis=-1) * dx)
+    cdf_reference = jnp.mean(
+        (x[:, :, None] >= centered_reference[:, None, :]).astype(quantiles_reference.dtype),
+        axis=-1,
+    )
+    cdf_candidate = jnp.mean(
+        (x[:, :, None] >= centered_candidate[:, None, :]).astype(quantiles_candidate.dtype),
+        axis=-1,
+    )
+    return jnp.mean(jnp.sum(jnp.square(cdf_reference - cdf_candidate), axis=-1) * dx)
 
 
 def apply_norm(x: jnp.ndarray, norm_type: str, train: bool):
@@ -831,36 +849,36 @@ def make_train(config: dict):
                         step_size = float(config.get("CENTERED_SHAPE_STEP_SIZE", config["LR"]))
                         new_params = jax.tree_util.tree_map(lambda p, g: p - step_size * g, params, aux_grads)
                         new_vars = {"params": new_params, "batch_stats": train_state.batch_stats}
-                        old_vars = variables
+                        reference_vars = variables
                         if variant == "ctd":
-                            old_probs = jax.nn.softmax(
+                            reference_probs = jax.nn.softmax(
                                 select_action_values(
-                                    network.apply(old_vars, minibatch.obs, train=False)["logits"], minibatch.action
+                                    network.apply(reference_vars, minibatch.obs, train=False)["logits"], minibatch.action
                                 ),
                                 axis=-1,
                             )
-                            new_probs = jax.nn.softmax(
+                            candidate_probs = jax.nn.softmax(
                                 select_action_values(
                                     network.apply(new_vars, minibatch.obs, train=False)["logits"], minibatch.action
                                 ),
                                 axis=-1,
                             )
                             volatility = centered_cramer_categorical(
-                                old_probs,
+                                reference_probs,
                                 support,
-                                new_probs,
+                                candidate_probs,
                                 grid_size=int(config.get("CENTERED_SHAPE_GRID_SIZE", 129)),
                             )
                         else:
-                            old_q = select_action_values(
-                                network.apply(old_vars, minibatch.obs, train=False)["quantiles"], minibatch.action
+                            reference_quantiles = select_action_values(
+                                network.apply(reference_vars, minibatch.obs, train=False)["quantiles"], minibatch.action
                             )
-                            new_q = select_action_values(
+                            candidate_quantiles = select_action_values(
                                 network.apply(new_vars, minibatch.obs, train=False)["quantiles"], minibatch.action
                             )
                             volatility = centered_cramer_quantile(
-                                old_q,
-                                new_q,
+                                reference_quantiles,
+                                candidate_quantiles,
                                 grid_size=int(config.get("CENTERED_SHAPE_GRID_SIZE", 129)),
                             )
                         return dist_only, td_only, td_rep_norm, dist_rep_norm, grad_cos, volatility

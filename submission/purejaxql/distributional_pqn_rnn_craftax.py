@@ -6,7 +6,7 @@ and IQN differ only in their distributional heads and Bellman losses.
 
 For CTD only, ``DIST_LOSS`` selects the distributional term: ``cross_entropy`` (C51 CE
 to the projected target) or ``weighted_cf`` (same target, MSE between characteristic
-functions with optional 1/ω² weighting; see ``purejaxql.utils.mog_cf``).
+functions with configurable 1/ω² weighting; see ``purejaxql.utils.phi_td_cf``).
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from omegaconf import OmegaConf
 
 from craftax.craftax_env import make_craftax_env_from_name
 from purejaxql.utils.batch_renorm import BatchRenorm
-from purejaxql.utils.mog_cf import (
+from purejaxql.utils.phi_td_cf import (
     categorical_cf_weighted_mse,
     normalize_dist_loss_name,
     sample_frequencies,

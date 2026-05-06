@@ -1,11 +1,8 @@
-#!/usr/bin/env python3
-"""Offline contextual bandit benchmark parallel to ``run_distribution_analysis.py``.
+"""Offline contextual bandit benchmark parallel to run_distribution_analysis.py.
 
-Same dataset and Bellman CF targets as distribution_analysis; **only** the three parametric mixture
-φTD heads from ``run_cauchy_mog_comparison.py`` (MoG / MoCauchy / MoGamma). CTD and QTD are **not**
-trained or evaluated here (use ``run_distribution_analysis.py`` for those baselines).
-
-Uses the same ``distribution.yaml`` defaults as distribution_analysis for comparable wall-clock.
+Same dataset and Bellman CF targets as distribution_analysis; only the three parametric mixture
+φTD heads from run_cauchy_mog_comparison.py (MoG / MoCauchy / MoGamma). CTD and QTD are not
+trained or evaluated here (use run_distribution_analysis.py for those baselines).
 """
 
 from __future__ import annotations
@@ -13,10 +10,11 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import os
 import sys
 import time
-from dataclasses import fields, replace
+from dataclasses import replace
 from pathlib import Path
 
 import flax.linen as nn
@@ -26,7 +24,6 @@ import numpy as np
 import optax
 from flax.training import train_state
 
-from plot_colors import algo_color
 from paper_plots import (
     configure_matplotlib,
     pdf_path_for_png_stem,
@@ -36,27 +33,22 @@ from paper_plots import (
 )
 
 from run_cauchy_mog_comparison import model_cdf, model_pdf, model_phi_return, _softplus
+from purejaxql.utils.mog_cf import sample_frequencies
 from run_distribution_analysis import (
     ACTION_DISTS,
     DAConfig,
     MK,
     NUM_ACTIONS,
-    PANEL_ANCHOR_PRNG_KEY,
     _INVERSE_2PI,
     _config_for_logging,
     _huber,
     _dense_ln_relu,
-    analytic_bellman_moments,
+    _panel_anchor_prng_key,
     build_dataset,
     cf_l2_sq_over_omega2,
-    cf_mse_vs_truth,
     cramer_l2_sq_cdf,
-    cvar_from_cdf,
-    entropic_risk_from_cdf,
     gil_pelaez_cdf,
-    ks_on_grid,
     load_da_config_yaml,
-    sample_frequencies,
     w1_cdf,
     _write_yaml,
 )
@@ -72,11 +64,6 @@ def _artifact_purejaxql_dir() -> Path:
 
 # --- Three φTD mixture families only (no CTD/QTD in this experiment). ---
 FP_ORDER = ("phi_mog", "phi_moc", "phi_mogamma")
-LEGACY_ALGO_ALIASES_FP = {
-    "phi_mog": "phitd_mog",
-    "phi_moc": "phitd_cauchy",
-    "phi_mogamma": "phitd_mogamma",
-}
 
 
 class PhiMoGNet(nn.Module):
@@ -304,7 +291,6 @@ def _make_eval_fp(
     wm = cfg.omega_max
     te = jnp.linspace(-wm, wm, cfg.eval_num_t, jnp.float64)
     xe = jnp.linspace(cfg.eval_x_min, cfg.eval_x_max, cfg.eval_num_x, jnp.float64)
-    xr = jnp.linspace(cfg.risk_x_min, cfg.risk_x_max, cfg.risk_num_x, jnp.float64)
     tp = jnp.linspace(cfg.gp_t_delta, wm, cfg.gp_num_t, jnp.float64)
     g64, rs64 = jnp.float64(cfg.gamma), jnp.float64(cfg.immediate_reward_std)
     phis = [d.phi for d in ACTION_DISTS]
@@ -318,21 +304,18 @@ def _make_eval_fp(
         pm_mog = _params_mog(lg1[0], mu1[0], ls1[0])
         phimog = model_phi_return("mog", pm_mog, te_c)
         Fmog = model_cdf("mog", pm_mog, xe)
-        Fmogr = model_cdf("mog", pm_mog, xr)
         pdfmog = model_pdf("mog", pm_mog, xe)
 
         lg2, loc2, lsc2 = phi_moc.apply({"params": pm2}, x1, a1)
         pm_moc = _params_moc(lg2[0], loc2[0], lsc2[0])
         phimoc = model_phi_return("moc", pm_moc, te_c)
         Fmoc = model_cdf("moc", pm_moc, xe)
-        Fmocr = model_cdf("moc", pm_moc, xr)
         pdfmoc = model_pdf("moc", pm_moc, xe)
 
         lg3, lsh3, lsc3 = phi_mogamma.apply({"params": pm3}, x1, a1)
         pm_mg = _params_mogamma(lg3[0], lsh3[0], lsc3[0])
         phimg = model_phi_return("mogamma", pm_mg, te_c)
         Fmg = model_cdf("mogamma", pm_mg, xe)
-        Fmgr = model_cdf("mogamma", pm_mg, xr)
         pdfmg = model_pdf("mogamma", pm_mg, xe)
 
         pr = jnp.exp(-0.5 * (rs64**2) * te**2)
@@ -343,49 +326,13 @@ def _make_eval_fp(
         pzp = jax.lax.switch(k, phis, g64 * tp, xs.astype(jnp.float64))
         ptp = prp * pzp
         Ft = gil_pelaez_cdf(ptp, tp, xe)
-        Ftr = gil_pelaez_cdf(ptp, tp, xr)
         pdf_t = jnp.clip(jnp.gradient(Ft, xe), 0, None)
-
-        mtn, vtn, mvtn, ertn = analytic_bellman_moments(
-            k, xs, g64, rs64, jnp.float64(cfg.mv_lambda), jnp.float64(cfg.er_beta)
-        )
-
-        cv_t = cvar_from_cdf(Ftr, xr, cfg.cvar_alpha)
-
-        er_err_mog = jnp.abs(entropic_risk_from_cdf(Fmogr, xr, cfg.er_beta) - ertn)
-        er_err_moc = jnp.abs(entropic_risk_from_cdf(Fmocr, xr, cfg.er_beta) - ertn)
-        er_err_mg = jnp.abs(entropic_risk_from_cdf(Fmgr, xr, cfg.er_beta) - ertn)
-
-        def mer(mp, vp, mf, vf):
-            return jnp.abs(mp - mf), jnp.abs(vp - vf), jnp.abs((mp - cfg.mv_lambda * vp) - mvtn)
-
-        wv = jax.nn.softmax(lg1[0], axis=-1)
-        sig = _softplus(ls1[0])
-        mmog = jnp.sum(wv * mu1[0])
-        vmog = jnp.sum(wv * (sig**2 + mu1[0] ** 2)) - mmog**2
-        memog = mer(mmog.astype(jnp.float64), vmog.astype(jnp.float64), mtn, vtn)
-
-        memoc = mer(_mixture_mean_moc(lg2[0], loc2[0], lsc2[0]), jnp.float64(jnp.nan), mtn, vtn)
-
-        w3 = jax.nn.softmax(lg3[0], axis=-1)
-        k3, th3 = _softplus(lsh3[0]), _softplus(lsc3[0])
-        m_comp = k3 * th3
-        v_comp = k3 * th3**2
-        mm_g = jnp.sum(w3 * m_comp)
-        vm_g = jnp.sum(w3 * (v_comp + m_comp**2)) - mm_g**2
-        memg = mer(mm_g.astype(jnp.float64), vm_g.astype(jnp.float64), mtn, vtn)
 
         cf_l2_mog = cf_l2_sq_over_omega2(phimog.astype(jnp.complex128), pt, te, cfg.gp_t_delta)
         cf_l2_moc = cf_l2_sq_over_omega2(phimoc.astype(jnp.complex128), pt, te, cfg.gp_t_delta)
         cf_l2_mg = cf_l2_sq_over_omega2(phimg.astype(jnp.complex128), pt, te, cfg.gp_t_delta)
 
         out = {
-            "phi_mse_phi_mog": cf_mse_vs_truth(phimog, pt),
-            "phi_mse_phi_moc": cf_mse_vs_truth(phimoc, pt),
-            "phi_mse_phi_mogamma": cf_mse_vs_truth(phimg, pt),
-            "ks_phi_mog": ks_on_grid(Fmog, Ft),
-            "ks_phi_moc": ks_on_grid(Fmoc, Ft),
-            "ks_phi_mogamma": ks_on_grid(Fmg, Ft),
             "w1_phi_mog": w1_cdf(Fmog, Ft, xe),
             "w1_phi_moc": w1_cdf(Fmoc, Ft, xe),
             "w1_phi_mogamma": w1_cdf(Fmg, Ft, xe),
@@ -395,12 +342,6 @@ def _make_eval_fp(
             "cf_l2_w_phi_mog": cf_l2_mog,
             "cf_l2_w_phi_moc": cf_l2_moc,
             "cf_l2_w_phi_mogamma": cf_l2_mg,
-            "cvar_err_phi_mog": jnp.abs(cvar_from_cdf(Fmogr, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_phi_moc": jnp.abs(cvar_from_cdf(Fmocr, xr, cfg.cvar_alpha) - cv_t),
-            "cvar_err_phi_mogamma": jnp.abs(cvar_from_cdf(Fmgr, xr, cfg.cvar_alpha) - cv_t),
-            "er_err_phi_mog": er_err_mog,
-            "er_err_phi_moc": er_err_moc,
-            "er_err_phi_mogamma": er_err_mg,
             "phi_phi_mog": phimog,
             "phi_phi_moc": phimoc,
             "phi_phi_mogamma": phimg,
@@ -413,21 +354,7 @@ def _make_eval_fp(
             "pdf_phi_mog": pdfmog,
             "pdf_phi_moc": pdfmoc,
             "pdf_phi_mogamma": pdfmg,
-            "mean_err_phi_mog": memog[0],
-            "mean_err_phi_moc": memoc[0],
-            "mean_err_phi_mogamma": memg[0],
-            "var_err_phi_mog": memog[1],
-            "var_err_phi_moc": memoc[1],
-            "var_err_phi_mogamma": memg[1],
-            "mv_err_phi_mog": memog[2],
-            "mv_err_phi_moc": memoc[2],
-            "mv_err_phi_mogamma": memg[2],
         }
-
-        for m in MK:
-            out[f"{m}_phitd_mog"] = out[f"{m}_phi_mog"]
-            out[f"{m}_phitd_cauchy"] = out[f"{m}_phi_moc"]
-            out[f"{m}_phitd_mogamma"] = out[f"{m}_phi_mogamma"]
 
         return out
 
@@ -483,9 +410,6 @@ def _collect_eval_payload_fp(cfg: DAConfig, tag: str, er: dict, te: np.ndarray, 
     ok = [a for a in FP_ORDER if all(f"{m}_{a}" in pm for m in MK)]
     for a in ok:
         metric_means[a] = _means_local(pm, a).tolist()
-    for new_name, old_name in LEGACY_ALGO_ALIASES_FP.items():
-        if new_name in metric_means:
-            metric_means[old_name] = metric_means[new_name]
 
     payload = {
         "seed": int(cfg.seed),
@@ -589,9 +513,9 @@ FP_PLOT_TITLES = {
 FP_PLOT_VISIBLE_ALGOS = ("phi_mog", "phi_moc", "phi_mogamma")
 FP_PLOT_COLORS = {
     "truth": "#0A0A0A",
-    "phi_mog": algo_color("phitd_mog"),
-    "phi_moc": algo_color("phitd_cauchy"),
-    "phi_mogamma": algo_color("phitd_mogamma"),
+    "phi_mog": "#2C7BB6",
+    "phi_moc": "#D7191C",
+    "phi_mogamma": "#1A9641",
 }
 FP_PLOT_LW = {
     "truth": 2.15,
@@ -625,9 +549,6 @@ def _fp_plot_resolve_row_keys(payloads: list[dict]) -> tuple[str, ...]:
 def _fp_plot_resolve_algo_key(metric_means: dict, algo: str) -> str | None:
     if algo in metric_means:
         return algo
-    legacy = LEGACY_ALGO_ALIASES_FP.get(algo)
-    if legacy and legacy in metric_means:
-        return legacy
     return None
 
 
@@ -1053,7 +974,7 @@ def train_and_export_fp(
     jax.tree.map(lambda x: x.block_until_ready(), ds)
     smog, smoc, smoga, *nets = create_train_states_fp(ri, cfg)
     parseval_eval, _, _ = _make_eval_fp(cfg, *nets)
-    anchor_x = jax.random.normal(PANEL_ANCHOR_PRNG_KEY, (cfg.state_dim,), jnp.float32)
+    anchor_x = jax.random.normal(_panel_anchor_prng_key(), (cfg.state_dim,), jnp.float32)
     parseval_history: dict[str, list[float]] = {
         "step": [],
         "cramer_l2_phi_mog": [],
@@ -1085,9 +1006,6 @@ def train_and_export_fp(
             "train/loss_phi_moc_final": float(ls[1][-1]),
             "train/loss_phi_mogamma_final": float(ls[2][-1]),
         }
-        last_losses["train/loss_phitd_mog_final"] = last_losses["train/loss_phi_mog_final"]
-        last_losses["train/loss_phitd_cauchy_final"] = last_losses["train/loss_phi_moc_final"]
-        last_losses["train/loss_phitd_mogamma_final"] = last_losses["train/loss_phi_mogamma_final"]
         if st % int(cfg.log_every) == 0 or st == int(cfg.total_steps) or c == 0:
             print(
                 f"  {st:>7}  phi_mog={last_losses['train/loss_phi_mog_final']:.4f} "
@@ -1116,7 +1034,7 @@ def train_and_export_fp(
         parseval_plot_paths = _save_parseval_training_plot_fp(cfg, tag, parseval_history, figures_run_dir)
     xt = jax.random.fold_in(rt, cfg.test_seed_offset)
     xv = jax.random.normal(xt, (cfg.n_test, cfg.state_dim), jnp.float32).at[0].set(
-        jax.random.normal(PANEL_ANCHOR_PRNG_KEY, (cfg.state_dim,), jnp.float32)
+        jax.random.normal(_panel_anchor_prng_key(), (cfg.state_dim,), jnp.float32)
     )
     er, te, xe = evaluate_test_set_fp(
         cfg,
@@ -1129,6 +1047,8 @@ def train_and_export_fp(
     payload, pm = _collect_eval_payload_fp(cfg, tag, er, te, xe, panel_index=0)
     payload["gamma"] = float(cfg.gamma)
     payload["immediate_reward_std"] = float(cfg.immediate_reward_std)
+    payload_path = figures_run_dir / "flexibility_parametric_family_payload.json"
+    payload_path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
 
     if not skip_plots:
         try:
@@ -1152,57 +1072,27 @@ def train_and_export_fp(
 
 
 def _default_config_yaml_path() -> Path:
-    return _artifact_purejaxql_dir() / "config" / "analysis" / "distribution.yaml"
+    return _artifact_purejaxql_dir() / "config" / "analysis" / "flexibility_parametric_family.yaml"
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Offline bandit + parametric φTD families (MoG/MoC/MoGamma): same protocol as distribution_analysis.",
+        description="Offline flexibility benchmark. Configuration is loaded from flexibility_parametric_family.yaml; only --replot is supported.",
     )
     p.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="YAML for DAConfig (default: purejaxql/config/analysis/distribution.yaml).",
+        "--replot",
+        action="store_true",
+        help="Re-generate plots from the most recent local run payload(s) and exit.",
     )
-    p.add_argument("--figures-dir", type=Path, default=None, help="Root for run output (default: figures/flexibility_parametric_family).")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--experiment-tag", default="FlexParamFamily")
-    p.add_argument("--total-steps", type=int)
-    p.add_argument("--log-every", type=int)
-    p.add_argument("--parseval-every", type=int, default=None)
-    p.add_argument("--dataset-size", type=int)
-    p.add_argument("--omega-laplace-scale", type=float)
-    p.add_argument("--num-qtd-quantiles", type=int)
-    p.add_argument("--num-ctd-atoms", type=int)
-    p.add_argument(
-        "--num-mixture-components",
-        type=int,
-        dest="num_dirac_components",
-        help="Components K for each φTD mixture head (same field as num_dirac_components in YAML).",
-    )
-    p.add_argument(
-        "--num-dirac-components",
-        type=int,
-        dest="num_dirac_components",
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument(
-        "--close-to-theory",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        dest="close_to_theory",
-        help="φTD: Pareto ω + unweighted CF MSE vs half-Laplacian ω + CF MSE/ω².",
-    )
-    p.add_argument("--omega-min-pareto", type=float, default=None, dest="omega_min_pareto")
-    p.add_argument("--no-wandb", action="store_true")
-    p.add_argument("--no-plots", action="store_true")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    figures_root = args.figures_dir if args.figures_dir is not None else (_REPO_ROOT / "figures" / "flexibility_parametric_family")
+    if args.replot:
+        replot()
+        return
+    figures_root = _REPO_ROOT / "figures" / "flexibility_parametric_family"
 
     now = dt.datetime.now()
     timestamp_str = now.strftime("%Y-%m-%d_%H:%M:%S")
@@ -1210,27 +1100,11 @@ def main(argv=None):
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run artifacts and figures: {run_dir}", flush=True)
 
-    overrides = {
-        "seed": args.seed,
-        "total_steps": args.total_steps,
-        "log_every": args.log_every,
-        "parseval_every": args.parseval_every,
-        "dataset_size": args.dataset_size,
-        "omega_laplace_scale": args.omega_laplace_scale,
-        "num_tau": args.num_qtd_quantiles,
-        "num_atoms": args.num_ctd_atoms,
-        "num_dirac_components": args.num_dirac_components,
-    }
-    if getattr(args, "close_to_theory", None) is not None:
-        overrides["close_to_theory"] = args.close_to_theory
-    if getattr(args, "omega_min_pareto", None) is not None:
-        overrides["omega_min_pareto"] = args.omega_min_pareto
-    base_cfg = load_da_config_yaml(args.config or _default_config_yaml_path(), overrides)
-    cfg = DAConfig(**{f.name: getattr(base_cfg, f.name) for f in fields(DAConfig)})
+    cfg = load_da_config_yaml(_default_config_yaml_path(), {})
     cfg = replace(cfg, artifacts_dir=run_dir)
 
-    use_wandb = not args.no_wandb
-    tag = os.environ.get("WANDB_EXPERIMENT_TAG", args.experiment_tag)
+    use_wandb = True
+    tag = os.environ.get("WANDB_EXPERIMENT_TAG", "FlexParamFamily")
     if use_wandb:
         import wandb
 
@@ -1243,13 +1117,39 @@ def main(argv=None):
             config=_config_for_logging(cfg),
         )
     try:
-        train_and_export_fp(cfg, tag, use_wandb, figures_run_dir=run_dir, skip_plots=args.no_plots)
+        train_and_export_fp(cfg, tag, use_wandb, figures_run_dir=run_dir, skip_plots=False)
     finally:
         if use_wandb:
             import wandb
 
             if wandb.run:
                 wandb.finish()
+
+
+def replot(figures_dir: Path | None = None) -> None:
+    """Re-generate plots from the most recent local payload without retraining."""
+    figures_root = figures_dir if figures_dir is not None else (_REPO_ROOT / "figures" / "flexibility_parametric_family")
+    run_dirs = sorted([p for p in figures_root.iterdir() if p.is_dir()], key=lambda p: p.name)
+    if not run_dirs:
+        raise FileNotFoundError(f"No run directories found under: {figures_root}")
+
+    latest: Path | None = None
+    for run_dir in reversed(run_dirs):
+        payload_path = run_dir / "flexibility_parametric_family_payload.json"
+        if payload_path.exists():
+            latest = payload_path
+            break
+    if latest is None:
+        raise FileNotFoundError(f"No flexibility_parametric_family_payload.json under: {figures_root}")
+
+    payload = json.loads(latest.read_text(encoding="utf-8"))
+    run_dir = latest.parent
+    out = plot_flexibility_parametric_family_local([payload], run_dir)
+    print(f"Replotted from: {latest}")
+    print(f"Output folder: {run_dir}")
+    for k in ("metrics_png", "panels_png", "metrics_csv"):
+        if k in out:
+            print(f"  {k}: {out[k]}")
 
 
 if __name__ == "__main__":

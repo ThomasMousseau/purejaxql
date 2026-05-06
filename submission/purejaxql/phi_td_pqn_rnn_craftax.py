@@ -1,7 +1,7 @@
 """Phi-TD on Craftax with the same LSTM rollout/trunk as ``distributional_pqn_rnn_craftax``.
 
 Uses **only** the characteristic-function TD(0) Bellman loss (no TD(λ) / PQN mean auxiliary),
-matching ``phi_td_pqn_minatar.py``. For apples-to-apples benchmarks vs CTD/QTD:
+matching ``phi_td_pqn_minatar.py``. Relative to CTD/QTD:
 
   - ``FAMILY_DISTRIBUTION: categorical`` ↔ C51-style head + categorical CF (same support / projection
     algebra as ``ALG_VARIANT: ctd``).
@@ -46,7 +46,7 @@ from purejaxql.utils.craftax_wrappers import (
     LogWrapper,
     OptimisticResetVecEnvWrapper,
 )
-from purejaxql.utils.mog_cf import (
+from purejaxql.utils.phi_td_cf import (
     build_categorical_cf,
     build_cauchy_mixture_cf,
     build_dirac_mixture_cf,

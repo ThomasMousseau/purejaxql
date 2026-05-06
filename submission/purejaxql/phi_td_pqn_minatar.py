@@ -9,13 +9,13 @@ Families (shared particle count ``M_PARTICLES`` = m):
   - **dirac** (``F_m``): mixture of Diracs, φ(ω) = Σ_k π_k exp(i ω μ_k).
   - **categorical** (``F_{C,m}``): C51-style fixed support + softmax probs.
   - **quantile** (``F_{Q,m}``): fixed τ fractions + learned locations; φ is the empirical CF.
-  - **mog**: mixture of Gaussians (same heads as ``mog_pqn_minatar``); φ via ``build_mog_cf`` (CF-only loss).
-  - **cauchy**: mixture of Cauchy laws (MoC); optional / legacy.
-  - **gamma**: mixture of Gammas (MoΓ); φ(ω) = Σ_k π_k (1 − i θ_k ω)^(−α_k). Q = Σ_k π_k α_k θ_k.
-  - **laplace**: mixture of Laplaces; Q = Σ_k π_k μ_k (finite mean).
-  - **logistic**: mixture of logistics; Q = Σ_k π_k μ_k.
+  - **mog**: mixture of Gaussians (same heads as mog_pqn_minatar); φ via build_mog_cf (CF-only loss).
+  - **cauchy**: mixture of Cauchy laws (MoC);
+  - **gamma**: mixture of Gammas (MoΓ); 
+  - **laplace**: mixture of Laplaces; 
+  - **logistic**: mixture of logistics; 
 
-See ``purejaxql.utils.mog_cf`` for CF primitives.
+See purejaxql.utils.phi_td_cf for CF primitives.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from omegaconf import OmegaConf
 import gymnax
 
 from purejaxql.distributional_pqn_minatar import project_categorical, select_action_values
-from purejaxql.utils.mog_cf import (
+from purejaxql.utils.phi_td_cf import (
     build_categorical_cf,
     build_cauchy_mixture_cf,
     build_dirac_mixture_cf,
@@ -89,7 +89,7 @@ class CNN(nn.Module):
 
 
 class PhiTDMinAtarQNetwork(nn.Module):
-    """CNN trunk + head chosen by ``family_distribution`` (incl. mog / gamma / laplace / logistic)."""
+    """CNN trunk + head chosen by family_distribution (incl. mog / gamma / laplace / logistic)."""
 
     family_distribution: str
     action_dim: int
