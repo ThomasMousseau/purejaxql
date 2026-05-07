@@ -4,18 +4,17 @@
 uv sync
 ```
 
-## Weights & Biases (optional)
+## Weights & Biases
 
-To log curves to W&B, edit `purejaxql/config/config.yaml`:
+Training entry points call `wandb.init` with `ENTITY`, `PROJECT`, and `WANDB_MODE` from config.
 
-- Set your W&B workspace info:
-  - `ENTITY: "your-entity"`
-  - `PROJECT: "your-project"`
-- Enable logging:
-  - Set `WANDB_MODE: "online"` in `purejaxql/config/config.yaml`
-  - If an algorithm YAML also defines `WANDB_MODE`, set it to `online` there too
+**You must edit `purejaxql/config/config.yaml`** before running with the default `WANDB_MODE: "online"`:
 
-By default, this submission is configured for offline-safe runs (`WANDB_MODE: disabled`).
+- Set `ENTITY` to your W&B username or team (not the placeholder `your-entity`).
+- Set `PROJECT` to an existing or new project name (not `your-project`).
+- Run `wandb login` on the machine if you have not already.
+
+Leaving the placeholders while `WANDB_MODE` is `online` will fail at startup (typically HTTP 404 from W&B). Algorithm YAMLs under `config/alg/` set `WANDB_MODE: online` so logging stays on; override with `WANDB_MODE=disabled` (Hydra) or change the base config if you want fully local runs without W&B.
 
 ## Distribution analysis
 

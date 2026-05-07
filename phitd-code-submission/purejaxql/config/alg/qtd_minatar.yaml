@@ -1,6 +1,7 @@
 # QTD/QR-DQN with the same CNN/PQN backbone and rollout shell as pqn_minatar.
 ALG_NAME: "qtd"
 ALG_VARIANT: "qtd"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000
 NUM_ENVS: 128

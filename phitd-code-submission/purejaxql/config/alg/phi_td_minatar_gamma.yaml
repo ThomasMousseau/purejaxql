@@ -1,6 +1,7 @@
 # Phi-TD MinAtar — mixture of Gammas (MoΓ): π, shape α, scale θ; CF Bellman only.
 ALG_NAME: "phi_td_gamma"
 FAMILY_DISTRIBUTION: "gamma"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000
 

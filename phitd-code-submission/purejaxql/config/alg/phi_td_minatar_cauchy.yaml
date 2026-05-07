@@ -1,6 +1,7 @@
 # Phi-TD MinAtar — mixture of Cauchy (MoC): π, location, scale heads; CF Bellman only.
 ALG_NAME: "phi_td_cauchy"
 FAMILY_DISTRIBUTION: "cauchy"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000
 

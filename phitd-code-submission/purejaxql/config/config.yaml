@@ -5,8 +5,12 @@ SEED: 0
 # if  hyperparameters tuning
 HYP_TUNE: False
 
-# wandb params
-WANDB_MODE: "disabled"  # set to online to activate wandb
+# Weights & Biases — required when WANDB_MODE is "online"
+# Replace ENTITY and PROJECT with your W&B username or team and project name.
+# Placeholder values (e.g. your-entity / your-project) cause wandb.init to fail (404) at run start.
+# Use WANDB_MODE: "disabled" for fully local runs without logging.
+# Run `wandb login` once per machine when using online mode.
+WANDB_MODE: "online"
 
 ENTITY: "your-entity"
 PROJECT: "your-project"

@@ -1,6 +1,7 @@
 # Phi-TD MinAtar — mixture of logistics; φ uses (π s ω)/sinh(π s ω); Q = Σ π_k μ_k.
 ALG_NAME: "phi_td_logistic"
 FAMILY_DISTRIBUTION: "logistic"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000
 

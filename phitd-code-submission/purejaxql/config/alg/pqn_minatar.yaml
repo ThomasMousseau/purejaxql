@@ -1,5 +1,6 @@
 # this is adapted from Atari configuration (with a slightly higher exploration eps), may get better results with some tuning
 ALG_NAME: "pqn-resid"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000 # will be used for decay functions, in case you want to test for less timesteps and keep decays same
 NUM_ENVS: 128 # parallel environments

@@ -1,6 +1,7 @@
 # Phi-TD MinAtar — quantile histogram / empirical CF (F_{Q,m}), CF Bellman only (no TD(λ) mean).
 ALG_NAME: "phi_td_quantile"
 FAMILY_DISTRIBUTION: "quantile"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 30000000
 TOTAL_TIMESTEPS_DECAY: 30000000
 

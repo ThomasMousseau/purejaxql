@@ -1,6 +1,7 @@
 # Phi-TD MinAtar — categorical on fixed support (F_{C,m}), CF Bellman only (no TD(λ) mean).
 ALG_NAME: "phi_td_categorical"
 FAMILY_DISTRIBUTION: "categorical"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 10_000_000
 TOTAL_TIMESTEPS_DECAY: 10_000_000
 

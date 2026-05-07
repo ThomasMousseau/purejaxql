@@ -1,6 +1,7 @@
 # CTD/C51 with the same CNN/PQN backbone and rollout shell as pqn_minatar.
 ALG_NAME: "ctd"
 ALG_VARIANT: "ctd"
+WANDB_MODE: online
 TOTAL_TIMESTEPS: 10_000_000
 TOTAL_TIMESTEPS_DECAY: 10_000_000
 NUM_ENVS: 128
