@@ -66,8 +66,30 @@ _WANDB_TAG_HEX: dict[str, str] = {
     "MoG-PQN-stab": COLOR_GREEN_MOG,
     # Sampling ablations (unique hues tied to family intent)
     "HALF_LAPLACIAN": COLOR_PHITD_LAPLACE,
+    "EXPONENTIAL": COLOR_PHITD_LAPLACE,  # alias: truncated exponential ≡ half_laplacian
     "UNIFORM": COLOR_DARK_BLUE_PQN,
     "HALF_GAUSSIAN": COLOR_PURPLE_QTD,
+    "PARETO_1": COLOR_PHITD_MOG,
+    # φTD Phase-1 ablations: sequential hues within each one-factor sweep
+    "N_OMEGA-32": "#94a3b8",
+    "N_OMEGA-64": COLOR_MED_BLUE,
+    "N_OMEGA-128": COLOR_PHITD_MOG,
+    "N_OMEGA-256": "#7f1d1d",
+    "M-10": "#94a3b8",
+    "M-20": COLOR_MED_BLUE,
+    "M-51": COLOR_PHITD_MOG,
+    "M-100": "#7f1d1d",
+    # Phase-2 combo tags — three family hues (red / purple / green), dark enough on white.
+    # Within family: Pareto / Exponential / Uniform (paired with solid/dashed/dotted in plots).
+    "ABL2-PhiTD-MoG-PARETO_1": "#b91c1c",
+    "ABL2-PhiTD-MoG-EXPONENTIAL": "#ef4444",
+    "ABL2-PhiTD-MoG-UNIFORM": "#7f1d1d",
+    "ABL2-PhiTD-FCm-PARETO_1": "#7e22ce",
+    "ABL2-PhiTD-FCm-EXPONENTIAL": "#a855f7",
+    "ABL2-PhiTD-FCm-UNIFORM": "#581c87",
+    "ABL2-PhiTD-FQm-PARETO_1": "#15803d",
+    "ABL2-PhiTD-FQm-EXPONENTIAL": "#22c55e",
+    "ABL2-PhiTD-FQm-UNIFORM": "#14532d",
 }
 
 # Lowercase lookup for robustness
@@ -122,6 +144,21 @@ LEGEND_WANDB_TAG: dict[str, str] = {
     "PHI_TD_LAPLACE_RNN": r"$\varphi\text{TD-Laplace}$",
     "PHI_TD_LOGISTIC_RNN": r"$\varphi\text{TD-Logistic}$",
     "PHI_TD_CAUCHY_RNN": r"$\varphi\text{TD-Cauchy}$",
+    # Sampling scheme labels
+    "PARETO_1": r"Pareto ($\alpha{=}1$)",
+    "EXPONENTIAL": "Exponential",
+    "HALF_LAPLACIAN": "Exponential",
+    "UNIFORM": "Uniform",
+    "HALF_GAUSSIAN": "Half-Gaussian",
+    # Phase-1 one-factor sweeps
+    "N_OMEGA-32": r"$N_\omega{=}32$",
+    "N_OMEGA-64": r"$N_\omega{=}64$",
+    "N_OMEGA-128": r"$N_\omega{=}128$",
+    "N_OMEGA-256": r"$N_\omega{=}256$",
+    "M-10": r"$m{=}10$",
+    "M-20": r"$m{=}20$",
+    "M-51": r"$m{=}51$",
+    "M-100": r"$m{=}100$",
 }
 
 # ``plot_minatar_10m_phi_td_families`` only: same names plus $(F_{\cdot})$ class in parentheses.
@@ -147,14 +184,23 @@ def legend_label_for_wandb_algo_tag(tag: str, *, phi_families_compare: bool = Fa
     for k, v in LEGEND_WANDB_TAG.items():
         if k.lower() == tl:
             return v
+    # Phase-2 combo tags: ABL2-{family}-{sampling}
+    if tag.startswith("ABL2-"):
+        body = tag[len("ABL2-") :]
+        for dist in (
+            "PARETO_1",
+            "EXPONENTIAL",
+            "UNIFORM",
+            "HALF_LAPLACIAN",
+            "HALF_GAUSSIAN",
+        ):
+            suffix = f"-{dist}"
+            if body.endswith(suffix):
+                fam = body[: -len(suffix)]
+                fam_lab = legend_label_for_wandb_algo_tag(fam)
+                dist_lab = LEGEND_WANDB_TAG.get(dist, dist)
+                return f"{fam_lab} / {dist_lab}"
     return tag
-
-
-# Back-compat names (e.g. ``plot_sampling_distributions.py``)
-COLOR_GREEN = COLOR_GREEN_MOG
-COLOR_PURPLE = COLOR_PURPLE_QTD
-COLOR_PINK = COLOR_PINK_CTD
-COLOR_DARK_BLUE = COLOR_DARK_BLUE_PQN
 
 
 def algo_color(algo_key: str, default: str = "#444444") -> str:
@@ -165,4 +211,25 @@ def algo_color(algo_key: str, default: str = "#444444") -> str:
     sl = s.lower()
     if sl in _WANDB_TAG_HEX_LOWER:
         return _WANDB_TAG_HEX_LOWER[sl]
+    # Phase-2 combo: color by family (sampling distinguished in legend text).
+    if s.startswith("ABL2-"):
+        body = s[len("ABL2-") :]
+        for dist in (
+            "PARETO_1",
+            "EXPONENTIAL",
+            "UNIFORM",
+            "HALF_LAPLACIAN",
+            "HALF_GAUSSIAN",
+        ):
+            suffix = f"-{dist}"
+            if body.endswith(suffix):
+                fam = body[: -len(suffix)]
+                return algo_color(fam, default=default)
     return _ALGO_KEY_TO_COLOR.get(sl, default)
+
+
+# Back-compat names (e.g. ``plot_sampling_distributions.py``)
+COLOR_GREEN = COLOR_GREEN_MOG
+COLOR_PURPLE = COLOR_PURPLE_QTD
+COLOR_PINK = COLOR_PINK_CTD
+COLOR_DARK_BLUE = COLOR_DARK_BLUE_PQN

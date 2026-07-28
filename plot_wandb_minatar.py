@@ -34,6 +34,11 @@ with the experiment tags and algo tags emitted by those scripts (plus ``phi_fami
 **φTD-MoG vs MoG-PQN weighted CF (Exp 1):** train with
 ``slurm/slurm_minatar_phi_td_mog_mimic_weighted_cf_exp1.sh`` and compare to historical
 ``MinAtar_20M_Td_Lambda_WeightedCF_MoG`` using :func:`plot_minatar_20m_exp1_mog_weighted_cf_vs_phi_td_mimic`.
+
+**φTD ablation (Breakout + SpaceInvaders):** ``slurm/slurm_minatar_phi_td_ablation_phase1.sh`` /
+``phase2.sh`` → :func:`plot_minatar_phi_td_ablation_phase1` and
+:func:`plot_minatar_phi_td_ablation_phase2` (same final-report multi-env styling as the φTD
+family figures).
 """
 from __future__ import annotations
 
@@ -42,6 +47,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 from pathlib import Path
+import csv
 
 import numpy as np
 from plot_colors import algo_color, legend_label_for_wandb_algo_tag
@@ -86,11 +92,21 @@ _LEGACY_ALGO_LEGEND: dict[str, str] = {
     "PQN": "PQN",
     "PQN_RNN": "PQN-RNN",
     "MOG_PQN_RNN": "MoG-PQN-RNN",
-    "HALF_LAPLACIAN": "Half-Laplacian",
+    "HALF_LAPLACIAN": "Exponential",
+    "EXPONENTIAL": "Exponential",
+    "PARETO_1": r"Pareto ($\alpha{=}1$)",
     "UNIFORM": "Uniform",
     "HALF_GAUSSIAN": "Half-Gaussian",
     "CTD": "CTD",
     "QTD": "QTD",
+    "N_OMEGA-32": r"$N_\omega{=}32$",
+    "N_OMEGA-64": r"$N_\omega{=}64$",
+    "N_OMEGA-128": r"$N_\omega{=}128$",
+    "N_OMEGA-256": r"$N_\omega{=}256$",
+    "M-10": r"$m{=}10$",
+    "M-20": r"$m{=}20$",
+    "M-51": r"$m{=}51$",
+    "M-100": r"$m{=}100$",
 }
 
 
@@ -151,29 +167,76 @@ def _algo_group(run, algo_tags: list[str]) -> str | None:
     raise ValueError(f"Run {run.id} has multiple algo tags {found}; use unique algo tags per run.")
 
 
-def _load_series(run, metric: str, step_key: str) -> tuple[np.ndarray, np.ndarray] | None:
-    """Returns (steps, values) sorted by step; drops NaNs."""
-    df = None
+def _history_as_rows(
+    run,
+    *,
+    keys: list[str] | None = None,
+    samples: int = 1200,
+) -> list[dict]:
+    """Fetch W&B history as a list of dicts (no pandas required)."""
     try:
-        # Downsample on the server side to keep WANDB reads bounded.
-        df = run.history(keys=[metric, step_key], pandas=True, samples=1200)
+        if keys is None:
+            rows = run.history(pandas=False, samples=samples)
+        else:
+            rows = run.history(keys=keys, pandas=False, samples=samples)
     except Exception:
-        df = None
-    if df is None or getattr(df, "empty", True):
+        return []
+    if rows is None:
+        return []
+    # ``pandas=False`` → list[dict]; be defensive if an older client returns something else.
+    if isinstance(rows, dict):
+        return [rows]
+    try:
+        return list(rows)
+    except TypeError:
+        return []
+
+
+def _series_from_history_rows(
+    rows: list[dict],
+    step_key: str,
+    metric: str,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build sorted (steps, values) from history rows; drops missing/NaN."""
+    steps_list: list[float] = []
+    vals_list: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if step_key not in row or metric not in row:
+            continue
+        s = row.get(step_key)
+        v = row.get(metric)
+        if s is None or v is None:
+            continue
         try:
-            # Fallback still sampled to avoid expensive full-history pulls.
-            df = run.history(pandas=True, samples=1200)
-        except Exception:
-            return None
-    if df is None or df.empty or step_key not in df.columns or metric not in df.columns:
+            sf = float(s)
+            vf = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(sf) and np.isfinite(vf)):
+            continue
+        steps_list.append(sf)
+        vals_list.append(vf)
+    if not steps_list:
         return None
-    work = df[[step_key, metric]].dropna()
-    if work.empty:
-        return None
-    steps = work[step_key].to_numpy(dtype=np.float64)
-    vals = work[metric].to_numpy(dtype=np.float64)
+    steps = np.asarray(steps_list, dtype=np.float64)
+    vals = np.asarray(vals_list, dtype=np.float64)
     order = np.argsort(steps)
     return steps[order], vals[order]
+
+
+def _load_series(run, metric: str, step_key: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Returns (steps, values) sorted by step; drops NaNs."""
+    # Downsample on the server side to keep W&B reads bounded. Use pandas=False so
+    # plotting works in envs without pandas (wandb warns and returns unusable data otherwise).
+    rows = _history_as_rows(run, keys=[metric, step_key], samples=1200)
+    series = _series_from_history_rows(rows, step_key, metric)
+    if series is not None:
+        return series
+    # Fallback still sampled to avoid expensive full-history pulls.
+    rows = _history_as_rows(run, keys=None, samples=1200)
+    return _series_from_history_rows(rows, step_key, metric)
 
 
 def _unique_ordered(xs: list[str]) -> list[str]:
@@ -228,36 +291,18 @@ def _load_series_any(
     uniq_steps = _unique_ordered(step_candidates)
     all_cols = _unique_ordered([*uniq_metrics, *uniq_steps])
 
-    df = None
-    try:
-        # Single targeted request per run/seed, sampled for responsiveness.
-        df = run.history(keys=all_cols, pandas=True, samples=1200)
-    except Exception:
-        df = None
-    if df is None or getattr(df, "empty", True):
-        try:
-            # Keep compatibility with runs where keys(...) misses sparse columns.
-            df = run.history(pandas=True, samples=1200)
-        except Exception:
-            df = None
-    if df is None or getattr(df, "empty", True):
+    rows = _history_as_rows(run, keys=all_cols, samples=1200)
+    if not rows:
+        # Keep compatibility with runs where keys(...) misses sparse columns.
+        rows = _history_as_rows(run, keys=None, samples=1200)
+    if not rows:
         return None
 
-    cols = set(df.columns)
     for m in metric_candidates:
-        if m not in cols:
-            continue
         for s in step_candidates:
-            if s not in cols:
-                continue
-            work = df[[s, m]].dropna()
-            if work.empty:
-                continue
-            steps = work[s].to_numpy(dtype=np.float64)
-            vals = work[m].to_numpy(dtype=np.float64)
-            order = np.argsort(steps)
-            return steps[order], vals[order]
-
+            series = _series_from_history_rows(rows, s, m)
+            if series is not None:
+                return series
     return None
 
 
@@ -402,6 +447,9 @@ def _draw_algo_curves_on_ax(
     tick_label_fontsize: float | None = None,
     legend_fontsize: float | None = None,
     show_legend: bool = True,
+    linestyles: list[str] | None = None,
+    linewidth: float = 2.0,
+    fill_alpha: float = 0.2,
 ) -> None:
     """If ``autoscale_y``, y-limits use a small pad (``y_top_margin`` × span of the band)."""
     ymax_track = -np.inf
@@ -437,8 +485,9 @@ def _draw_algo_curves_on_ax(
 
         label = _legend_for_algo_tag(algo_tag, phi_families_compare=phi_td_families_compare_legend)
         c = colors[idx % len(colors)]
-        ax.plot(grid, mean, color=c, linewidth=2.0, label=label)
-        ax.fill_between(grid, lower, upper, color=c, alpha=0.2)
+        ls = "-" if not linestyles else linestyles[idx % len(linestyles)]
+        ax.plot(grid, mean, color=c, linewidth=linewidth, linestyle=ls, label=label)
+        ax.fill_between(grid, lower, upper, color=c, alpha=fill_alpha)
 
     axis_label_kw: dict = {}
     if axis_label_fontsize is not None:
@@ -555,6 +604,11 @@ def plot_episodic_return(
     multi_env_tick_label_fontsize: float | None = None,
     multi_env_legend_fontsize: float | None = None,
     multi_env_legend_first_panel_only: bool = False,
+    multi_env_legend_below: bool = False,
+    multi_env_legend_ncol: int | None = None,
+    multi_env_linestyles: list[str] | None = None,
+    multi_env_linewidth: float = 2.0,
+    multi_env_fill_alpha: float = 0.2,
     multi_env_fig_width_min: float = 14,
     multi_env_wspace: float | None = None,
     multi_env_title_bold: bool = False,
@@ -670,7 +724,10 @@ def plot_episodic_return(
         for j, eid in enumerate(env_ids):
             ax = ax_flat[j]
             by_algo = by_env_algo.get(eid, {})
-            legend_this_panel = (not multi_env_legend_first_panel_only) or (j == 0)
+            if multi_env_legend_below:
+                legend_this_panel = False
+            else:
+                legend_this_panel = (not multi_env_legend_first_panel_only) or (j == 0)
             if not any(len(by_algo.get(t, [])) > 0 for t in algo_tags):
                 ax.text(0.5, 0.5, "No runs", ha="center", va="center", transform=ax.transAxes)
             else:
@@ -693,6 +750,9 @@ def plot_episodic_return(
                     tick_label_fontsize=multi_env_tick_label_fontsize,
                     legend_fontsize=multi_env_legend_fontsize,
                     show_legend=legend_this_panel,
+                    linestyles=multi_env_linestyles,
+                    linewidth=multi_env_linewidth,
+                    fill_alpha=multi_env_fill_alpha,
                 )
             ax.set_title(
                 _pretty_env_title(eid, omit_minatar=omit_minatar_in_env_title),
@@ -700,9 +760,33 @@ def plot_episodic_return(
                 fontweight="bold" if multi_env_title_bold else "normal",
             )
 
-        fig.tight_layout(rect=[0, 0, 1, 1])
-        if multi_env_wspace is not None:
-            fig.subplots_adjust(wspace=multi_env_wspace)
+        if multi_env_legend_below:
+            handles, labels = [], []
+            for ax in ax_flat:
+                h, lab = ax.get_legend_handles_labels()
+                if h:
+                    handles, labels = h, lab
+                    break
+            leg_fs = multi_env_legend_fontsize if multi_env_legend_fontsize is not None else 10
+            ncol = multi_env_legend_ncol if multi_env_legend_ncol is not None else min(3, max(1, len(handles)))
+            # Leave room under the panels for a shared legend.
+            fig.tight_layout(rect=[0, 0.16, 1, 1])
+            if multi_env_wspace is not None:
+                fig.subplots_adjust(wspace=multi_env_wspace)
+            if handles:
+                fig.legend(
+                    handles,
+                    labels,
+                    loc="lower center",
+                    bbox_to_anchor=(0.5, 0.0),
+                    ncol=ncol,
+                    fontsize=leg_fs,
+                    frameon=True,
+                )
+        else:
+            fig.tight_layout(rect=[0, 0, 1, 1])
+            if multi_env_wspace is not None:
+                fig.subplots_adjust(wspace=multi_env_wspace)
         png_path, pdf_path = save_figure_png_and_pdf(fig, out, dpi_png=150, dpi_pdf=300)
         plt.close(fig)
         print(f"Wrote {png_path}\n      {pdf_path}")
@@ -1704,6 +1788,481 @@ def plot_minatar_sampling_distribution_ablation(
     )
 
 
+_ABLATION_ENVS_DEFAULT = (
+    "Breakout-MinAtar",
+    "SpaceInvaders-MinAtar",
+)
+
+# Match ``plot_minatar_10m_phi_td_mog_gamma_laplace_logistic`` final-report styling.
+# ``fig_width_min`` scaled for 2 panels (4-env report uses 22 ≈ 4×5.75).
+_ABLATION_PAPER_STYLE: dict = {
+    "omit_minatar_in_env_title": True,
+    "multi_env_legend_first_panel_only": True,
+    "multi_env_fig_width_min": 11.5,
+    "multi_env_subplot_width": 5.75,
+    "multi_env_subplot_height": 5.2,
+    "multi_env_title_fontsize": 20,
+    "multi_env_axis_label_fontsize": 20,
+    "multi_env_tick_label_fontsize": 16,
+    "multi_env_legend_fontsize": 14,
+    "multi_env_title_bold": False,
+    "multi_env_axis_label_bold": False,
+}
+
+
+def _round_one_decimal(x: float) -> str:
+    """Format ``x`` with **one digit after the decimal** (e.g. ``98.7``)."""
+    if x is None or not np.isfinite(float(x)):
+        return ""
+    return f"{float(x):.1f}"
+
+
+def _round_sigfigs(x: float, n: int = 2) -> str:
+    """Format ``x`` with ``n`` significant figures (e.g. ``1.2``, ``2.0``, ``0.85``)."""
+    if x is None or not np.isfinite(float(x)):
+        return ""
+    val = float(x)
+    if val == 0.0:
+        return "0"
+    order = int(np.floor(np.log10(abs(val))))
+    decimals = n - 1 - order
+    rounded = round(val, decimals) if decimals >= 0 else round(val, decimals)
+    if decimals <= 0:
+        return f"{rounded:.0f}"
+    return f"{rounded:.{decimals}f}"
+
+
+def _mean_ci_return_at_steps(
+    curves: list[tuple[np.ndarray, np.ndarray]],
+    steps: list[float],
+    *,
+    end_tol_frac: float = 0.02,
+) -> list[tuple[float, float]]:
+    """Mean and 95% CI half-width across seed curves at each step.
+
+    Values are linearly interpolated on each seed curve. If a requested step is
+    slightly past a curve's last logged step (common near the 10M budget with
+    sparse W&B history), clamp to the final point when within ``end_tol_frac`` of
+    that curve's span.
+
+    CI half-width uses the same normal approximation as the plots:
+    ``1.96 * std / sqrt(n)`` (requires ``n >= 2``; otherwise CI is NaN).
+    """
+    out: list[tuple[float, float]] = []
+    for t in steps:
+        vals: list[float] = []
+        for s, v in curves:
+            if len(s) < 2:
+                continue
+            s_min, s_max = float(np.nanmin(s)), float(np.nanmax(s))
+            if not (np.isfinite(s_min) and np.isfinite(s_max)) or s_max <= s_min:
+                continue
+            if t < s_min:
+                continue
+            if t > s_max:
+                # Near end of training: use last logged return if close enough.
+                if (t - s_max) <= end_tol_frac * max(s_max, 1.0):
+                    vals.append(float(v[int(np.nanargmax(s))]))
+                continue
+            vals.append(float(np.interp(t, s, v)))
+        if not vals:
+            out.append((float("nan"), float("nan")))
+            continue
+        arr = np.asarray(vals, dtype=np.float64)
+        mu = float(np.mean(arr))
+        n = int(arr.size)
+        if n < 2:
+            out.append((mu, float("nan")))
+            continue
+        sem = float(np.std(arr, ddof=0) / np.sqrt(n))
+        out.append((mu, 1.96 * sem))
+    return out
+
+
+def _mean_return_at_steps(
+    curves: list[tuple[np.ndarray, np.ndarray]],
+    steps: list[float],
+    *,
+    end_tol_frac: float = 0.02,
+) -> list[float]:
+    """Mean episodic return across seed curves, linearly interpolated at each step."""
+    return [mu for mu, _ in _mean_ci_return_at_steps(curves, steps, end_tol_frac=end_tol_frac)]
+
+
+def _collect_env_algo_curves(
+    *,
+    project: str,
+    entity: str | None,
+    required_tag: list[str],
+    experiment_tag: str | None,
+    algo_tags: list[str],
+    env_ids: list[str],
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    max_runs: int = 3000,
+    multi_seed_tag: str = "multi_seed",
+    use_run_name_for_env: bool = True,
+) -> dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]]:
+    """Fetch matching W&B runs → ``{env_id: {algo_tag: [(steps, values), ...]}}``."""
+    required_effective = list(required_tag)
+    if experiment_tag:
+        required_effective.append(experiment_tag)
+
+    api = wandb.Api()
+    path = _wandb_path(entity, project)
+    runs = list(islice(api.runs(path, order="-created_at"), max_runs))
+
+    by_env_algo: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for run in runs:
+        if not _run_matches_required(run, required_effective):
+            continue
+        eid = _get_run_env_id(run, use_run_name=use_run_name_for_env)
+        if eid is None or eid not in env_ids:
+            continue
+        g = _algo_group(run, algo_tags)
+        if g is None:
+            continue
+        for series in curves_from_wandb_run(
+            run,
+            metric=metric,
+            step_metric=step_metric,
+            multi_seed_tag=multi_seed_tag,
+        ):
+            by_env_algo[eid][g].append(series)
+    return {e: dict(by_algo) for e, by_algo in by_env_algo.items()}
+
+
+def export_ablation_checkpoint_csv(
+    *,
+    project: str,
+    entity: str | None,
+    required_tag: list[str],
+    experiment_tag: str | None,
+    algo_tags: list[str],
+    env_ids: list[str],
+    out_csv: str,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    max_runs: int = 3000,
+    multi_seed_tag: str = "multi_seed",
+    use_run_name_for_env: bool = True,
+    step_stride: int = 2_000_000,
+    max_step: int = 10_000_000,
+) -> str:
+    """Sparse checkpoint CSV for rebuttal markdown tables.
+
+    Rows: ``env,variant,step,return,ci`` at every ``step_stride`` up to ``max_step``
+    (default every **2M** steps on 10M runs → 2M, 4M, 6M, 8M, 10M).
+    ``return`` is the seed-mean episodic return rounded to **one decimal place**;
+    ``ci`` is the 95% CI half-width (``1.96 * SEM``) with **two significant figures**.
+    """
+    by_env_algo = _collect_env_algo_curves(
+        project=project,
+        entity=entity,
+        required_tag=required_tag,
+        experiment_tag=experiment_tag,
+        algo_tags=algo_tags,
+        env_ids=env_ids,
+        metric=metric,
+        step_metric=step_metric,
+        max_runs=max_runs,
+        multi_seed_tag=multi_seed_tag,
+        use_run_name_for_env=use_run_name_for_env,
+    )
+    if not by_env_algo:
+        raise RuntimeError(
+            f"No runs matched for CSV export ({out_csv}). "
+            "Check experiment_tag / required_tag / algo_tags."
+        )
+
+    checkpoints = list(range(step_stride, max_step + 1, step_stride))
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["env", "variant", "step", "return", "ci"])
+        writer.writeheader()
+        for eid in env_ids:
+            by_algo = by_env_algo.get(eid, {})
+            for tag in algo_tags:
+                curves = by_algo.get(tag, [])
+                if not curves:
+                    continue
+                stats = _mean_ci_return_at_steps(curves, [float(t) for t in checkpoints])
+                for t, (mu, ci) in zip(checkpoints, stats):
+                    if not np.isfinite(mu):
+                        continue
+                    writer.writerow(
+                        {
+                            "env": eid,
+                            "variant": tag,
+                            "step": t,
+                            "return": _round_one_decimal(mu),
+                            "ci": _round_sigfigs(ci, 2) if np.isfinite(ci) else "",
+                        }
+                    )
+
+    print(
+        f"Wrote {out_path}  "
+        f"({len(checkpoints)} checkpoints × variants, return 1 decimal, ci 2 sig figs)"
+    )
+    return str(out_path)
+
+
+def plot_minatar_phi_td_ablation_phase1_omega_count(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_PhiTD_Ablation_Phase1",
+    out: str = "figures/minatar_phi_td_ablation_phase1_omega_count.png",
+    csv_out: str | None = "figures/minatar_phi_td_ablation_phase1_omega_count.csv",
+    env_ids: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 3000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Phase 1 — ``NUM_OMEGA_SAMPLES`` sweep (Gaussian / Pareto held).
+
+    From ``slurm/slurm_minatar_phi_td_ablation_phase1.sh`` axis A. Runs must carry
+    ``experiment_tag``, ``ablation_phase1``, ``omega_count``, ``PhiTD-MoG``, ``multi_seed``,
+    and exactly one of ``N_OMEGA-{32,64,128,256}``.
+
+    Styling matches the MinAtar final-report φTD family figures (short env titles,
+    legend on first panel only, large axis fonts).
+
+    When ``csv_out`` is set, also writes a sparse checkpoint CSV (every 2M steps,
+    seed-mean return to **one decimal place** and 95% CI half-width with **two
+    significant figures**) for rebuttal markdown tables.
+    """
+    if env_ids is None:
+        env_ids = list(_ABLATION_ENVS_DEFAULT)
+    if algo_tags is None:
+        algo_tags = ["N_OMEGA-32", "N_OMEGA-64", "N_OMEGA-128", "N_OMEGA-256"]
+
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        required_tag=["ablation_phase1", "omega_count", "PhiTD-MoG"],
+        algo_tags=algo_tags,
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+        **_ABLATION_PAPER_STYLE,
+    )
+    if csv_out:
+        export_ablation_checkpoint_csv(
+            project=project,
+            entity=entity,
+            required_tag=["ablation_phase1", "omega_count", "PhiTD-MoG"],
+            experiment_tag=experiment_tag,
+            algo_tags=algo_tags,
+            env_ids=env_ids,
+            out_csv=csv_out,
+            metric=metric,
+            step_metric=step_metric,
+            max_runs=max_runs,
+            multi_seed_tag=multi_seed_tag,
+            use_run_name_for_env=use_run_name_for_env,
+        )
+
+
+def plot_minatar_phi_td_ablation_phase1_components(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_PhiTD_Ablation_Phase1",
+    out: str = "figures/minatar_phi_td_ablation_phase1_components.png",
+    csv_out: str | None = "figures/minatar_phi_td_ablation_phase1_components.csv",
+    env_ids: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 3000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Phase 1 — ``M_PARTICLES`` sweep (Gaussian / Pareto held).
+
+    From ``slurm/slurm_minatar_phi_td_ablation_phase1.sh`` axis B. Runs must carry
+    ``experiment_tag``, ``ablation_phase1``, ``components``, ``PhiTD-MoG``, ``multi_seed``,
+    and exactly one of ``M-{10,20,51,100}``.
+
+    Styling matches the MinAtar final-report φTD family figures.
+
+    When ``csv_out`` is set, also writes a sparse checkpoint CSV (every 2M steps,
+    seed-mean return to **one decimal place** and 95% CI half-width with **two
+    significant figures**) for rebuttal markdown tables.
+    """
+    if env_ids is None:
+        env_ids = list(_ABLATION_ENVS_DEFAULT)
+    if algo_tags is None:
+        algo_tags = ["M-10", "M-20", "M-51", "M-100"]
+
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        required_tag=["ablation_phase1", "components", "PhiTD-MoG"],
+        algo_tags=algo_tags,
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+        **_ABLATION_PAPER_STYLE,
+    )
+    if csv_out:
+        export_ablation_checkpoint_csv(
+            project=project,
+            entity=entity,
+            required_tag=["ablation_phase1", "components", "PhiTD-MoG"],
+            experiment_tag=experiment_tag,
+            algo_tags=algo_tags,
+            env_ids=env_ids,
+            out_csv=csv_out,
+            metric=metric,
+            step_metric=step_metric,
+            max_runs=max_runs,
+            multi_seed_tag=multi_seed_tag,
+            use_run_name_for_env=use_run_name_for_env,
+        )
+
+
+def plot_minatar_phi_td_ablation_phase1(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_PhiTD_Ablation_Phase1",
+    out_omega: str = "figures/minatar_phi_td_ablation_phase1_omega_count.png",
+    out_components: str = "figures/minatar_phi_td_ablation_phase1_components.png",
+    csv_omega: str | None = "figures/minatar_phi_td_ablation_phase1_omega_count.csv",
+    csv_components: str | None = "figures/minatar_phi_td_ablation_phase1_components.csv",
+    **kwargs,
+) -> None:
+    """Write both Phase-1 ablation figures (+ sparse checkpoint CSVs by default)."""
+    plot_minatar_phi_td_ablation_phase1_omega_count(
+        project=project,
+        entity=entity,
+        experiment_tag=experiment_tag,
+        out=out_omega,
+        csv_out=csv_omega,
+        **kwargs,
+    )
+    plot_minatar_phi_td_ablation_phase1_components(
+        project=project,
+        entity=entity,
+        experiment_tag=experiment_tag,
+        out=out_components,
+        csv_out=csv_components,
+        **kwargs,
+    )
+
+
+def plot_minatar_phi_td_ablation_phase2(
+    *,
+    project: str = "Deep-CVI-Experiments",
+    entity: str | None = None,
+    experiment_tag: str = "MinAtar_PhiTD_Ablation_Phase2",
+    out: str = "figures/minatar_phi_td_ablation_phase2.png",
+    csv_out: str | None = "figures/minatar_phi_td_ablation_phase2.csv",
+    env_ids: list[str] | None = None,
+    algo_tags: list[str] | None = None,
+    use_run_name_for_env: bool = True,
+    metric: str = "charts/episodic_return",
+    step_metric: str = "global_step",
+    grid_points: int = 800,
+    max_runs: int = 3000,
+    smooth_window: int = 41,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
+    multi_seed_tag: str = "multi_seed",
+) -> None:
+    """Phase 2 — sampling scheme × distribution family (fixed Phase-1 winners).
+
+    From ``slurm/slurm_minatar_phi_td_ablation_phase2.sh``. Curves keyed by unique
+    ``ABL2-{family}-{sampling}`` combo tags (avoids multi-match on family+sampling).
+
+    Styling matches the MinAtar final-report φTD family figures, with the 9-way
+    combo legend placed **under** the panels and a strong (non-pastel) color scheme.
+
+    When ``csv_out`` is set, also writes a sparse checkpoint CSV (every 2M steps,
+    seed-mean return to **one decimal place** and 95% CI half-width with **two
+    significant figures**) for rebuttal markdown tables.
+    """
+    if env_ids is None:
+        env_ids = list(_ABLATION_ENVS_DEFAULT)
+    if algo_tags is None:
+        families = ["PhiTD-MoG", "PhiTD-FCm", "PhiTD-FQm"]
+        samplings = ["PARETO_1", "EXPONENTIAL", "UNIFORM"]
+        algo_tags = [f"ABL2-{fam}-{samp}" for fam in families for samp in samplings]
+
+    style = {
+        **_ABLATION_PAPER_STYLE,
+        "multi_env_legend_fontsize": 11,
+        "multi_env_legend_below": True,
+        "multi_env_legend_ncol": 3,
+        "multi_env_subplot_height": 5.6,
+        # Within each family: Pareto solid, Exponential dashed, Uniform dotted.
+        "multi_env_linestyles": ["-", "--", ":", "-", "--", ":", "-", "--", ":"],
+        "multi_env_linewidth": 2.4,
+        "multi_env_fill_alpha": 0.12,
+    }
+    plot_episodic_return(
+        project=project,
+        entity=entity,
+        required_tag=["ablation_phase2"],
+        algo_tags=algo_tags,
+        metric=metric,
+        step_metric=step_metric,
+        out=out,
+        grid_points=grid_points,
+        max_runs=max_runs,
+        smooth_window=smooth_window,
+        experiment_tag=experiment_tag,
+        env_ids=env_ids,
+        use_run_name_for_env=use_run_name_for_env,
+        multi_env_y_top_margin=multi_env_y_top_margin,
+        multi_seed_tag=multi_seed_tag,
+        **style,
+    )
+    if csv_out:
+        export_ablation_checkpoint_csv(
+            project=project,
+            entity=entity,
+            required_tag=["ablation_phase2"],
+            experiment_tag=experiment_tag,
+            algo_tags=algo_tags,
+            env_ids=env_ids,
+            out_csv=csv_out,
+            metric=metric,
+            step_metric=step_metric,
+            max_runs=max_runs,
+            multi_seed_tag=multi_seed_tag,
+            use_run_name_for_env=use_run_name_for_env,
+        )
+
+
 def plot_minatar_10m_phi_td_families(
     *,
     project: str = "Deep-CVI-Experiments",
@@ -2054,10 +2613,22 @@ if __name__ == "__main__":
     
     #? FINAL REPORT PLOTS
     #! Phi-TD MoG / Gamma / Laplace / Logistic (+ optional PQN baseline) — slurm_minatar_phi_mog_gamma_laplace_logistic.sh
-    plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+    # plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    #     out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
+    # )
+
+    # #! φTD ablation Phase 1 (N_ω + m) — Breakout / SpaceInvaders
+    # Figures + sparse 2M-step CSVs (1 decimal) for rebuttal markdown tables.
+    # plot_minatar_phi_td_ablation_phase1(
+    #     project="Deep-CVI-Experiments",
+    #     entity="fatty_data",
+    # )
+    # #! φTD ablation Phase 2 (sampling × family) — same CSV convention
+    plot_minatar_phi_td_ablation_phase2(
         project="Deep-CVI-Experiments",
         entity="fatty_data",
-        out="figures/minatar_10m_phi_td_mog_gamma_laplace_logistic.png",
     )
 
 
