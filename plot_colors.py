@@ -80,7 +80,7 @@ _WANDB_TAG_HEX: dict[str, str] = {
     "M-51": COLOR_PHITD_MOG,
     "M-100": "#7f1d1d",
     # Phase-2 combo tags — three family hues (red / purple / green), dark enough on white.
-    # Within family: Pareto / Exponential / Uniform (paired with solid/dashed/dotted in plots).
+    # Within family: Pareto / Exponential / Uniform (paired with circle / square / triangle markers).
     "ABL2-PhiTD-MoG-PARETO_1": "#b91c1c",
     "ABL2-PhiTD-MoG-EXPONENTIAL": "#ef4444",
     "ABL2-PhiTD-MoG-UNIFORM": "#7f1d1d",

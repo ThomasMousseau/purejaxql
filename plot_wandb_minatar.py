@@ -427,6 +427,18 @@ def _pretty_env_title(env_id: str, *, omit_minatar: bool = False) -> str:
     return env_id.replace("-", " ").replace("_", " ").title()
 
 
+def _markevery_for_idx(
+    markevery: int | tuple[int, int] | list[int | tuple[int, int] | None] | None,
+    idx: int,
+) -> int | tuple[int, int] | None:
+    """Resolve ``markevery`` for curve ``idx`` (shared value, or per-curve list)."""
+    if markevery is None:
+        return None
+    if isinstance(markevery, list):
+        return markevery[idx % len(markevery)]
+    return markevery
+
+
 def _draw_algo_curves_on_ax(
     ax,
     by_algo: dict[str, list],
@@ -450,6 +462,11 @@ def _draw_algo_curves_on_ax(
     linestyles: list[str] | None = None,
     linewidth: float = 2.0,
     fill_alpha: float = 0.2,
+    markers: list[str] | None = None,
+    markevery: int | tuple[int, int] | list[int | tuple[int, int] | None] | None = None,
+    markersize: float = 7.0,
+    markeredgecolor: str = "white",
+    markeredgewidth: float = 0.7,
 ) -> None:
     """If ``autoscale_y``, y-limits use a small pad (``y_top_margin`` × span of the band)."""
     ymax_track = -np.inf
@@ -486,8 +503,17 @@ def _draw_algo_curves_on_ax(
         label = _legend_for_algo_tag(algo_tag, phi_families_compare=phi_td_families_compare_legend)
         c = colors[idx % len(colors)]
         ls = "-" if not linestyles else linestyles[idx % len(linestyles)]
-        ax.plot(grid, mean, color=c, linewidth=linewidth, linestyle=ls, label=label)
-        ax.fill_between(grid, lower, upper, color=c, alpha=fill_alpha)
+        plot_kw: dict = {"color": c, "linewidth": linewidth, "linestyle": ls, "label": label, "zorder": 3}
+        if markers:
+            mk = markers[idx % len(markers)]
+            if mk:
+                plot_kw["marker"] = mk
+                plot_kw["markersize"] = markersize
+                plot_kw["markeredgecolor"] = markeredgecolor
+                plot_kw["markeredgewidth"] = markeredgewidth
+                plot_kw["markevery"] = _markevery_for_idx(markevery, idx)
+        ax.plot(grid, mean, **plot_kw)
+        ax.fill_between(grid, lower, upper, color=c, alpha=fill_alpha, zorder=2)
 
     axis_label_kw: dict = {}
     if axis_label_fontsize is not None:
@@ -609,6 +635,9 @@ def plot_episodic_return(
     multi_env_linestyles: list[str] | None = None,
     multi_env_linewidth: float = 2.0,
     multi_env_fill_alpha: float = 0.2,
+    multi_env_markers: list[str] | None = None,
+    multi_env_markevery: int | tuple[int, int] | list[int | tuple[int, int] | None] | None = None,
+    multi_env_markersize: float = 7.0,
     multi_env_fig_width_min: float = 14,
     multi_env_wspace: float | None = None,
     multi_env_title_bold: bool = False,
@@ -753,6 +782,9 @@ def plot_episodic_return(
                     linestyles=multi_env_linestyles,
                     linewidth=multi_env_linewidth,
                     fill_alpha=multi_env_fill_alpha,
+                    markers=multi_env_markers,
+                    markevery=multi_env_markevery,
+                    markersize=multi_env_markersize,
                 )
             ax.set_title(
                 _pretty_env_title(eid, omit_minatar=omit_minatar_in_env_title),
@@ -782,6 +814,7 @@ def plot_episodic_return(
                     ncol=ncol,
                     fontsize=leg_fs,
                     frameon=True,
+                    markerscale=1.35 if multi_env_markers else 1.0,
                 )
         else:
             fig.tight_layout(rect=[0, 0, 1, 1])
@@ -2206,6 +2239,11 @@ def plot_minatar_phi_td_ablation_phase2(
     Styling matches the MinAtar final-report φTD family figures, with the 9-way
     combo legend placed **under** the panels and a strong (non-pastel) color scheme.
 
+    Sampling is encoded with **markers on solid lines** (Pareto circle, Exponential
+    square, Uniform triangle), not dash/dot linestyles — dotted Uniform was too
+    easy to lose against the grid and overlapping CIs. Marker placement is
+    staggered along *x* so the three samplings in a family do not stack.
+
     When ``csv_out`` is set, also writes a sparse checkpoint CSV (every 2M steps,
     seed-mean return to **one decimal place** and 95% CI half-width with **two
     significant figures**) for rebuttal markdown tables.
@@ -2217,16 +2255,22 @@ def plot_minatar_phi_td_ablation_phase2(
         samplings = ["PARETO_1", "EXPONENTIAL", "UNIFORM"]
         algo_tags = [f"ABL2-{fam}-{samp}" for fam in families for samp in samplings]
 
+    # One family per legend row, one sampling per column (ncol=3, family-major tags).
+    # Offset markers so Pareto / Exponential / Uniform ticks do not coincide.
+    sampling_markers = ["o", "s", "^"]
+    sampling_markevery = [(0, 70), (23, 70), (46, 70)]
     style = {
         **_ABLATION_PAPER_STYLE,
         "multi_env_legend_fontsize": 11,
         "multi_env_legend_below": True,
         "multi_env_legend_ncol": 3,
         "multi_env_subplot_height": 5.6,
-        # Within each family: Pareto solid, Exponential dashed, Uniform dotted.
-        "multi_env_linestyles": ["-", "--", ":", "-", "--", ":", "-", "--", ":"],
+        "multi_env_linestyles": ["-"] * 9,
+        "multi_env_markers": sampling_markers * 3,
+        "multi_env_markevery": sampling_markevery * 3,
+        "multi_env_markersize": 8.0,
         "multi_env_linewidth": 2.4,
-        "multi_env_fill_alpha": 0.12,
+        "multi_env_fill_alpha": 0.10,
     }
     plot_episodic_return(
         project=project,

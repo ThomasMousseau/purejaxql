@@ -1,10 +1,3 @@
-# Flexibility parametric-family benchmark — same simple protocol as May-4 run.
-# Truths: Gauss / Cauchy / MoG / Gam
-# Algos: MoG / MoC / MoGamma / Categorical / Quantile
-# Training CF loss: 0.5 * mean(|Δφ|²[/ω²])  (no 1/2π; matches original flexibility script)
-# Eval CF metric: still Parseval-normalized cf_l2_w
-# aux_mean_loss_weight: shared for all finite-mean heads (MoC skips; no mean)
-
 seed: 0
 num_seeds: 1
 state_dim: 5
@@ -14,7 +7,6 @@ total_steps: 20000
 log_every: 20000
 parseval_every: 1000
 batch_size: 1024
-
 num_tau: 51
 num_atoms: 51
 num_dirac_components: 51
@@ -29,7 +21,6 @@ omega_clip: 15.0
 omega_laplace_scale: 0.8
 cf_loss_omega_eps: 0.001
 aux_mean_loss_weight: 0.1
-
 c51_v_min: -25.0
 c51_v_max: 25.0
 hidden_dim: 256
@@ -41,8 +32,17 @@ eval_num_t: 201
 eval_x_min: -15.0
 eval_x_max: 15.0
 eval_num_x: 301
+risk_x_min: -200.0
+risk_x_max: 200.0
+risk_num_x: 2001
 gp_t_delta: 0.0001
 gp_num_t: 2001
-
+cvar_alpha: 0.05
+er_beta: 0.1
+mv_lambda: 0.1
 close_to_theory: false
 omega_min_pareto: 0.001
+phi_qt_same_arch_as_qtd: true
+phi_qt_num_quantiles: null
+phi_qt_aux_qtd_huber_weight: 0.0
+artifacts_dir: "/network/scratch/m/mousseat/purejaxql/figures/flexibility_parametric_family/2026-08-02_09:14:22"

@@ -21,3 +21,7 @@ checkpoints/
 
 purejaxql/*.npz
 purejaxql/*.msgpack
+
+# Reviewer bundle for main-paper Figure 1 (MinAtar) and Figure 2 (Craftax).
+phitd-code-submission/
+phitd-code-submission.zip
