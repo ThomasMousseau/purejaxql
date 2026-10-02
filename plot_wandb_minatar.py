@@ -50,7 +50,7 @@ from pathlib import Path
 import csv
 
 import numpy as np
-from plot_colors import algo_color, legend_label_for_wandb_algo_tag
+from plot_colors import LEGEND_WANDB_TAG, algo_color, legend_label_for_wandb_algo_tag
 
 try:
     import matplotlib.pyplot as plt
@@ -467,6 +467,7 @@ def _draw_algo_curves_on_ax(
     markersize: float = 7.0,
     markeredgecolor: str = "white",
     markeredgewidth: float = 0.7,
+    legend_overrides: dict[str, str] | None = None,
 ) -> None:
     """If ``autoscale_y``, y-limits use a small pad (``y_top_margin`` × span of the band)."""
     ymax_track = -np.inf
@@ -501,6 +502,8 @@ def _draw_algo_curves_on_ax(
         ymin_track = min(ymin_track, float(np.nanmin(lower)))
 
         label = _legend_for_algo_tag(algo_tag, phi_families_compare=phi_td_families_compare_legend)
+        if legend_overrides and algo_tag in legend_overrides:
+            label = legend_overrides[algo_tag]
         c = colors[idx % len(colors)]
         ls = "-" if not linestyles else linestyles[idx % len(linestyles)]
         plot_kw: dict = {"color": c, "linewidth": linewidth, "linestyle": ls, "label": label, "zorder": 3}
@@ -2255,6 +2258,12 @@ def plot_minatar_phi_td_ablation_phase2(
         samplings = ["PARETO_1", "EXPONENTIAL", "UNIFORM"]
         algo_tags = [f"ABL2-{fam}-{samp}" for fam in families for samp in samplings]
 
+    # Phase 2 fixes M_PARTICLES=51, so this family is a mixture, not a single
+    # Gaussian (m=1). Other figures keep the shared "φTD-Gaussian" legend.
+    legend_key = "PhiTD-MoG"
+    prev_legend = LEGEND_WANDB_TAG[legend_key]
+    LEGEND_WANDB_TAG[legend_key] = r"$\varphi\text{TD-MoGaussian}$"
+
     # One family per legend row, one sampling per column (ncol=3, family-major tags).
     # Offset markers so Pareto / Exponential / Uniform ticks do not coincide.
     sampling_markers = ["o", "s", "^"]
@@ -2272,39 +2281,42 @@ def plot_minatar_phi_td_ablation_phase2(
         "multi_env_linewidth": 2.4,
         "multi_env_fill_alpha": 0.10,
     }
-    plot_episodic_return(
-        project=project,
-        entity=entity,
-        required_tag=["ablation_phase2"],
-        algo_tags=algo_tags,
-        metric=metric,
-        step_metric=step_metric,
-        out=out,
-        grid_points=grid_points,
-        max_runs=max_runs,
-        smooth_window=smooth_window,
-        experiment_tag=experiment_tag,
-        env_ids=env_ids,
-        use_run_name_for_env=use_run_name_for_env,
-        multi_env_y_top_margin=multi_env_y_top_margin,
-        multi_seed_tag=multi_seed_tag,
-        **style,
-    )
-    if csv_out:
-        export_ablation_checkpoint_csv(
+    try:
+        plot_episodic_return(
             project=project,
             entity=entity,
             required_tag=["ablation_phase2"],
-            experiment_tag=experiment_tag,
             algo_tags=algo_tags,
-            env_ids=env_ids,
-            out_csv=csv_out,
             metric=metric,
             step_metric=step_metric,
+            out=out,
+            grid_points=grid_points,
             max_runs=max_runs,
-            multi_seed_tag=multi_seed_tag,
+            smooth_window=smooth_window,
+            experiment_tag=experiment_tag,
+            env_ids=env_ids,
             use_run_name_for_env=use_run_name_for_env,
+            multi_env_y_top_margin=multi_env_y_top_margin,
+            multi_seed_tag=multi_seed_tag,
+            **style,
         )
+        if csv_out:
+            export_ablation_checkpoint_csv(
+                project=project,
+                entity=entity,
+                required_tag=["ablation_phase2"],
+                experiment_tag=experiment_tag,
+                algo_tags=algo_tags,
+                env_ids=env_ids,
+                out_csv=csv_out,
+                metric=metric,
+                step_metric=step_metric,
+                max_runs=max_runs,
+                multi_seed_tag=multi_seed_tag,
+                use_run_name_for_env=use_run_name_for_env,
+            )
+    finally:
+        LEGEND_WANDB_TAG[legend_key] = prev_legend
 
 
 def plot_minatar_10m_phi_td_families(
@@ -2475,6 +2487,117 @@ def plot_minatar_10m_phi_td_mog_gamma_laplace_logistic(
         multi_env_title_bold=False,
         multi_env_axis_label_bold=False,
     )
+
+
+def plot_minatar_dqn_distributional_from_csv(
+    *,
+    csv_path: str = "curves.csv",
+    out: str = "figures/minatar_10m_phi_td_mog_iqn_qrdqn_c51.png",
+    env_ids: list[str] | None = None,
+    grid_points: int = 800,
+    smooth_window: int = 161,
+    multi_env_y_top_margin: float = DEFAULT_CURVE_Y_MARGIN_FRAC,
+) -> None:
+    """Four-panel MinAtar curves from a seed-level CSV, styled like the φTD family report.
+
+    Expected columns: ``environment,method,seed,env_step,return``.
+    Methods plotted (in legend order): φTD-MoG, IQN, QR-DQN, C51.
+    """
+    if env_ids is None:
+        env_ids = [
+            "Asterix-MinAtar",
+            "Breakout-MinAtar",
+            "Freeway-MinAtar",
+            "SpaceInvaders-MinAtar",
+        ]
+    method_to_algo = {
+        "Phi-TD MoG": "PhiTD-MoG",
+        "IQN": "IQN",
+        "QTD/QR-DQN": "QR-DQN",
+        "CTD/C51": "C51",
+    }
+    algo_tags = ["PhiTD-MoG", "IQN", "QR-DQN", "C51"]
+    # Same red, blue, orange, and green as ``minatar_10m_phi_td_mog_gamma_laplace_logistic``.
+    colors = [
+        algo_color("PhiTD-MoG"),
+        algo_color("PhiTD-Laplace"),
+        algo_color("PhiTD-Categorical"),
+        algo_color("PhiTD-Quantile"),
+    ]
+    legend_overrides = {
+        "PhiTD-MoG": r"$\varphi\text{TD-MoG}$",
+        "IQN": "IQN",
+        "QR-DQN": "QR-DQN",
+        "C51": "C51",
+    }
+
+    by_env_algo: dict[str, dict[str, dict[int, list[tuple[float, float]]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+    with Path(csv_path).open(newline="") as f:
+        for row in csv.DictReader(f):
+            algo = method_to_algo.get(row["method"])
+            eid = row["environment"]
+            if algo is None or eid not in env_ids:
+                continue
+            by_env_algo[eid][algo][int(row["seed"])].append(
+                (float(row["env_step"]), float(row["return"]))
+            )
+
+    curves: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    for eid in env_ids:
+        curves[eid] = {}
+        for algo in algo_tags:
+            seed_series = []
+            for pts in by_env_algo[eid][algo].values():
+                pts.sort(key=lambda p: p[0])
+                steps = np.asarray([p[0] for p in pts], dtype=np.float64)
+                vals = np.asarray([p[1] for p in pts], dtype=np.float64)
+                if len(steps) >= 2:
+                    seed_series.append((steps, vals))
+            curves[eid][algo] = seed_series
+
+    if not any(curves[e][a] for e in env_ids for a in algo_tags):
+        raise RuntimeError(f"No curves loaded from {csv_path}.")
+
+    n = len(env_ids)
+    subplot_w, subplot_h = 5.75, 5.2
+    fig, axes = plt.subplots(
+        1,
+        n,
+        figsize=(max(22.0, subplot_w * n), subplot_h),
+        sharey=False,
+        squeeze=False,
+    )
+    for j, eid in enumerate(env_ids):
+        ax = axes[0, j]
+        _draw_algo_curves_on_ax(
+            ax,
+            curves[eid],
+            algo_tags,
+            colors,
+            grid_points=grid_points,
+            smooth_window=smooth_window,
+            step_metric="global_step",
+            metric="charts/episodic_return",
+            show_ylabel=(j == 0),
+            autoscale_y=True,
+            y_top_margin=multi_env_y_top_margin,
+            y_bottom=0.0,
+            axis_label_fontsize=20,
+            tick_label_fontsize=16,
+            legend_fontsize=14,
+            show_legend=(j == 0),
+            linewidth=2.0,
+            fill_alpha=0.2,
+            legend_overrides=legend_overrides,
+        )
+        ax.set_title(_pretty_env_title(eid, omit_minatar=True), fontsize=20, fontweight="normal")
+
+    fig.tight_layout(rect=[0, 0, 1, 1])
+    png_path, pdf_path = save_figure_png_and_pdf(fig, out, dpi_png=150, dpi_pdf=300)
+    plt.close(fig)
+    print(f"Wrote {png_path}\n      {pdf_path}")
 
 
 def plot_minatar_gradient_alignment_and_volatility(
